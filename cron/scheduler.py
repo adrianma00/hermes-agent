@@ -3614,6 +3614,20 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # A `quota_override` job runs while the provider-quota gate is closed, routed to the
+    # fallback chain FOR THIS RUN ONLY (in-memory, never persisted) — so the next run after
+    # the window reopens goes back to the primary automatically. Only queried for jobs
+    # carrying the flag, so the common path pays nothing.
+    if job.get("quota_override"):
+        from cron import scheduler_quota as _quota_gate
+        _gate = _quota_gate.gate_state()
+        if _gate is not None:
+            _route = _quota_gate.override_route(claimed_job, _gate)
+            if _route is not None:
+                claimed_job["provider"], claimed_job["model"] = _route
+                logger.info(
+                    "Job '%s': quota override active — running on fallback %s/%s",
+                    job.get("name") or job.get("id"), _route[0], _route[1])
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -3766,6 +3780,16 @@ def tick(
 
         due_jobs = get_due_jobs()
         _sweep_stale_inflight_for_tick(due_jobs)
+
+        # Provider-quota gate: while the primary model's subscription window is closed,
+        # due jobs on the walled provider are held (next_run_at re-armed to the provider's
+        # reset time) instead of burning LLM calls that will 429. Exempt: jobs pinned to a
+        # healthy provider, and `quota_override` jobs (routed to the fallback chain below).
+        from cron import scheduler_quota as _quota_gate
+        _gate = _quota_gate.gate_state()
+        if _gate is not None:
+            due_jobs, _held = _quota_gate.hold_jobs(due_jobs, _gate)
+            _quota_gate.log_hold_summary(_held, _gate)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
