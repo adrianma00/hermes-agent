@@ -1831,6 +1831,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
+    # Leaving the primary on a quota wall: close the shared gate so cron jobs and
+    # kanban dispatch on this provider hold until the window reopens, instead of
+    # each re-hitting the same 429. Fires only when still ON the primary (the
+    # cooldown helper already decided that) and only with a real reset instant.
+    if not getattr(agent, "_fallback_activated", False):
+        try:
+            from agent.quota_gate_trigger import maybe_close_gate
+
+            _ctx = getattr(agent, "_last_api_error_context", None) or {}
+            maybe_close_gate(
+                provider=getattr(agent, "provider", None),
+                reset_at=_ctx.get("reset_at"),
+                reason=getattr(reason, "value", None) if reason is not None else None,
+            )
+        except Exception:
+            logger.debug("quota gate trigger skipped", exc_info=True)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)

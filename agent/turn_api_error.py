@@ -86,6 +86,9 @@ def handle_api_error(
 
     status_code = getattr(api_error, "status_code", None)
     error_context = agent._extract_api_error_context(api_error)
+    # Keep the classified error context reachable for the fallback walk, which is where
+    # the provider-quota gate learns the primary's reset instant (agent/quota_gate_trigger).
+    agent._last_api_error_context = error_context
 
     # Process is exiting mid-flight: retries/rotation/fallbacks are futile and the
     # retry trace spams the shell. One log line.
