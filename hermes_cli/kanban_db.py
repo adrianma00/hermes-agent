@@ -4533,6 +4533,71 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
     return [(r["id"], r["result"]) for r in rows]
 
 
+# ── Quota gate card writer ──────────────────────────────────────────────────
+
+
+def write_quota_gate_card(provider: str, body: dict) -> None:
+    """Create or update the quota gate card on the shared board.
+
+    ``body`` must carry ``v``, ``provider``, ``reset_at``, ``closed_at``,
+    and optionally ``window``/``opened_at``.  The card lands in ``scheduled``
+    status (inert — never dispatched) with no assignee.
+    """
+    db_path = _quota_gate_db_path()
+    if db_path is None:
+        raise RuntimeError("Quota-gate board not found — cannot write the gate card")
+
+    title = f"{_QUOTA_GATE_TITLE_PREFIX}{provider}"
+    import sqlite3
+
+    now = int(time.time())
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        # Upsert: find existing card for this provider, or insert.
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE title = ? AND status = 'scheduled'",
+            (title,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                (json.dumps(body), existing["id"]),
+            )
+        else:
+            task_id = _new_task_id()
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, "
+                "created_by, created_at, workspace_kind) VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, title, json.dumps(body), None, "scheduled", 0,
+                 "sysadmin", now, "scratch"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_quota_gate_card(provider: str) -> bool:
+    """Remove the quota gate card for ``provider``.  Returns True when one was deleted."""
+    title = f"{_QUOTA_GATE_TITLE_PREFIX}{provider}"
+    import sqlite3
+
+    db_path = _quota_gate_db_path()
+    if db_path is None:
+        return False
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE title = ? AND status = 'scheduled'",
+            (title,),
+        )
+        affected = cur.rowcount
+        conn.commit()
+        return affected > 0
+    finally:
+        conn.close()
+
+
 # ── Quota gate ──────────────────────────────────────────────────────────────
 
 
