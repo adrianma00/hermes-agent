@@ -4546,6 +4546,14 @@ def write_quota_gate_card(provider: str, body: dict) -> None:
     db_path = _quota_gate_db_path()
     if db_path is None:
         raise RuntimeError("Quota-gate board not found — cannot write the gate card")
+    if not Path(db_path).exists():
+        # Never create the board implicitly, and never write into a non-existent
+        # path: a silent no-op here leaves the gate OPEN while a 429 says the
+        # provider is walled, which is exactly how the dispatcher keeps spawning.
+        raise RuntimeError(
+            f"Quota-gate board '{_QUOTA_GATE_BOARD}' not found at {db_path} — "
+            "the shared board must exist before the gate can close"
+        )
 
     title = f"{_QUOTA_GATE_TITLE_PREFIX}{provider}"
     import sqlite3
@@ -4641,15 +4649,41 @@ _QUOTA_GATE_TITLE_PREFIX = "quota-gate:"
 
 
 def _quota_gate_db_path(board: Optional[str] = None) -> Optional[Path]:
-    """Resolve the quota-gate board's DB path.
+    """Resolve the quota-gate board's DB path, PIN-INDEPENDENTLY.
 
-    Returns None when the slug cannot be resolved; callers decide whether that
-    is a fail-closed condition (enabled) or a no-op (disabled).
+    The gate board is a SIBLING board shared across the fleet, so it must never be
+    resolved through ``HERMES_KANBAN_DB``: that pin is injected into every dispatched
+    worker and answers only for the caller's OWN board, so ``kanban_db_path(board=…)``
+    from a worker collapses the gate board onto the worker's own DB. A worker-side
+    first-429 write then lands on the wrong board while the dispatcher (unpinned)
+    reads the right one — the gate never closes and the dispatcher keeps spawning.
+    Use :func:`board_db_path_unpinned` for the sibling lookup.
+
+    It also lives in the DEFAULT install's kanban home (where the shared board and
+    its cross-tenant symlink are created), so resolve there first and fall back to
+    the current home for single-install setups.
     """
+    slug = board or _QUOTA_GATE_BOARD
+    candidates: list[Path] = []
     try:
-        return kanban_db_path(board=board or _QUOTA_GATE_BOARD)
+        from hermes_cli.profiles import _get_default_hermes_home
+
+        candidates.append(Path(_get_default_hermes_home()) / "kanban" / "boards" / slug / "kanban.db")
     except Exception:
-        return None
+        pass
+    try:
+        candidates.append(board_db_path_unpinned(slug))
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    # Nothing on disk: hand back the preferred candidate so the caller can report
+    # the path it looked for (never a silent no-op).
+    return candidates[0] if candidates else None
 
 
 def read_quota_gate_state(

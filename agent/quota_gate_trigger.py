@@ -76,5 +76,12 @@ def maybe_close_gate(
         )
         return True
     except Exception:
-        logger.debug("quota gate: close-on-429 failed (non-fatal)", exc_info=True)
+        # NOT debug: a failed write while the gate is enabled means the fleet keeps
+        # spawning into a walled provider (found live, 2026-09-15 — a pinned worker
+        # resolved the gate board to its own DB and the failure was invisible).
+        logger.warning(
+            "Provider-quota gate: could not close the gate for %s (reset_at=%s) — "
+            "kanban dispatch and cron will keep running against a walled provider",
+            provider, reset_at, exc_info=True,
+        )
         return False
