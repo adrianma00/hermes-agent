@@ -212,6 +212,10 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--quota-override", action="store_true", dest="quota_override",
+             help="Priority card: still runs while the provider-quota gate is "
+                  "closed, routed to the configured fallback chain for that "
+                  "spawn only (returns to the primary when the gate reopens)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -252,6 +256,12 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("quota-override", [
+        _TASK_ID,
+        _arg("state", nargs="?", choices=("on", "off"), default="on",
+             help="on = may run while the provider-quota gate is closed "
+                  "(routed to the fallback chain); off = waits with the fleet."),
+    ], help="Let one card run while the provider-quota gate is closed"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

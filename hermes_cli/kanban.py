@@ -384,6 +384,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            quota_override=bool(getattr(args, "quota_override", False)),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -529,6 +530,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.quota_override:
+        field("quota-override", "on — runs while the provider-quota gate is closed")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -609,6 +612,25 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_quota_override(args: argparse.Namespace) -> int:
+    """Set/clear a task's quota-gate override (may run while the gate is closed)."""
+    raw = (getattr(args, "state", None) or "on").strip().lower()
+    if raw in {"on", "true", "1", "yes", "enable", "enabled"}:
+        enabled = True
+    elif raw in {"off", "false", "0", "no", "disable", "disabled", "clear"}:
+        enabled = False
+    else:
+        return _err(f"kanban: expected on|off, got {raw!r}", 2)
+    with kbc.connect_closing() as conn:
+        ok = kb.set_quota_override(conn, args.task_id, enabled)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    state = "set" if enabled else "cleared"
+    print(f"Quota override {state} on {args.task_id} "
+          f"({'runs on the fallback chain while the quota gate is closed' if enabled else 'waits with the fleet when the gate is closed'})")
     return 0
 
 
@@ -1267,6 +1289,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "quota-override": _cmd_quota_override,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

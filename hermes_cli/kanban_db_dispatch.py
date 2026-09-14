@@ -26,7 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from hermes_cli.kanban_db import Task
+    from hermes_cli.kanban_db import Task, QuotaGateState
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -145,6 +145,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    quota_paused: list[str] = field(default_factory=list)
+    """Task ids skipped because the provider-quota gate is closed and the
+    task has no ``quota_override`` flag. Released automatically when the
+    gate reopens or the reset timestamp elapses."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1917,6 +1921,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    quota_gate: Optional["QuotaGateState"] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1976,6 +1981,34 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # --- Provider-quota gate (fleet-level pause) ---------------------------
+    # Outranks the per-task respawn guard: when the shared gate says the
+    # primary provider's quota window is closed, a task without an explicit
+    # ``quota_override`` waits rather than burning a worker slot on a 429.
+    # Skipped cards are recorded as ``quota_paused`` (not ``respawn_guarded``)
+    # so board telemetry distinguishes "paused by quota" from "stuck".
+    if quota_gate is not None and quota_gate.is_closed:
+        override_flag, pinned_provider = _task_quota_gate_flags(conn, task_id)
+        # A card permanently pinned to a healthy provider spends no quota on
+        # the walled one — it is exempt and spawns on its own pin.
+        exempt = quota_gate.is_exempt(pinned_provider)
+        if not exempt and (not override_flag or not quota_gate.fallback_model):
+            result.quota_paused.append(task_id)
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "quota_paused", {
+                        "reset_at": quota_gate.reset_at,
+                        "override": bool(override_flag),
+                        # An override with no configured fallback chain has
+                        # nowhere to route, so it pauses like everything else.
+                        "reason": (
+                            "no_fallback_route"
+                            if (override_flag and not quota_gate.fallback_model)
+                            else "gate_closed"
+                        ),
+                    })
+            return False
+
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2026,6 +2059,17 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    if (
+        quota_gate is not None and quota_gate.is_closed
+        and quota_gate.fallback_model and claimed.quota_override
+        # Never clobber a deliberate per-card pin: that routing decision is the
+        # card's own and outlives the pause (the two concepts stay separate).
+        and not claimed.provider_override and not claimed.model_override
+    ):
+        # Route THIS SPAWN to the fallback chain only. Nothing is persisted, so
+        # the moment the gate reopens the next dispatch returns to the primary.
+        claimed.model_override = quota_gate.fallback_model
+        claimed.provider_override = quota_gate.fallback_provider
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2162,6 +2206,23 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def _task_quota_gate_flags(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
+    """``(quota_override, provider_override)`` for ``task_id``.
+
+    Read lazily (only while the gate is closed) and default to ``(False, None)``
+    on any error — an unreadable flag must never let a card skip the pause.
+    """
+    try:
+        row = conn.execute(
+            "SELECT quota_override, provider_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, None
+        return bool(row["quota_override"]), (row["provider_override"] or None)
+    except Exception:
+        return False, None
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
@@ -2205,6 +2266,26 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _resolve_fallback_chain() -> Optional[list[dict]]:
+    """Read ``fallback_providers`` from the dispatcher's own config.
+
+    Returns the first fallback entry as ``[{"provider": ..., "model": ...}]``
+    or ``None`` when no fallback chain is configured.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        chain = cfg.get("fallback_providers") or cfg.get("fallback_model")
+        if isinstance(chain, list) and chain:
+            return [{"provider": e["provider"], "model": e["model"]}
+                    for e in chain if isinstance(e, dict) and e.get("provider") and e.get("model")]
+        if isinstance(chain, dict):
+            return [{"provider": chain.get("provider"), "model": chain.get("model")}]
+        return None
+    except Exception:
+        return None
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2239,6 +2320,14 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
+    # Read provider-quota gate state (fail closed per Adrian's requirement).
+    # The gate is shared via the yummi-admin board; if the mount is down
+    # the gate stays closed.
+    from hermes_cli.kanban_db import read_quota_gate_state
+    quota_gate = read_quota_gate_state(fallback_chain=_resolve_fallback_chain())
+    if quota_gate.is_closed:
+        result.quota_paused = []  # populated by _dispatch_lane_task
+
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2272,6 +2361,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        quota_gate=quota_gate,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

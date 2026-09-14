@@ -3144,6 +3144,13 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         delay = reset_delay_from_message(context.get("message") or "")
         if delay is not None:
             context["reset_at"] = time.time() + delay
+        else:
+            # Also try extracting an absolute timestamp from the message text
+            # (e.g. "It will reset at 2026-09-15 00:19:52 +0800 CST" from Ark).
+            from agent.credential_pool import _extract_reset_at_from_message
+            abs_ts = _extract_reset_at_from_message(context["message"])
+            if abs_ts is not None:
+                context["reset_at"] = abs_ts
     return context
 
 

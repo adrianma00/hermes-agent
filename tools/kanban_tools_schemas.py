@@ -468,6 +468,14 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "is blocked for review. Ignored unless goal_mode is "
                 "true. Defaults to the goal-engine default (20)."
         )),
+        "quota_override": _prop("boolean", (
+                "Priority card: still runs while the provider-quota gate is "
+                "closed (the primary model's subscription window is "
+                "exhausted). The worker is routed to the configured fallback "
+                "chain for that spawn only, so the card returns to the "
+                "primary automatically when the window reopens. Defaults to "
+                "false: the card waits with the rest of the fleet."
+        )),
         "model": _prop("string", (
                 "Pin the dispatched worker to this model instead of "
                 "the assignee profile's configured model. Use the "

@@ -1767,6 +1767,17 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # Provider-quota gate: when the primary model's subscription window is exhausted, hold
+        # queued work until the provider's stated reset time instead of spawning workers that
+        # bounce off the same 429. Disabled by default — an install that never opts in is never
+        # paused. Once enabled the gate FAILS CLOSED: if the shared board is missing or
+        # unreadable, the fleet holds (the shared mount is how the gate is coordinated).
+        "quota_gate": {
+            "enabled": False,
+            # Board that carries the gate card (one `quota-gate:<provider>` card in `scheduled`).
+            # Shared across the fleet/tenants so every profile reads the same state.
+            "board": "yummi-admin",
+        },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

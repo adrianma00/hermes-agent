@@ -969,6 +969,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Quota-gate override: 1 = may run while the primary provider quota is
+    # walled (routed to the fallback chain for that spawn only).
+    quota_override: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -986,6 +989,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            quota_override=bool(g("quota_override")),
         )
 
 
@@ -1486,6 +1490,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    quota_override: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1585,8 +1590,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        quota_override
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1596,6 +1602,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if quota_override else 0,
                     ),
                 )
                 for pid in parents:
@@ -1798,6 +1805,21 @@ def set_model_override(
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
+    )
+
+
+def set_quota_override(conn: sqlite3.Connection, task_id: str, enabled: bool) -> bool:
+    """Set/clear the per-task quota-gate override.
+
+    ``enabled=True`` lets the task spawn while the provider-quota gate is
+    closed, routed to the fallback chain for that spawn only — nothing durable
+    is written, so the card returns to the primary once the gate reopens.
+    """
+    return _set_task_override(
+        conn, task_id,
+        "UPDATE tasks SET quota_override = ? WHERE id = ?", (1 if enabled else 0,),
+        "quota_override_set", {"quota_override": bool(enabled)},
+        ("quota_override",), archived_msg="cannot set quota override",
     )
 
 
@@ -4509,6 +4531,152 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         (task_id,),
     ).fetchall()
     return [(r["id"], r["result"]) for r in rows]
+
+
+# ── Quota gate ──────────────────────────────────────────────────────────────
+
+
+@dataclass
+class QuotaGateState:
+    """Whether the provider-quota gate is closed and how to route overrides."""
+
+    is_closed: bool
+    reset_at: Optional[float] = None
+    # Provider identity the gate applies to (from the gate card body). A card
+    # permanently pinned to a DIFFERENT provider consumes no walled quota and
+    # is exempt from the pause.
+    walled_provider: Optional[str] = None
+    fallback_model: Optional[str] = None
+    fallback_provider: Optional[str] = None
+
+    @property
+    def skip_spawn(self) -> bool:
+        """True when the gate is closed and no fallback routing is available
+        (hard pause — tasks without ``quota_override`` must not spawn)."""
+        return self.is_closed and not self.fallback_model
+
+    def is_exempt(self, provider_override: Optional[str]) -> bool:
+        """Whether a card pinned to ``provider_override`` sidesteps the gate.
+
+        Only an explicit pin to a provider OTHER than the walled one is
+        exempt: a card pinned to the walled provider itself still waits.
+        """
+        pinned = (provider_override or "").strip().lower()
+        walled = (self.walled_provider or "").strip().lower()
+        return bool(pinned) and pinned != walled
+
+
+# Shared-board slug for the quota gate card.  Board is shared cross-tenant
+# between Em (ama) and Yummi (elise) so every profile in the fleet reads
+# the same gate state.
+_QUOTA_GATE_BOARD = "yummi-admin"
+# Title prefix for the gate card; the full title is ``quota-gate:<provider>``
+# where ``provider`` is the credential-pool key (e.g. ``custom:modelark``).
+_QUOTA_GATE_TITLE_PREFIX = "quota-gate:"
+
+
+def _quota_gate_db_path(board: Optional[str] = None) -> Optional[Path]:
+    """Resolve the quota-gate board's DB path.
+
+    Returns None when the slug cannot be resolved; callers decide whether that
+    is a fail-closed condition (enabled) or a no-op (disabled).
+    """
+    try:
+        return kanban_db_path(board=board or _QUOTA_GATE_BOARD)
+    except Exception:
+        return None
+
+
+def read_quota_gate_state(
+    fallback_chain: Optional[list[dict]] = None,
+    *,
+    enabled: Optional[bool] = None,
+    board: Optional[str] = None,
+) -> QuotaGateState:
+    """Read the provider-quota gate card from the shared board.
+
+    ``fallback_chain`` is the list of ``fallback_providers`` entries from the
+    dispatcher's config (e.g. ``[{"provider": "deepseek", "model": …}]``).
+    When provided, the first entry is used as the override route.
+
+    Opt-in via ``kanban.quota_gate.enabled`` (default **false**): a dispatcher
+    that never opted in is never paused, so an install with no shared board
+    behaves exactly as before. Once enabled, the gate FAILS CLOSED — an
+    unreachable/absent board means "the mount is gone, we cannot operate", per
+    the fleet's stated preference. ``board`` / ``enabled`` override the config
+    (used by tests and the ``hermes quota`` CLI).
+    """
+    if enabled is None or board is None:
+        cfg_enabled, cfg_board = _quota_gate_config()
+        if enabled is None:
+            enabled = cfg_enabled
+        if board is None:
+            board = cfg_board
+    if not enabled:
+        return QuotaGateState(is_closed=False)
+
+    db_path = _quota_gate_db_path(board)
+    if db_path is None or not db_path.exists():
+        # Enabled but the board is gone → the shared mount is unreachable.
+        return QuotaGateState(is_closed=True)
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT body FROM tasks "
+            "WHERE title LIKE ? AND status = 'scheduled' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"{_QUOTA_GATE_TITLE_PREFIX}%",),
+        ).fetchone()
+        if not row or not row["body"]:
+            # No gate card: nothing is walled.
+            return QuotaGateState(is_closed=False)
+        gate = json.loads(row["body"])
+        now = time.time()
+        reset_at = gate.get("reset_at")
+        if reset_at is not None and isinstance(reset_at, (int, float)) and reset_at > now:
+            fb_model = None
+            fb_provider = None
+            if isinstance(fallback_chain, list) and fallback_chain:
+                fb_model = fallback_chain[0].get("model")
+                fb_provider = fallback_chain[0].get("provider")
+            return QuotaGateState(
+                is_closed=True,
+                reset_at=float(reset_at),
+                walled_provider=gate.get("provider"),
+                fallback_model=fb_model,
+                fallback_provider=fb_provider,
+            )
+        # reset_at in the past (or absent) → gate is open
+        return QuotaGateState(is_closed=False)
+    except Exception as exc:
+        # Enabled and the board exists but cannot be read (corruption,
+        # permission, mount error) → fail closed.
+        _log.warning("Quota gate unreadable at %s — holding the fleet: %s", db_path, exc)
+        return QuotaGateState(is_closed=True)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _quota_gate_config() -> "tuple[bool, str]":
+    """``(enabled, board_slug)`` from ``kanban.quota_gate``; disabled by default."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("quota_gate") or {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    enabled = bool(cfg.get("enabled", False))
+    board = str(cfg.get("board") or _QUOTA_GATE_BOARD).strip() or _QUOTA_GATE_BOARD
+    return enabled, board
 
 
 _PLUGIN_COMPAT_LAZY = {

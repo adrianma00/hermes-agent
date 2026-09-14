@@ -387,9 +387,46 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         retry_delay_seconds = reset_delay_from_message(message)
         if retry_delay_seconds is not None:
             parsed_reset_at = time.time() + retry_delay_seconds
+    if parsed_reset_at is None and isinstance(message, str):
+        parsed_reset_at = _extract_reset_at_from_message(message)
     if parsed_reset_at is not None:
         normalized["reset_at"] = parsed_reset_at
     return normalized
+
+
+# Pattern for absolute timestamps embedded in provider error messages.
+# Matches "reset at YYYY-MM-DD HH:MM:SS +HHMM" (and variants like "resets on",
+# "reset on", "resets at"), then strips any trailing alphabetic timezone name.
+_RESET_AT_PATTERN = re.compile(
+    r"(?:reset|resets)\s+(?:at|on)\s+"
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+    r"\s*([+-]\d{2}:?\d{2})?",
+    re.IGNORECASE,
+)
+
+
+def _extract_reset_at_from_message(message: str) -> Optional[float]:
+    """Search a provider error message for an absolute reset timestamp.
+
+    Handles formats like:
+      "It will reset at 2026-09-15 00:19:52 +0800 CST"
+      "Quota resets on 2026-09-15T00:19:52+08:00"
+    """
+    m = _RESET_AT_PATTERN.search(message)
+    if not m:
+        return None
+    date_part, time_part, offset = m.group(1), m.group(2), m.group(3)
+    # Build an ISO-ish string: "YYYY-MM-DD HH:MM:SS+HHMM" or
+    # "YYYY-MM-DD HH:MM:SS" (no offset → assume UTC; Hermes is provider-agnostic)
+    iso_str = f"{date_part} {time_part}"
+    if offset:
+        # Normalise "+0800" → "+08:00" if needed; strip colon if already has one
+        offset = offset.replace(":", "")
+        iso_str += f" {offset[:3]}:{offset[3:]}" if len(offset) == 5 else f" {offset}"
+    try:
+        return datetime.fromisoformat(iso_str).timestamp()
+    except ValueError:
+        return None
 
 
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:
