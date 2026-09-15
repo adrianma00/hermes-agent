@@ -391,6 +391,11 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         parsed_reset_at = _extract_reset_at_from_message(message)
     if parsed_reset_at is not None:
         normalized["reset_at"] = parsed_reset_at
+    # Also extract quota window type (5h/weekly/monthly) from the message
+    if isinstance(message, str):
+        window = _extract_window_type(message)
+        if window:
+            normalized["window"] = window
     return normalized
 
 
@@ -427,6 +432,37 @@ def _extract_reset_at_from_message(message: str) -> Optional[float]:
         return datetime.fromisoformat(iso_str).timestamp()
     except ValueError:
         return None
+
+
+# Pattern for quota window type embedded in provider error messages.
+# Matches "5-hour", "weekly", "monthly" in quota-exhaustion messages.
+_WINDOW_TYPE_PATTERN = re.compile(
+    r"(5[-\s]?hour|weekly|monthly)",
+    re.IGNORECASE,
+)
+
+# Map canonical window-type strings to short labels.
+_WINDOW_LABEL_MAP = {
+    "5-hour": "5h",
+    "5 hour": "5h",
+    "weekly": "weekly",
+    "monthly": "monthly",
+}
+
+
+def _extract_window_type(message: str) -> Optional[str]:
+    """Search a provider error message for the quota window type.
+
+    Returns a short label ("5h", "weekly", "monthly") or None.
+    Handles messages like:
+      "You have exceeded the 5-hour usage quota..."
+      "You have exceeded the weekly usage quota..."
+    """
+    m = _WINDOW_TYPE_PATTERN.search(message)
+    if not m:
+        return None
+    key = m.group(1).lower().strip()
+    return _WINDOW_LABEL_MAP.get(key)
 
 
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:

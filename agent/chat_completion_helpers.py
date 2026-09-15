@@ -1844,6 +1844,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 provider=getattr(agent, "provider", None),
                 reset_at=_ctx.get("reset_at"),
                 reason=getattr(reason, "value", None) if reason is not None else None,
+                window=_ctx.get("window"),
             )
         except Exception:
             logger.debug("quota gate trigger skipped", exc_info=True)
