@@ -3151,6 +3151,14 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             abs_ts = _extract_reset_at_from_message(context["message"])
             if abs_ts is not None:
                 context["reset_at"] = abs_ts
+    # Which quota window is exhausted (5h / weekly / monthly). Carried on the agent's
+    # error context because the quota-gate trigger reads it to label the gate card —
+    # without this it always defaults to "5h" even on a weekly/monthly wall.
+    if "window" not in context and isinstance(context.get("message") or "", str):
+        from agent.credential_pool import _extract_window_type
+        _window = _extract_window_type(context["message"])
+        if _window:
+            context["window"] = _window
     return context
 
 
