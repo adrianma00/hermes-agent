@@ -67,7 +67,7 @@ def test_restore_primary_runtime_is_gated_on_rejected_primary_slug():
     fb_client = MagicMock()
     fb_client.api_key, fb_client.base_url = "fallback-" + "key-1234", "https://fallback.example.com/v1"
 
-    def _run(rejected_slug):
+    def _run(rejected_slug, gate_wait=False):
         agent = _make_agent(fallback_model={"provider": "zai", "model": "glm-5.2"})
         agent._primary_runtime["model"], agent._primary_runtime["provider"] = "gpt-5.6-sol", "openai-codex"
         agent._entitlement_rejected_models = {("openai-codex", rejected_slug)}
@@ -75,6 +75,9 @@ def test_restore_primary_runtime_is_gated_on_rejected_primary_slug():
             assert agent._try_activate_fallback() is True
         emitted = []
         agent._emit_status = emitted.append
+        # The "Primary model restored" notice marks a QUOTA-GATED recovery, so it
+        # needs the reset-gate wait signal — a bare restore is deliberately silent.
+        agent._restore_wait_logged = gate_wait
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             restored = agent._restore_primary_runtime()
         return agent, restored, emitted
@@ -84,6 +87,6 @@ def test_restore_primary_runtime_is_gated_on_rejected_primary_slug():
     assert (agent.provider, agent.model, agent._fallback_activated) == ("zai", "glm-5.2", True)
     assert not any("Primary model restored" in n for n in emitted)
 
-    _, restored, emitted = _run("some-other-slug")
+    _, restored, emitted = _run("some-other-slug", gate_wait=True)
     assert restored is True
     assert any("Primary model restored" in n for n in emitted)

@@ -1143,7 +1143,10 @@ def restore_primary_runtime(agent) -> bool:
     )
     if blocked:
         return False
-    agent._restore_wait_logged = False
+    # Read the gate-wait signal but do NOT clear it yet: a restore that fails
+    # part-way is retried, and clearing here would lose the evidence that the
+    # recovery was quota-gated (the notice is suppressed without it).
+    _was_restore_gate_blocked = getattr(agent, "_restore_wait_logged", False)
     fallback_route = getattr(agent, "_provider_fallback_route", None)
     if not (isinstance(fallback_route, (list, tuple)) and len(fallback_route) == 2):
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
@@ -1187,7 +1190,14 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        if provider_fallback_active:
+        # Clear the gate-wait signal only now that the restore has succeeded, so a
+        # retry after a partial failure still knows the recovery was quota-gated.
+        agent._restore_wait_logged = False
+        if provider_fallback_active and _was_restore_gate_blocked:
+            # Only announce when the restore was actually BLOCKED by a reset gate
+            # (quota exhaustion). A transient 429 (rate limit) that expires before
+            # the next turn restores silently — the user sees no "Primary model
+            # restored" message when quota was never an issue.
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_status(

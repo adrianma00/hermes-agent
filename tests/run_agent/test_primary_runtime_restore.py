@@ -186,6 +186,10 @@ class TestRestorePrimaryRuntime:
 
         emitted = []
         agent._emit_status = emitted.append
+        # The restore notice is reserved for a QUOTA-GATED recovery: the flag is
+        # raised while the reset gate blocks the restore and survives until the
+        # window reopens. Without it a transient-429 fallback restores silently.
+        agent._restore_wait_logged = True
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
 
@@ -193,6 +197,36 @@ class TestRestorePrimaryRuntime:
             f"✅ Primary model restored: {original_model} via {original_provider}; "
             "fallback anthropic/claude-sonnet-4 via openrouter is no longer active."
         ]
+
+    def test_no_restore_notice_when_the_fallback_was_not_quota_gated(self):
+        """A transient-429 fallback must restore SILENTLY.
+
+        Ark answers with ``429 ServerOverloaded`` ("...due to server overload.
+        Please retry later.") for transient capacity. That is classified
+        ``overloaded`` → retried twice → walks the provider chain by design, with
+        no quota wall involved. Emitting "Primary model restored" for it reads as
+        a quota recovery and is pure noise (reported live 2026-09-15).
+        """
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        agent.model = "primary-model"
+        agent._primary_runtime["model"] = "primary-model"
+        mock_client = _mock_resolve()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        emitted = []
+        agent._emit_status = emitted.append
+        # The reset gate never blocked (no quota reset was pending).
+        agent._restore_wait_logged = False
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert emitted == [], f"expected silence on a non-gated restore, got {emitted!r}"
 
     def test_does_not_label_temporary_model_restore_as_fallback_recovery(self):
         """`/model --once` reuses restore with no provider fallback lifecycle."""
@@ -223,6 +257,8 @@ class TestRestorePrimaryRuntime:
 
         emitted = []
         agent._emit_status = emitted.append
+        # Quota-gated recovery: the flag is raised while the reset gate blocks.
+        agent._restore_wait_logged = True
         with (
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch.object(
