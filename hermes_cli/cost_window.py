@@ -99,12 +99,17 @@ def cost_window_command(args) -> int:
     print(f"   peak windows   : {_fmt_windows(state.windows)}")
     print(f"   peak days      : {_fmt_days(state.days)}")
     print(f"   priced providers: {', '.join(state.providers) or '(none)'}")
+    _clock = {True: "synchronised (NTP)", False: "NOT synchronised", None: "unknown"}
+    print(f"   clock           : {_clock.get(state.clock_synced, 'unknown')}")
 
     until = _bypass_until()
     if until:
         print(f"   bypass         : ACTIVE until {_sgt(until)}")
     print()
     print(f"   {_status_line(state)}")
+    warning = _clock_warning(state)
+    if warning:
+        print(warning)
 
     if not bool(block.get("enabled", False)):
         print()
@@ -118,6 +123,13 @@ def _status_line(state) -> str:
         return "Status: DISABLED — cards spawn immediately."
     if state.reason == "bypass_active":
         return "Status: BYPASS — cards spawn immediately, peak-priced or not."
+    if state.reason == "awaiting_ntp":
+        until = f" (re-checking {_sgt(state.resume_at)})" if state.resume_at else ""
+        return (
+            "Status: HOLDING for clock sync — the system clock is not NTP-"
+            "synchronised, and a time-based decision must not be made on a clock "
+            f"known to be wrong{until}."
+        )
     if state.is_deferred and state.resume_at:
         return (
             f"Status: DEFERRED (peak hours) — cards routed to "
@@ -126,3 +138,19 @@ def _status_line(state) -> str:
             f"`hermes kanban run-now <id>`; fleet-wide: `hermes cost-window open 2h`."
         )
     return "Status: OFF-PEAK — cards spawn at the discounted rate."
+
+
+def _clock_warning(state) -> str:
+    """A separate line, because the window evaluation owns the status line.
+
+    The grace-elapsed case still produces a normal deferred/off-peak verdict, so
+    folding the warning into that string would erase it.
+    """
+    if getattr(state, "clock_grace_elapsed", False):
+        return (
+            "   ⚠️  Clock still unsynchronised past the grace period — proceeding "
+            "anyway (fail open). Check this host's time source."
+        )
+    if state.clock_synced is False:
+        return "   ⚠️  Clock is NOT NTP-synchronised."
+    return ""

@@ -1795,6 +1795,14 @@ DEFAULT_CONFIG = {
             # Providers whose price varies by time of day. A flat-rate plan must NOT
             # be listed: deferring it wastes time and saves nothing.
             "providers": ["deepseek"],
+            # This gate decides FROM the clock, so an unsynchronised clock is the
+            # input, not a detail. On a host whose RTC boots fast, the first
+            # seconds after boot see a wrong time, so hold cards until NTP lands
+            # rather than acting on a value known to be wrong. Bounded: after
+            # clock_sync_grace_seconds without NTP we proceed anyway (fail open),
+            # so a host with no time source never parks the fleet forever.
+            "require_clock_sync": True,
+            "clock_sync_grace_seconds": 300,
         },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.

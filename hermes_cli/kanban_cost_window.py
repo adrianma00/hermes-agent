@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -159,6 +160,14 @@ class CostWindowState:
     reason: str = "disabled"
     # Providers the deferral is configured for (populated by the reader).
     providers: tuple[str, ...] = ()
+    # Clock trust: True/False from timedatectl, None when undeterminable.
+    # Reported so an operator can see WHY a deferral is happening — a hold for
+    # "awaiting_ntp" is a different story from a hold for peak pricing.
+    clock_synced: Optional[bool] = None
+    # The clock stayed unsynchronised past the grace period and we proceeded
+    # anyway. Its own field, not a ``reason``: the window evaluation still runs
+    # and owns ``reason``, so folding the warning in there would erase it.
+    clock_grace_elapsed: bool = False
 
     def covers(self, provider: Optional[str]) -> bool:
         """Whether this deferral applies to a card running on ``provider``.
@@ -229,6 +238,60 @@ def _bypass_until(now: Optional[float] = None) -> Optional[float]:
         return None
 
 
+# ── Clock trust ─────────────────────────────────────────────────────────
+# This gate makes a decision FROM the clock, so an unsynchronised clock is not
+# a detail — it is the input. This host boots with its RTC ~3.3h fast and NTP
+# steps the clock back seconds later (journal: "rtc_cmos 00:03: setting system
+# clock to 2026-09-29T21:49:55 UTC"), so for those first seconds every
+# time-based decision is made on a value known to be wrong.
+#
+# The response is to WAIT, not to guess: hold cards for a moment until the clock
+# is trustworthy. Bounded, because a host with no NTP at all must never park the
+# fleet forever — after the grace period we proceed (fail open, like everything
+# else here).
+_CLOCK_SYNC_TTL = 5.0          # seconds to reuse one timedatectl answer
+_CLOCK_SYNC_UNKNOWN = object()  # "not measured yet" — distinct from a real None
+_clock_sync_cache: dict = {"at": None, "synced": _CLOCK_SYNC_UNKNOWN}
+_clock_unsynced_since: Optional[float] = None
+# How long to keep asking for NTP before giving up and proceeding.
+DEFAULT_CLOCK_SYNC_GRACE_SECONDS = 300.0
+# Re-check cadence while waiting (and the resume instant we publish).
+_CLOCK_RETRY_SECONDS = 30.0
+
+
+def _ntp_synchronized(now: Optional[float] = None) -> Optional[bool]:
+    """Whether the system clock is NTP-synchronised: True / False / None.
+
+    ``None`` means undeterminable (no ``timedatectl``, non-systemd host, probe
+    error) and callers must treat it as "cannot prove it is wrong" — i.e. proceed.
+    Cached briefly so a tick that evaluates many cards shells out once.
+    """
+    moment = now if now is not None else time.time()
+    cached_at, cached = _clock_sync_cache.get("at"), _clock_sync_cache.get("synced")
+    if cached is not _CLOCK_SYNC_UNKNOWN and cached_at is not None and moment - cached_at < _CLOCK_SYNC_TTL:
+        return cached
+    synced: Optional[bool] = None
+    try:
+        proc = subprocess.run(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            synced = proc.stdout.strip().lower() in {"yes", "true", "1"}
+    except Exception:
+        synced = None
+    _clock_sync_cache["at"], _clock_sync_cache["synced"] = moment, synced
+    return synced
+
+
+def _reset_clock_cache() -> None:
+    """Clear the cached sync answer and the unsynced-since marker (tests)."""
+    global _clock_unsynced_since
+    _clock_sync_cache["at"] = None
+    _clock_sync_cache["synced"] = _CLOCK_SYNC_UNKNOWN
+    _clock_unsynced_since = None
+
+
 def read_cost_window_state(
     provider: Optional[str] = None,
     *,
@@ -258,6 +321,11 @@ def read_cost_window_state(
         for p in (block.get("providers") or DEFAULT_PROVIDERS)
         if str(p).strip()
     )
+    require_clock_sync = bool(block.get("require_clock_sync", True))
+    try:
+        grace = float(block.get("clock_sync_grace_seconds", DEFAULT_CLOCK_SYNC_GRACE_SECONDS))
+    except (TypeError, ValueError):
+        grace = DEFAULT_CLOCK_SYNC_GRACE_SECONDS
 
     if not enabled:
         return CostWindowState(windows=windows, days=days, providers=providers, reason="disabled")
@@ -272,6 +340,28 @@ def read_cost_window_state(
     if until:
         state.reason = "bypass_active"
         return state
+
+    # Never decide a TIME-based question from a clock we know is wrong. Hold
+    # cards until NTP lands, bounded by the grace period so an NTP-less host
+    # still makes progress.
+    if require_clock_sync:
+        synced = _ntp_synchronized(moment.timestamp())
+        state.clock_synced = synced
+        if synced is False:
+            global _clock_unsynced_since
+            if _clock_unsynced_since is None:
+                _clock_unsynced_since = moment.timestamp()
+            waited = moment.timestamp() - _clock_unsynced_since
+            if waited < grace:
+                state.is_deferred = True
+                state.resume_at = moment.timestamp() + _CLOCK_RETRY_SECONDS
+                state.reason = "awaiting_ntp"
+                return state
+            # NTP is not coming (no network, no daemon, late boot). Fail open:
+            # a wrong-but-progressing fleet beats a permanently parked one.
+            state.clock_grace_elapsed = True
+        else:
+            _clock_unsynced_since = None
 
     resume = next_window_end(moment, windows, days)
     if resume is None:
