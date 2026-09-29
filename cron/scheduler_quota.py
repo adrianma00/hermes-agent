@@ -75,6 +75,19 @@ def _job_effective_provider(job: dict, cfg: dict) -> str:
     return str((model_cfg or {}).get("provider") or "").strip()
 
 
+def job_needs_model(job: dict) -> bool:
+    """Whether firing this job will make a model call (and so spend walled quota).
+
+    A ``no_agent`` job IS its script: it runs, delivers stdout, and never touches a
+    provider. Holding one therefore buys nothing and costs the fleet its monitoring
+    for the whole pause — and a quota pause is precisely when an unattended fleet
+    needs its monitors most. Hit for real: during the 2026-09 wall the Vault came up
+    sealed after a host reboot and the ``no_agent`` health check that would have
+    caught it was itself held until the reset, i.e. blind for ~13 days.
+    """
+    return not job.get("no_agent")
+
+
 def job_is_exempt(job: dict, cfg: dict, gate) -> bool:
     """Whether this job sidesteps the gate: pinned to a provider other than the walled one.
 
@@ -122,6 +135,10 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
     reset_at = gate.reset_at
 
     for job in due_jobs:
+        if not job_needs_model(job):
+            # Pure script: spends none of the walled quota, so it always fires.
+            fire.append(job)
+            continue
         if job_is_exempt(job, cfg, gate):
             fire.append(job)
             continue
