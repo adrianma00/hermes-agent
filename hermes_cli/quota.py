@@ -104,10 +104,28 @@ def _cmd_status(args: argparse.Namespace) -> int:
     state = kb.read_quota_gate_state(enabled=True)
     if state.is_closed:
         walled = state.walled_provider or "unknown"
-        reset_s = f" ({time.strftime('%H:%M:%S', time.localtime(state.reset_at))})" if state.reset_at else ""
-        print(f"Gate CLOSED for {walled}  reset at {reset_s}")
+        win = f" [{state.window} window]" if state.window else ""
+        if state.reset_at:
+            # Show the DATE, not just a clock time: "reset at (23:59:59)" is how a
+            # 13-day monthly wall reads as "tonight", which is the single most
+            # misleading thing this command used to print.
+            when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(state.reset_at))
+            left = state.reset_at - time.time()
+            if left >= 86400:
+                rel = f"{left / 86400:.1f} days"
+            elif left >= 3600:
+                rel = f"{left / 3600:.1f} hours"
+            else:
+                rel = f"{max(1, int(left // 60))} min"
+            print(f"Gate CLOSED for {walled}{win} — resets {when} (in {rel})")
+        else:
+            # No reset time = nothing will reopen this automatically. Say so.
+            print(f"Gate CLOSED for {walled}{win} — reset time UNKNOWN; will NOT auto-reopen.")
+            print("  Fix: `hermes quota open <provider>` (or set reset_at on the gate card).")
         if state.fallback_model:
             print(f"  Override route: {state.fallback_provider}:{state.fallback_model}")
+        else:
+            print("  Hard pause: no fallback route — cards wait for the reset.")
     else:
         print("Gate OPEN — all providers available")
     return 0

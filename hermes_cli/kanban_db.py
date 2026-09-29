@@ -4641,6 +4641,10 @@ class QuotaGateState:
     # permanently pinned to a DIFFERENT provider consumes no walled quota and
     # is exempt from the pause.
     walled_provider: Optional[str] = None
+    # Which quota window walled us (5h / weekly / monthly, parsed from the 429).
+    # Load-bearing for the operator: "reopens 23:59:59" reads as TONIGHT, and a
+    # monthly wall is ~13 days away. Surface it, don't make them compute it.
+    window: Optional[str] = None
     fallback_model: Optional[str] = None
     fallback_provider: Optional[str] = None
 
@@ -4767,6 +4771,7 @@ def read_quota_gate_state(
                 is_closed=True,
                 reset_at=float(reset_at),
                 walled_provider=gate.get("provider"),
+                window=gate.get("window"),
                 fallback_model=fb_model,
                 fallback_provider=fb_provider,
             )
