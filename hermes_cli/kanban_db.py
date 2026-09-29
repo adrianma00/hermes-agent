@@ -972,6 +972,9 @@ class Task:
     # Quota-gate override: 1 = may run while the primary provider quota is
     # walled (routed to the fallback chain for that spawn only).
     quota_override: bool = False
+    # Cost-window override: 1 = may run inside the provider's peak-price hours
+    # rather than waiting for the off-peak discount.
+    run_now: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -990,6 +993,7 @@ class Task:
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             quota_override=bool(g("quota_override")),
+            run_now=bool(g("run_now")),
         )
 
 
@@ -1491,6 +1495,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     quota_override: bool = False,
+    run_now: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1591,8 +1596,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        quota_override
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        quota_override, run_now
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1603,6 +1608,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         1 if quota_override else 0,
+                        1 if run_now else 0,
                     ),
                 )
                 for pid in parents:
@@ -1820,6 +1826,22 @@ def set_quota_override(conn: sqlite3.Connection, task_id: str, enabled: bool) ->
         "UPDATE tasks SET quota_override = ? WHERE id = ?", (1 if enabled else 0,),
         "quota_override_set", {"quota_override": bool(enabled)},
         ("quota_override",), archived_msg="cannot set quota override",
+    )
+
+
+def set_run_now(conn: sqlite3.Connection, task_id: str, enabled: bool) -> bool:
+    """Set/clear the per-task cost-window override.
+
+    ``enabled=True`` lets the task spawn INSIDE the provider's peak-price hours
+    instead of waiting for the off-peak discount — the "force an immediate run"
+    escape hatch. Independent of the quota override: this one buys time with
+    money, whereas ``quota_override`` spends money to beat a quota wall.
+    """
+    return _set_task_override(
+        conn, task_id,
+        "UPDATE tasks SET run_now = ? WHERE id = ?", (1 if enabled else 0,),
+        "run_now_set", {"run_now": bool(enabled)},
+        ("run_now",), archived_msg="cannot set run-now",
     )
 
 

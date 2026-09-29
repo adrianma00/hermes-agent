@@ -385,6 +385,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
             quota_override=bool(getattr(args, "quota_override", False)),
+            run_now=bool(getattr(args, "run_now", False)),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -532,6 +533,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("model", f"{task.model_override}{_prov}")
     if task.quota_override:
         field("quota-override", "on — runs while the provider-quota gate is closed")
+    if getattr(task, "run_now", False):
+        field("run-now", "on — spawns inside the provider peak-price window")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -631,6 +634,25 @@ def _cmd_quota_override(args: argparse.Namespace) -> int:
     state = "set" if enabled else "cleared"
     print(f"Quota override {state} on {args.task_id} "
           f"({'runs on the fallback chain while the quota gate is closed' if enabled else 'waits with the fleet when the gate is closed'})")
+    return 0
+
+
+def _cmd_run_now(args: argparse.Namespace) -> int:
+    """Set/clear a task's cost-window override (may run during peak-price hours)."""
+    raw = (getattr(args, "state", None) or "on").strip().lower()
+    if raw in {"on", "true", "1", "yes", "enable", "enabled"}:
+        enabled = True
+    elif raw in {"off", "false", "0", "no", "disable", "disabled", "clear"}:
+        enabled = False
+    else:
+        return _err(f"kanban: expected on|off, got {raw!r}", 2)
+    with kbc.connect_closing() as conn:
+        ok = kb.set_run_now(conn, args.task_id, enabled)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    state = "set" if enabled else "cleared"
+    print(f"Run-now {state} on {args.task_id} "
+          f"({'spawns immediately, even inside the provider peak-price window' if enabled else 'waits for the off-peak discount again'})")
     return 0
 
 
@@ -1290,6 +1312,7 @@ _HANDLERS = {
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "quota-override": _cmd_quota_override,
+    "run-now": _cmd_run_now,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

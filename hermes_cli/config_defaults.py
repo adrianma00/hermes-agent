@@ -1778,6 +1778,24 @@ DEFAULT_CONFIG = {
             # Shared across the fleet/tenants so every profile reads the same state.
             "board": "yummi-admin",
         },
+        # Provider COST-window deferral: hold dispatch out of a provider's peak-price
+        # hours so batch work runs at the discounted rate. The twin of quota_gate, with
+        # two deliberate differences: it FAILS OPEN (a clock/config problem must cost
+        # time, never stop the fleet) and it holds no cross-install state, because the
+        # boundary recurs daily and every install can compute it from the clock.
+        # Off by default. A per-card `run_now` flag (or a `cost-window:bypass` card)
+        # forces an immediate spawn.
+        "cost_window": {
+            "enabled": False,
+            # Peak windows in UTC, exactly as the provider publishes them.
+            # DeepSeek: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri; every other hour
+            # (incl. all weekend) is off-peak at half price.
+            "peak_windows_utc": ["01:00-04:00", "06:00-10:00"],
+            "peak_days": ["mon", "tue", "wed", "thu", "fri"],
+            # Providers whose price varies by time of day. A flat-rate plan must NOT
+            # be listed: deferring it wastes time and saves nothing.
+            "providers": ["deepseek"],
+        },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

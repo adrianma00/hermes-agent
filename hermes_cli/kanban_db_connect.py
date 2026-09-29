@@ -819,6 +819,10 @@ _LATER_TASK_COLUMNS = (
     # Quota-gate override: 1 = may run while the provider quota gate is closed
     # (routed to the fallback chain for that spawn only).
     ("quota_override", "quota_override INTEGER NOT NULL DEFAULT 0"),
+    # Cost-window override: 1 = may run inside the provider's PEAK-price hours
+    # instead of waiting for the off-peak discount. Independent of quota_override:
+    # this one buys time with money, that one spends money to beat a quota wall.
+    ("run_now", "run_now INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

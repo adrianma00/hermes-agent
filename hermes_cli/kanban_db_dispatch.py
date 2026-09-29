@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task, QuotaGateState
+    from hermes_cli.kanban_cost_window import CostWindowState
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -149,6 +150,11 @@ class DispatchResult:
     """Task ids skipped because the provider-quota gate is closed and the
     task has no ``quota_override`` flag. Released automatically when the
     gate reopens or the reset timestamp elapses."""
+    cost_deferred: list[str] = field(default_factory=list)
+    """Task ids held because the current UTC time is inside the provider's
+    PEAK-price window and the task has no ``run_now`` flag. Released
+    automatically when the window ends — unlike ``quota_paused`` there is no
+    reset instant to record, because the boundary recurs daily."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1922,6 +1928,7 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     quota_gate: Optional["QuotaGateState"] = None,
+    cost_window: Optional["CostWindowState"] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2006,6 +2013,35 @@ def _dispatch_lane_task(
                             if (override_flag and not quota_gate.fallback_model)
                             else "gate_closed"
                         ),
+                    })
+            return False
+
+    # --- Provider COST-window deferral (peak-price hold) -------------------
+    # Checked AFTER the quota gate, and independent of it: the quota gate
+    # answers "is this provider walled?", this one "is its discounted window
+    # shut?". A card that will run on a priced provider waits for off-peak
+    # unless it carries ``run_now``.
+    #
+    # The effective provider matters: an install whose PRIMARY is a flat-rate
+    # coding plan must not be deferred, because delaying it saves nothing. So
+    # resolve what this card will actually run on — an explicit pin wins, else
+    # the gated fallback route, else the configured primary.
+    if cost_window is not None and cost_window.is_deferred:
+        run_now_flag, pinned = _task_run_now_flag(conn, task_id)
+        if pinned:
+            effective_provider = pinned
+        elif quota_gate is not None and quota_gate.is_closed and quota_gate.fallback_provider:
+            effective_provider = quota_gate.fallback_provider
+        else:
+            effective_provider = _configured_primary_provider()
+        if cost_window.covers(effective_provider) and not run_now_flag:
+            result.cost_deferred.append(task_id)
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "cost_deferred", {
+                        "resume_at": cost_window.resume_at,
+                        "provider": effective_provider,
+                        "reason": "peak_hours",
                     })
             return False
 
@@ -2206,6 +2242,44 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def _task_run_now_flag(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
+    """``(run_now, provider_override)`` for ``task_id``.
+
+    ``run_now`` forces a spawn inside the provider's peak-price window; the
+    provider pin decides whether the window applies to this card at all.
+    """
+    try:
+        row = conn.execute(
+            "SELECT run_now, provider_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False, None
+    if row is None:
+        return False, None
+    try:
+        return bool(row["run_now"]), (row["provider_override"] or None)
+    except (IndexError, KeyError):
+        # Pre-migration DB without the column: no override.
+        return False, None
+
+
+def _configured_primary_provider() -> Optional[str]:
+    """The install's configured default provider (``model.provider``).
+
+    Used to decide whether the cost window applies to an unpinned card: a
+    flat-rate primary must not be deferred, because waiting saves nothing.
+    Returns None when unreadable — the caller then treats the route as priced,
+    i.e. defers (matching ``CostWindowState.covers(None)``).
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        cfg = load_user_config_effective() or {}
+        return ((cfg.get("model") or {}).get("provider") or None)
+    except Exception:
+        return None
+
+
 def _task_quota_gate_flags(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
     """``(quota_override, provider_override)`` for ``task_id``.
 
@@ -2328,6 +2402,13 @@ def _dispatch_once_locked(
     if quota_gate.is_closed:
         result.quota_paused = []  # populated by _dispatch_lane_task
 
+    # Provider cost-window (peak-price) deferral — the twin of the quota gate,
+    # read the same way. Unlike the quota gate it FAILS OPEN: a broken clock or
+    # config means "spawn as usual", because misreading the time costs money,
+    # whereas misreading a quota wall costs a fleet of failed workers.
+    from hermes_cli.kanban_cost_window import read_cost_window_state
+    cost_window = read_cost_window_state()
+
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2362,6 +2443,7 @@ def _dispatch_once_locked(
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         quota_gate=quota_gate,
+        cost_window=cost_window,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

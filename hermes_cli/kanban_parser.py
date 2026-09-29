@@ -216,6 +216,10 @@ _SPECS = [
              help="Priority card: still runs while the provider-quota gate is "
                   "closed, routed to the configured fallback chain for that "
                   "spawn only (returns to the primary when the gate reopens)."),
+        _arg("--run-now", action="store_true", dest="run_now",
+             help="Run immediately even inside the provider's PEAK-price window, "
+                  "instead of waiting for the off-peak discount. Costs money, "
+                  "saves time."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -262,6 +266,12 @@ _SPECS = [
              help="on = may run while the provider-quota gate is closed "
                   "(routed to the fallback chain); off = waits with the fleet."),
     ], help="Let one card run while the provider-quota gate is closed"),
+    _cmd("run-now", [
+        _TASK_ID,
+        _arg("state", nargs="?", choices=("on", "off"), default="on",
+             help="on = spawn now even inside the provider peak-price window; "
+                  "off = wait for the off-peak discount again."),
+    ], help="Force one card to run now, ignoring peak-pricing hours"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
