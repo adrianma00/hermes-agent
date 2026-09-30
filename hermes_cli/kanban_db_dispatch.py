@@ -214,10 +214,39 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.quota_paused:
+            counts["quota_paused"] = counts.get("quota_paused", 0) + len(res.quota_paused)
+        if res.cost_deferred:
+            counts["cost_deferred"] = counts.get("cost_deferred", 0) + len(res.cost_deferred)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def deliberate_gate_holds(results: Iterable[Optional["DispatchResult"]]) -> str:
+    """Name the DELIBERATE gate holds (quota pause / cost window), or ``""`` if none.
+
+    A gate hold is the dispatcher obeying its configuration, not a stalled queue, so health
+    telemetry must not read it as "0 spawned -> dispatcher stuck". Neither field was known to
+    :func:`describe_suppression`, so through every peak window the embedded dispatcher logged
+    ``ready queue non-empty for N consecutive ticks but 0 workers spawned`` with an EMPTY reason
+    line (56 consecutive ticks observed 2026-09-30) — which is the worst shape for an alarm: it
+    cries wolf on a correct hold AND leaves the reader nothing to act on, hiding a genuine stall
+    in the noise.
+
+    Deliberately narrow: it reports ONLY the gate holds. Every other suppression reason keeps
+    counting as a bad tick, so a real stuck still fires.
+    """
+    counts: dict[str, int] = {}
+    for res in results:
+        if res is None:
+            continue
+        if res.quota_paused:
+            counts["quota_paused"] = counts.get("quota_paused", 0) + len(res.quota_paused)
+        if res.cost_deferred:
+            counts["cost_deferred"] = counts.get("cost_deferred", 0) + len(res.cost_deferred)
+    return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in

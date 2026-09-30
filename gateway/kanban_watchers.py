@@ -302,7 +302,16 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    # A deliberate gate hold (quota pause / cost window) is the dispatcher obeying
+                    # its config, NOT a stuck queue. Counting it made the health line fire every
+                    # tick through every peak window with an empty reason line, which masks a real
+                    # stall in the noise. Any other suppression still counts (see
+                    # deliberate_gate_holds).
+                    from hermes_cli import kanban_db_dispatch as _kbd_gate
+                    gate_hold = _kbd_gate.deliberate_gate_holds(
+                        res for _slug, res in (results or []))
+                    bad_ticks = bad_ticks + 1 if (ready_pending and not any_spawned
+                                                  and not gate_hold) else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
