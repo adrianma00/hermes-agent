@@ -2067,6 +2067,109 @@ def board_namespace(board: Optional[str] = None) -> Optional[str]:
     return canonical
 
 
+# ---------------------------------------------------------------------------
+# R33 (cross-fleet assignee discipline) — the CREATION-side gate
+# ---------------------------------------------------------------------------
+
+# A fleet's TOP-LEVEL bot runs as its ``default`` profile on every install of
+# this family (Em = ``em:default``, Yummi = ``yummi:default``), so R33's
+# "assign cross-fleet work to that fleet's TOP-LEVEL bot" is decidable from the
+# namespace ALONE — no cross-install profile list is needed. An install whose
+# top-level profile is named something else overrides this with
+# ``kanban.cross_fleet_top_level_assignees`` (comma list) in ``config.yaml``.
+DEFAULT_CROSS_FLEET_TOP_LEVEL_ASSIGNEES: frozenset[str] = frozenset({"default"})
+
+
+def cross_fleet_top_level_assignees() -> frozenset[str]:
+    """Profile names that count as a fleet's TOP-LEVEL bot in the creation gate."""
+    raw: Any = None
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        raw = cfg.get("cross_fleet_top_level_assignees")
+    except Exception:
+        raw = None
+    if isinstance(raw, str):
+        tokens = {t.strip().lower() for t in raw.replace(";", ",").split(",")}
+        tokens.discard("")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        tokens = {str(t).strip().lower() for t in raw if str(t).strip()}
+    else:
+        tokens = set()
+    return frozenset(tokens) or DEFAULT_CROSS_FLEET_TOP_LEVEL_ASSIGNEES
+
+
+def cross_fleet_assignee_refusal(
+    assignee: Optional[str], board: Optional[str] = None,
+) -> Optional[str]:
+    """R33 (cross-fleet assignee discipline): refuse a cross-fleet child at CREATION.
+
+    Returns the VISIBLE refusal message when *assignee* hands work belonging to
+    ANOTHER install to one of that install's children, else ``None``. This is the
+    creation-side half of the namespace resolution: :func:`resolve_assignee` is the
+    dispatch-side half, and it cannot catch this case — a bare child name on the
+    board resolves to the BOARD's namespace, so on the receiving install it looks
+    like its own top bot's legitimate delegation, the child is spawned, and card
+    origin is not recorded (``created_by`` is a bare un-namespaced name) so the
+    mistake cannot be told apart afterwards. Creation is the only point that has
+    the information, hence R33's "enforce at creation".
+
+    Deliberately narrow — it fires on exactly one pair:
+
+    * the namespace is ANOTHER install's — explicit (``<ns>:<name>``) or, for a
+      bare name, the one the board declares (:func:`board_namespace`); AND
+    * the profile half is not that fleet's top-level bot
+      (:func:`cross_fleet_top_level_assignees`).
+
+    Everything else passes through unchanged: this install's own profiles (own
+    namespace, explicit or via the board), a bare/unique name on a board that
+    declares no namespace, work addressed to the other fleet's TOP-LEVEL bot (the
+    correct cross-fleet route), and a name with no profile half at all (left to the
+    existing ``assignee_invalid`` dispatch path). Never a silent rewrite: the card
+    is not created and the caller gets the reason and the fix.
+    """
+    raw = str(assignee or "").strip()
+    if not raw:
+        return None
+    namespace, profile = split_assignee(raw)
+    if not profile:
+        return None
+    canonical, accepted = install_namespaces()
+    slug = _effective_board_slug(board)
+    if namespace is None:
+        namespace = board_namespace(slug)
+        origin = f"board {slug!r} declares namespace"
+    else:
+        origin = "assignee is namespaced"
+    if namespace is None or not accepted or namespace in accepted:
+        return None
+    top_level = sorted(cross_fleet_top_level_assignees())
+    if profile.lower() in top_level:
+        return None
+    target = top_level[0]
+    here = canonical or "<this-install>"
+    message = (
+        f"R33 (cross-fleet assignee discipline): assignee {raw!r} would hand work "
+        f"belonging to another install to one of its CHILDREN — {origin} {namespace!r}, "
+        f"which is not this install's namespace ({here}), and {profile!r} is not that "
+        f"fleet's top-level profile. A fleet's children receive work only from their OWN "
+        f"top-level bot, and on the receiving side this card resolves to a legitimate "
+        f"delegation from its own top bot, so the child would be spawned before any rule "
+        f"could be read. Assign it to that fleet's TOP-LEVEL bot ({target!r} on this "
+        f"board, or {namespace}:{target!r}), or to {here}:<profile> if the work is this "
+        f"fleet's. Nothing was created."
+    )
+    try:
+        _kb._log.warning(
+            "kanban create: task NOT created — cross-fleet assignee %r on board %s "
+            "(board_namespace=%r, install_namespace=%r, profile=%r not top-level)",
+            raw, slug, namespace, canonical, profile,
+        )
+    except Exception:  # pragma: no cover — never fail creation on a log line
+        pass
+    return message
+
+
 def resolve_assignee(assignee: Optional[str], board: Optional[str] = None) -> AssigneeResolution:
     """Decide whether THIS install may claim *assignee* on *board*, and as whom.
 

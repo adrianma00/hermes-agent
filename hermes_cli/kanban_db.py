@@ -1553,6 +1553,16 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # R33 (cross-fleet assignee discipline): refuse at CREATION a card that hands
+    # work belonging to ANOTHER install to one of its children. The receiving
+    # dispatcher cannot catch this one — a bare child name there resolves to the
+    # board's own namespace and looks like its top bot's legitimate delegation, so
+    # the child is already spawned by the time any rule is read. Creation is the
+    # only point that has the information. Visible refusal, never a silent rewrite.
+    from hermes_cli.kanban_db_dispatch import cross_fleet_assignee_refusal
+    refusal = cross_fleet_assignee_refusal(assignee, board=board)
+    if refusal:
+        raise ValueError(refusal)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
