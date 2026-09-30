@@ -31,6 +31,16 @@ Profile *existence* is necessarily shared in a single-home test, so cases that
 turn on "this namespace has no such profile" use a profile name that is absent
 from the fixture's profile list.
 
+Profiles are constructed the way the runtime recognises them — a
+``profiles/<name>/`` directory carrying an identity marker
+(:data:`_PROFILE_IDENTITY_FILE`), not a bare ``mkdir``. ``profiles.profile_exists``
+delegates to ``hermes_constants.named_profile_is_live``, which requires one of
+``_PROFILE_IDENTITY_MARKERS``; a bare directory answers False, so the dispatcher
+refused every assignee resolving to a named profile with
+``profile_missing_in_namespace``: three tests stayed red against a fixture whose
+disk layout looked correct. :func:`_assert_fixture_profiles_constructible` fails
+loud on that now.
+
 Isolation, and why it is asserted rather than assumed: the same file, run from a
 Hermes-launched shell, once wrote 37 of its fixture cards into the PRODUCTION
 board DBs (2 default / 11 em-admin / 24 shared, plus a live ``board.json``
@@ -97,6 +107,26 @@ _INHERITED_KANBAN_PINS = (
     "HERMES_KANBAN_HOME",
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_KANBAN_ATTACHMENTS_ROOT",
+)
+
+# A directory under ``profiles/`` is a profile only when something identifies it
+# as one: ``hermes_constants.named_profile_is_live`` requires a marker from
+# ``hermes_constants._PROFILE_IDENTITY_MARKERS`` (``config.yaml``, ``.env``,
+# ``SOUL.md``, ``profile.yaml``, ``auth.json``, ``state.db``). ``config.yaml`` is
+# what ``hermes profile create`` writes first, so the fixture writes that.
+# A bare directory is NOT a live profile: ``profiles.profile_exists`` answers
+# False for it, which is how three tests in this file stayed red — every assignee
+# resolving to a named profile was refused with ``profile_missing_in_namespace``
+# even though the fixture's home was perfectly isolated.
+_PROFILE_IDENTITY_FILE = "config.yaml"
+_PROFILE_IDENTITY_BODY = (
+    "# Written by tests/hermes_cli/test_kanban_assignee_namespaces.py.\n"
+    "# The marker itself is the point: profiles/<name>/ counts as a live profile\n"
+    "# only when it carries one of hermes_constants._PROFILE_IDENTITY_MARKERS,\n"
+    "# which is what profiles.profile_exists() (and so the dispatcher's assignee\n"
+    "# check) resolves against. The mapping is empty on purpose — nothing here\n"
+    "# should change what the code under test reads.\n"
+    "{}\n"
 )
 
 # One per-process base for the fixture homes. Cleaned up at interpreter exit so
@@ -212,6 +242,55 @@ def _assert_fixture_home_isolated(home) -> None:
         )
 
 
+def _assert_fixture_profiles_constructible(home, names) -> None:
+    """Fail LOUD when the fixture's profiles are not the ones the runtime sees.
+
+    ``dispatch_once`` asks ``profiles.profile_exists(<assignee>)``, and that
+    resolves through ``hermes_constants.get_default_hermes_root()`` →
+    ``<root>/profiles/<name>`` live — nothing the fixture passes in. So both
+    halves have to hold, and each was previously checked only by eye:
+
+    * the profiles root this process will read must be inside the fixture home
+      (the platform default root's own ``profiles/`` means the LIVE install's
+      profile set is answering);
+    * every profile the fixture declares must satisfy ``profile_exists`` — a bare
+      directory does not, because ``named_profile_is_live`` requires an identity
+      marker (:data:`_PROFILE_IDENTITY_FILE`).
+
+    A fault in either half shows up as a ``profile_missing_in_namespace`` refusal
+    that reads like a namespace-logic bug: exactly how the three 2026-09-30 reds
+    in this file were first misdiagnosed.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    home_path = Path(home).expanduser().resolve()
+    native = _platform_default_root()
+    root = Path(profiles_mod._get_profiles_root()).expanduser()
+    if not _is_under(root, home_path) or _is_under(root, native):
+        raise AssertionError(
+            f"kanban test isolation: the profiles root this process reads is {root}, "
+            f"which is not inside the fixture home {home_path} (platform default "
+            f"root: {native}). profiles.profile_exists() would answer for the live "
+            f"install's profile set, not the fixture's — the dispatcher would then "
+            f"refuse (or claim) assignees for the wrong reason."
+        )
+    wrong_home = [n for n in names if not _is_under(profiles_mod.get_profile_dir(n), home_path)]
+    if wrong_home:
+        raise AssertionError(
+            f"kanban test isolation: fixture profiles {wrong_home} do not resolve "
+            f"under the fixture home {home_path}."
+        )
+    missing = [n for n in names if not profiles_mod.profile_exists(n)]
+    if missing:
+        raise AssertionError(
+            f"kanban test fixture: profiles {missing} do not satisfy "
+            f"profiles.profile_exists() under {root}. A bare directory is not a live "
+            f"profile — hermes_constants.named_profile_is_live requires an identity "
+            f"marker ({_PROFILE_IDENTITY_FILE}); the dispatcher refuses every "
+            f"assignee resolving to them with profile_missing_in_namespace."
+        )
+
+
 def _assert_pins_stripped(home: Path) -> None:
     """The inherited dispatcher pins must be gone; only this fixture's may remain.
 
@@ -276,7 +355,14 @@ def fleet(monkeypatch):
             tempfile.mkdtemp(prefix="kanban_assignee_ns_test_", dir=str(_fixture_base_dir()))
         )
         for prof in profiles:
-            os.makedirs(os.path.join(home, "profiles", prof), exist_ok=True)
+            profile_dir = home / "profiles" / prof
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            # An identity marker, not just a directory: profile_exists() is
+            # routed through named_profile_is_live() and a bare mkdir answers
+            # False (see _PROFILE_IDENTITY_FILE).
+            (profile_dir / _PROFILE_IDENTITY_FILE).write_text(
+                _PROFILE_IDENTITY_BODY, encoding="utf-8"
+            )
         # Strip the dispatcher's pins BEFORE anything resolves a board path:
         # inherited, they make the caller's own board (HERMES_KANBAN_BOARD) answer
         # with the LIVE pinned file no matter how isolated the home is.
@@ -302,6 +388,11 @@ def fleet(monkeypatch):
         # Fail loud BEFORE any board is created, against the freshly imported
         # modules the writes will actually go through.
         _assert_fixture_home_isolated(home)
+        # …and equally loud about the profile set the dispatcher will consult:
+        # an isolated home whose profiles are not resolvable as live profiles is
+        # what kept three tests in this file red against the LIVE install's
+        # profile names while looking correct on disk.
+        _assert_fixture_profiles_constructible(home, profiles)
         for slug, namespace in boards.items():
             kb.create_board(slug=slug, name=slug, namespace=namespace)
         # The install namespace is resolved once per process and memoised, so a
@@ -554,6 +645,36 @@ def test_connect_guard_rejects_a_connection_outside_the_fixture_home(fleet, tmp_
     with pytest.raises(AssertionError, match="outside the fixture home"):
         with env.kbc.connect_closing(db_path=tmp_path / "elsewhere" / "kanban.db"):
             pass  # pragma: no cover - the connect above must raise
+
+
+def test_fixture_profiles_are_live_the_way_the_runtime_sees_them(fleet):
+    """The fixture's profiles must satisfy the SAME predicate the dispatcher asks,
+    resolved the same way — and the guard must fail loud on the pre-fix shape.
+
+    ``profiles.profile_exists('admin')`` answered False while the fixture built
+    bare ``profiles/admin`` directories, because ``named_profile_is_live`` wants
+    an identity marker. The symptom was not "admin is missing from the fixture"
+    but ``profile_missing_in_namespace`` refusals that read like namespace-logic
+    bugs, so the guard asserts both halves: the resolved profiles root is the
+    fixture's, and the declared names are live there.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    env = fleet(profiles=("default", "admin"), boards={"shared": None})
+    root = Path(profiles_mod._get_profiles_root())
+    assert _is_under(root, env.home), f"profiles root {root} is not the fixture's"
+    assert profiles_mod.profile_exists("admin")
+    marker = Path(env.home) / "profiles" / "admin" / _PROFILE_IDENTITY_FILE
+    assert marker.is_file(), f"no identity marker at {marker}"
+
+    # The pre-fix construction, verbatim, must now be rejected loudly.
+    bare = Path(env.home) / "profiles" / "bare-profile"
+    bare.mkdir()
+    assert profiles_mod.profile_exists("bare-profile") is False, (
+        "a bare directory must not count as a live profile, or this guard proves nothing"
+    )
+    with pytest.raises(AssertionError, match="do not satisfy"):
+        _assert_fixture_profiles_constructible(env.home, ["default", "bare-profile"])
 
 
 # ---------------------------------------------------------------------------
