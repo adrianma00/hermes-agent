@@ -2881,13 +2881,6 @@ def _any_spawnable_review(
     """
     if not review_rows:
         return False
-    claimable = [
-        resolved.profile for resolved in
-        (resolve_assignee(row["assignee"], board) for row in review_rows)
-        if resolved.claimable and resolved.profile
-    ]
-    if not claimable:
-        return False
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
     for row in review_rows:
