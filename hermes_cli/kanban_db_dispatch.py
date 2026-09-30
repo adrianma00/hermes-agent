@@ -2864,10 +2864,62 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _seed_per_profile_running(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> dict[str, int]:
+    """Running-worker counts per RESOLVED profile, for this tick's cap budget.
+
+    The cap check in :func:`_dispatch_lane_task` and its in-tick increment are
+    keyed on the RESOLVED profile (``resolve_assignee``), so the cross-tick
+    snapshot that seeds the budget has to be too. Grouping the raw ``assignee``
+    column — the previous shape — put ``em:default`` under a key no resolution
+    ever produces, so a running explicit-``<ns>:<profile>`` worker was INVISIBLE
+    to its own profile's budget on later ticks: bare ``default`` and
+    ``em:default`` are one profile, and the cap could be exceeded by the number
+    of running explicit-assignee cards for it. (A bare ``default`` happened to
+    work only because its literal string equals the resolved profile name.)
+
+    Refusals must never cost capacity: a literal assignee this install cannot
+    claim (a FOREIGN namespace, an undeclared board's install-relative name, an
+    invalid name) is dropped instead of counted, because
+    :func:`_dispatch_lane_task` refuses that card BEFORE the cap is consulted —
+    it will never consume this install's budget, and counting it under a
+    namespace token (or under the literal ``ns:profile``) would invent a budget
+    for work this install does not run.
+
+    Resolution is per DISTINCT literal assignee (:func:`resolve_assignee` reads
+    the board's ``board.json``), and this only runs when the cap is configured.
+    """
+    counts: dict[str, int] = {}
+    # ``""`` marks an assignee this install must not count; the GROUP BY already
+    # collapsed the rows to one entry per distinct literal assignee.
+    resolved: dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ).fetchall()
+    for row in rows:
+        assignee = row["assignee"]
+        profile = resolved.get(assignee)
+        if profile is None:
+            resolution = resolve_assignee(assignee, board)
+            if not resolution.claimable:
+                resolved[assignee] = ""
+                continue
+            profile = resolution.profile or assignee
+            resolved[assignee] = profile
+        if profile:
+            counts[profile] = counts.get(profile, 0) + int(row["n"])
+    return counts
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
     *,
+    board: Optional[str] = None,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
 ) -> bool:
@@ -2878,6 +2930,12 @@ def _any_spawnable_review(
     assignee already at the per-profile cap, or respawn-guarded — cannot
     consume the reservation, so it must not withhold capacity from an
     otherwise ready task (one such row would pin ``ready_budget`` to 0).
+
+    Keyed on the RESOLVED profile, like the lane loop and the budget it reads: a
+    review row assigned ``em:default`` is the profile ``default``, so a literal
+    lookup would both miss its capped state and misread the label as a profile
+    name. A row this install cannot claim is refused by the lane loop before the
+    cap, so it never needs a slot held for it either.
     """
     if not review_rows:
         return False
@@ -2887,9 +2945,13 @@ def _any_spawnable_review(
         assignee = row["assignee"]
         if not assignee:
             continue
-        if profile_exists is not None and not profile_exists(assignee):
+        resolution = resolve_assignee(assignee, board)
+        if not resolution.claimable:
             continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+        profile = resolution.profile or assignee
+        if profile_exists is not None and not profile_exists(profile):
+            continue
+        if per_profile_cap is not None and running.get(profile, 0) >= per_profile_cap:
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2998,19 +3060,16 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        # Seeded from the DB keyed on the RESOLVED profile (:func:`_seed_per_profile_running`),
+        # matching the check and the in-tick increment in :func:`_dispatch_lane_task`.
+        per_profile_running = _seed_per_profile_running(conn, board)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
     # one slot back.
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
-        conn, review_rows,
+        conn, review_rows, board=board,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
