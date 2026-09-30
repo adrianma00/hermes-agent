@@ -1938,6 +1938,43 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # Provider-quota gate: when the primary model's subscription window is exhausted, hold
+        # queued work until the provider's stated reset time instead of spawning workers that
+        # bounce off the same 429. Disabled by default — an install that never opts in is never
+        # paused. Once enabled the gate FAILS CLOSED: if the shared board is missing or
+        # unreadable, the fleet holds (the shared mount is how the gate is coordinated).
+        "quota_gate": {
+            "enabled": False,
+            # Board that carries the gate card (one `quota-gate:<provider>` card in `scheduled`).
+            # Shared across the fleet/tenants so every profile reads the same state.
+            "board": "yummi-admin",
+        },
+        # Provider COST-window deferral: hold dispatch out of a provider's peak-price
+        # hours so batch work runs at the discounted rate. The twin of quota_gate, with
+        # two deliberate differences: it FAILS OPEN (a clock/config problem must cost
+        # time, never stop the fleet) and it holds no cross-install state, because the
+        # boundary recurs daily and every install can compute it from the clock.
+        # Off by default. A per-card `run_now` flag (or a `cost-window:bypass` card)
+        # forces an immediate spawn.
+        "cost_window": {
+            "enabled": False,
+            # Peak windows in UTC, exactly as the provider publishes them.
+            # DeepSeek: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri; every other hour
+            # (incl. all weekend) is off-peak at half price.
+            "peak_windows_utc": ["01:00-04:00", "06:00-10:00"],
+            "peak_days": ["mon", "tue", "wed", "thu", "fri"],
+            # Providers whose price varies by time of day. A flat-rate plan must NOT
+            # be listed: deferring it wastes time and saves nothing.
+            "providers": ["deepseek"],
+            # This gate decides FROM the clock, so an unsynchronised clock is the
+            # input, not a detail. On a host whose RTC boots fast, the first
+            # seconds after boot see a wrong time, so hold cards until NTP lands
+            # rather than acting on a value known to be wrong. Bounded: after
+            # clock_sync_grace_seconds without NTP we proceed anyway (fail open),
+            # so a host with no time source never parks the fleet forever.
+            "require_clock_sync": True,
+            "clock_sync_grace_seconds": 300,
+        },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

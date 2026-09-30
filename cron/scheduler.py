@@ -4109,6 +4109,20 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # A `quota_override` job runs while the provider-quota gate is closed, routed to the
+    # fallback chain FOR THIS RUN ONLY (in-memory, never persisted) — so the next run after
+    # the window reopens goes back to the primary automatically. Only queried for jobs
+    # carrying the flag, so the common path pays nothing.
+    if job.get("quota_override"):
+        from cron import scheduler_quota as _quota_gate
+        _gate = _quota_gate.gate_state()
+        if _gate is not None:
+            _route = _quota_gate.override_route(claimed_job, _gate)
+            if _route is not None:
+                claimed_job["provider"], claimed_job["model"] = _route
+                logger.info(
+                    "Job '%s': quota override active — running on fallback %s/%s",
+                    job.get("name") or job.get("id"), _route[0], _route[1])
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

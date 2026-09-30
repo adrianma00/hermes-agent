@@ -1305,7 +1305,10 @@ def restore_primary_runtime(agent) -> bool:
     )
     if blocked:
         return False
-    agent._restore_wait_logged = False
+    # Read the gate-wait signal but do NOT clear it yet: a restore that fails
+    # part-way is retried, and clearing here would lose the evidence that the
+    # recovery was quota-gated (the notice is suppressed without it).
+    _was_restore_gate_blocked = getattr(agent, "_restore_wait_logged", False)
     fallback_route = getattr(agent, "_provider_fallback_route", None)
     if not (isinstance(fallback_route, (list, tuple)) and len(fallback_route) == 2):
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
@@ -1353,7 +1356,14 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        if provider_fallback_active:
+        # Clear the gate-wait signal only now that the restore has succeeded, so a
+        # retry after a partial failure still knows the recovery was quota-gated.
+        agent._restore_wait_logged = False
+        if provider_fallback_active and _was_restore_gate_blocked:
+            # Only announce when the restore was actually BLOCKED by a reset gate
+            # (quota exhaustion). A transient 429 (rate limit) that expires before
+            # the next turn restores silently — the user sees no "Primary model
+            # restored" message when quota was never an issue.
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(
@@ -3493,6 +3503,21 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         delay = reset_delay_from_message(context.get("message") or "")
         if delay is not None:
             context["reset_at"] = time.time() + delay
+        else:
+            # Also try extracting an absolute timestamp from the message text
+            # (e.g. "It will reset at 2026-09-15 00:19:52 +0800 CST" from Ark).
+            from agent.credential_pool import _extract_reset_at_from_message
+            abs_ts = _extract_reset_at_from_message(context["message"])
+            if abs_ts is not None:
+                context["reset_at"] = abs_ts
+    # Which quota window is exhausted (5h / weekly / monthly). Carried on the agent's
+    # error context because the quota-gate trigger reads it to label the gate card —
+    # without this it always defaults to "5h" even on a weekly/monthly wall.
+    if "window" not in context and isinstance(context.get("message") or "", str):
+        from agent.credential_pool import _extract_window_type
+        _window = _extract_window_type(context["message"])
+        if _window:
+            context["window"] = _window
     return context
 
 

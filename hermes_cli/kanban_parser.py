@@ -107,6 +107,11 @@ _BOARD_SPECS = [
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
         _arg("--switch", action="store_true", help="Switch to the new board after creating it"),
         _arg("--default-workdir", help="Default workspace path for tasks created on this board"),
+        _arg("--namespace",
+             help="Namespace (install) that BARE assignees on this board refer to, "
+                  "e.g. 'em' or 'yummi'. Declare it on a board shared between "
+                  "installs; without it a bare install-relative assignee like "
+                  "'default' is ambiguous and is skipped, visibly."),
     ], aliases=["new"], help="Create a new board"),
     _cmd("rm", [
         _SLUG,
@@ -122,6 +127,12 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-namespace", [
+        _SLUG,
+        _arg("owner", nargs="?",
+             help="Namespace (install) that bare assignees on this board refer to "
+                  "(e.g. 'em' or 'yummi'). Omit to clear."),
+    ], help="Declare which install's profiles a bare assignee on this board means"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -217,6 +228,14 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--quota-override", action="store_true", dest="quota_override",
+             help="Priority card: still runs while the provider-quota gate is "
+                  "closed, routed to the configured fallback chain for that "
+                  "spawn only (returns to the primary when the gate reopens)."),
+        _arg("--run-now", action="store_true", dest="run_now",
+             help="Run immediately even inside the provider's PEAK-price window, "
+                  "instead of waiting for the off-peak discount. Costs money, "
+                  "saves time."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -257,6 +276,18 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("quota-override", [
+        _TASK_ID,
+        _arg("state", nargs="?", choices=("on", "off"), default="on",
+             help="on = may run while the provider-quota gate is closed "
+                  "(routed to the fallback chain); off = waits with the fleet."),
+    ], help="Let one card run while the provider-quota gate is closed"),
+    _cmd("run-now", [
+        _TASK_ID,
+        _arg("state", nargs="?", choices=("on", "off"), default="on",
+             help="on = spawn now even inside the provider peak-price window; "
+                  "off = wait for the off-peak discount again."),
+    ], help="Force one card to run now, ignoring peak-pricing hours"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

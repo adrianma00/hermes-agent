@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -28,7 +29,8 @@ from typing import TYPE_CHECKING
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
-    from hermes_cli.kanban_db import Task
+    from hermes_cli.kanban_db import Task, QuotaGateState
+    from hermes_cli.kanban_cost_window import CostWindowState
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -125,6 +127,17 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_namespace: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, reason)`` refused because the assignee could not be
+    resolved to a profile THIS install may run: ``namespace_mismatch`` (namespace
+    — explicit or the board's — belongs to another install), ``namespace_undeclared``
+    (bare install-relative name on a board that declares none), ``install_namespace_unresolved``
+    (this install has no namespace configured), ``assignee_invalid``,
+    ``profile_missing_in_namespace`` (the namespace resolves here but has no such
+    profile — e.g. bare ``sysadmin`` on a board whose namespace is another
+    install). Operator-actionable: place the card explicitly as ``<ns>:<profile>``.
+    NEVER a silent skip — each entry is also logged and persisted as a
+    ``dispatch_skipped`` event on the task."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -152,6 +165,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    quota_paused: list[str] = field(default_factory=list)
+    """Task ids skipped because the provider-quota gate is closed and the
+    task has no ``quota_override`` flag. Released automatically when the
+    gate reopens or the reset timestamp elapses."""
+    cost_deferred: list[str] = field(default_factory=list)
+    """Task ids held because the current UTC time is inside the provider's
+    PEAK-price window and the task has no ``run_now`` flag. Released
+    automatically when the window ends — unlike ``quota_paused`` there is no
+    reset instant to record, because the boundary recurs daily."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -1761,7 +1783,393 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+# ---------------------------------------------------------------------------
+# Assignee namespaces: whose ``default`` is it?
+# ---------------------------------------------------------------------------
+#
+# ``default`` is INSTALL-RELATIVE: it means "the top-level agent of the install
+# doing the claiming", and ``profiles.profile_exists("default")`` answers True in
+# EVERY install. So on a board two installs sweep, the card was spawnable in both
+# and ran in whichever dispatcher ticked first (proven live: probe t_45f8aaac on
+# the shared board ran here instead of in the owning install). Same defect family
+# as the ``HERMES_KANBAN_DB`` pin work — a name resolved without the ownership
+# context it depends on.
+#
+# The disambiguation lives in the ASSIGNEE NAME: ``<namespace>:<profile>``
+# (``yummi:default`` = the yummi install's default profile). A bare name is
+# resolved within the BOARD's namespace, so a bare ``default`` on the shared board
+# means that board's install and never whichever dispatcher happens to tick
+# first. Namespacing is better than requiring board ownership because it works on
+# ANY board and lets one board legitimately hold work for either install.
+
+# Bare names that are install-relative (never globally unique) and therefore
+# ambiguous unless the board declares a namespace.
+INSTALL_RELATIVE_ASSIGNEES: frozenset[str] = frozenset({"default"})
+
+# The separator between namespace and profile in an assignee (``yummi:default``).
+NAMESPACE_SEPARATOR = ":"
+
+# Board slugs whose DB is THIS install's own by construction:
+# ``kanban_db.kanban_db_path("default")`` is ``<this install root>/kanban.db``,
+# never a board directory another install's boards root can symlink into, so a
+# sibling install's sweep of the same slug resolves to its own file. That is a
+# property of the slug->path mapping, not an inference from symlinks, and it is
+# why the default board needs no declared namespace while every other board
+# (a directory, possibly symlinked into several board roots) does.
+_INSTALL_LOCAL_BOARD_SLUGS: frozenset[str] = frozenset({"default"})
+
+# Reasons a namespaced/bare assignee is refused. Each one is surfaced as a log
+# line AND a durable ``dispatch_skipped`` event — a refusal that leaves no trace
+# is the exact bug class this feature exists to prevent.
+REASON_NAMESPACE_MISMATCH = "namespace_mismatch"
+REASON_NAMESPACE_UNDECLARED = "namespace_undeclared"
+REASON_NAMESPACE_UNRESOLVED = "install_namespace_unresolved"
+REASON_ASSIGNEE_INVALID = "assignee_invalid"
+REASON_PROFILE_MISSING = "profile_missing_in_namespace"
+
+# Namespace tokens: same shape as profile ids (no colon, path, or case games).
+_NAMESPACE_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]{0,31}$")
+
+
+@dataclass(frozen=True)
+class AssigneeResolution:
+    """What a task's ``assignee`` means HERE: the profile to spawn, or why not.
+
+    ``reason`` set (with ``remedy``) means THIS install must not claim the card.
+    ``claimable`` is the single question the dispatcher asks.
+    """
+
+    assignee: str
+    profile: Optional[str] = None
+    namespace: Optional[str] = None
+    board_namespace: Optional[str] = None
+    reason: Optional[str] = None
+    remedy: Optional[str] = None
+
+    @property
+    def claimable(self) -> bool:
+        return self.reason is None and bool(self.profile)
+
+
+def split_assignee(assignee: Optional[str]) -> "tuple[Optional[str], str]":
+    """``("yummi", "default")`` for ``"Yummi:default"``; ``(None, "sysadmin")`` for a bare name.
+
+    Case-insensitive namespace (``Yummi:default`` == ``yummi:default``): the token
+    is lowercased for comparison while the profile half keeps
+    ``normalize_profile_name``'s lowercase-id rules.
+    """
+    text = str(assignee or "").strip()
+    if NAMESPACE_SEPARATOR not in text:
+        return None, text
+    namespace, _, profile = text.partition(NAMESPACE_SEPARATOR)
+    return namespace.strip().lower() or None, profile.strip()
+
+
+def assignee_profile(assignee: Optional[str]) -> str:
+    """The profile id to actually spawn: the assignee minus any namespace prefix."""
+    return split_assignee(assignee)[1]
+
+
+def _split_namespace_list(raw: Optional[str]) -> "tuple[Optional[str], frozenset[str]]":
+    """``"ama, em"`` -> ``("ama", {"ama", "em"})``; first entry is canonical.
+
+    Aliases exist so the human forms people actually write (an agent name, an OS
+    user) can both resolve, while every message names ONE canonical token.
+    """
+    tokens = [t.strip().lower() for t in str(raw or "").replace(";", ",").split(",")]
+    valid = [t for t in tokens if t and _NAMESPACE_TOKEN_RE.match(t)]
+    if not valid:
+        return None, frozenset()
+    return valid[0], frozenset(valid)
+
+
+def _resolve_install_namespaces(override: str) -> "tuple[Optional[str], frozenset[str]]":
+    """The uncached resolution ``install_namespaces()`` memoises.
+
+    ``override`` is the already-stripped ``HERMES_KANBAN_NAMESPACE`` value (``""``
+    when unset). See :func:`install_namespaces` for the documented order.
+    """
+    if override:
+        return _split_namespace_list(override)
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        configured = str(cfg.get("namespace") or "").strip()
+        if configured:
+            return _split_namespace_list(configured)
+    except Exception:
+        pass
+    try:
+        import getpass
+        user = (getpass.getuser() or "").strip()
+        if user:
+            return _split_namespace_list(user)
+    except Exception:
+        pass
+    try:
+        import pwd
+        return _split_namespace_list(pwd.getpwuid(os.geteuid()).pw_name)
+    except Exception:
+        return None, frozenset()
+
+
+# The resolution, memoised for the life of the process. ``install_namespaces()``
+# sits on the dispatcher's per-tick path and the namespace is a DEPLOY-TIME
+# fact: changing it is a deliberate act that takes a restart (gateway) or a
+# fresh process (worker), so re-parsing ``config.yaml`` every tick buys nothing.
+# The memo is keyed on the raw override so ``HERMES_KANBAN_NAMESPACE`` stays
+# first in the order and stays live (an env read is a dict lookup, not a config
+# parse); the config read and the OS-user fallback happen once per process.
+_NAMESPACE_MEMO: "Optional[tuple[Optional[str], frozenset[str]]]" = None
+_NAMESPACE_MEMO_KEY: Optional[str] = None
+
+
+def _reset_namespace_cache() -> None:
+    """Drop the per-process namespace memo.
+
+    Tests that vary the install's namespace within one process must call this
+    when the variation has to be visible: the ``HERMES_KANBAN_NAMESPACE`` override
+    is part of the memo key and therefore live anyway, but a namespace derived
+    from ``config.yaml`` or the OS user is read once, so a test that rewrites
+    ``config.yaml`` mid-process needs this reset to be re-read. Nothing outside
+    tests calls it and no refusal or remedy depends on it.
+    """
+    global _NAMESPACE_MEMO, _NAMESPACE_MEMO_KEY
+    _NAMESPACE_MEMO = None
+    _NAMESPACE_MEMO_KEY = None
+
+
+def install_namespaces() -> "tuple[Optional[str], frozenset[str]]":
+    """``(canonical, accepted)`` namespace tokens for THIS install.
+
+    Resolution order: ``HERMES_KANBAN_NAMESPACE`` (explicit override — deploy,
+    tests, containers), ``kanban.namespace`` in ``config.yaml`` (comma-separated,
+    first token canonical), then the OS user running the install, which is the
+    identity the install is already implicit under (``/home/<user>/.hermes``;
+    every dispatched worker inherits it). Deliberately NOT ``display_name``
+    (cosmetic, user-editable) and NOT the hostname — two installs share this host,
+    which is precisely the shared-board case.
+
+    ``(None, frozenset())`` when nothing resolves ⇒ install-relative and
+    namespaced assignees are refused rather than guessed.
+
+    Read ONCE per process (:data:`_NAMESPACE_MEMO`): the gateway resolves it at
+    start and every tick after that is free, while a dispatched worker is a fresh
+    process and reads it at spawn. Identical semantics for what matters — the
+    value only changes through a restart — without a config parse per tick. The
+    ``HERMES_KANBAN_NAMESPACE`` override is part of the memo key, so it takes
+    effect in-process as well (:func:`_reset_namespace_cache` for tests that need
+    a full re-read).
+    """
+    global _NAMESPACE_MEMO, _NAMESPACE_MEMO_KEY
+    override = os.environ.get("HERMES_KANBAN_NAMESPACE", "").strip()
+    if _NAMESPACE_MEMO is None or _NAMESPACE_MEMO_KEY != override:
+        _NAMESPACE_MEMO = _resolve_install_namespaces(override)
+        _NAMESPACE_MEMO_KEY = override
+    return _NAMESPACE_MEMO
+
+
+def canonical_install_namespace() -> Optional[str]:
+    """This install's canonical namespace token (used in messages), or None."""
+    return install_namespaces()[0]
+
+
+
+def _effective_board_slug(board: Optional[str]) -> Optional[str]:
+    """Board slug this call acts on: explicit arg, else the active board.
+
+    Mirrors how every other board-scoped path in the dispatcher resolves a
+    ``None`` board (``hermes kanban dispatch`` runs with no explicit slug).
+    """
+    try:
+        slug = _kb._normalize_board_slug(board)
+    except Exception:
+        slug = None
+    if slug is None:
+        try:
+            slug = _kb.get_current_board()
+        except Exception:
+            slug = None
+    return slug
+
+
+def board_namespace(board: Optional[str] = None) -> Optional[str]:
+    """Namespace declared in *board*'s ``board.json`` (``namespace``), else ``None``.
+
+    Both installs read the same file on a shared board, which is what makes a BARE
+    assignee there unambiguous: it resolves to that board's install. An undeclared
+    board keeps today's name-partitioning behaviour, except for install-relative
+    names, which are ambiguous by construction and therefore refused (visibly).
+    """
+    slug = _effective_board_slug(board)
+    if not slug:
+        return None
+    try:
+        meta = _kb.read_board_metadata(slug)
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    canonical, _tokens = _split_namespace_list(meta.get("namespace"))
+    return canonical
+
+
+def resolve_assignee(assignee: Optional[str], board: Optional[str] = None) -> AssigneeResolution:
+    """Decide whether THIS install may claim *assignee* on *board*, and as whom.
+
+    A profile's identity is the PAIR ``(namespace, name)`` — never the bare name
+    alone. ``<namespace>:<name>`` is canonical and explicitly overrides the board
+    (``ama:sysadmin`` on another install's board runs here — that is how work is
+    placed across namespaces deliberately). A BARE name resolves against the
+    BOARD's declared namespace, so bare ``default``/``sysadmin`` on the shared
+    board means that board's install, never whichever dispatcher ticks first. The
+    dispatcher therefore no longer depends on profile names being globally unique
+    (R12 becomes defence-in-depth, not the mechanism).
+
+    Fallbacks, in order:
+
+    * board declares a namespace → claim only when it is one of this install's;
+    * board declares none, bare install-relative name (``default``) → ambiguous by
+      construction, refused with a visible record;
+    * board declares none, bare unique name → today's behaviour (partition by
+      name), unchanged;
+    * the ``default`` board itself needs no declaration: its DB is this install's
+      own by construction (:data:`_INSTALL_LOCAL_BOARD_SLUGS`).
+    """
+    raw = str(assignee or "").strip()
+    namespace, profile = split_assignee(raw)
+    canonical, accepted = install_namespaces()
+
+    if not profile:
+        return AssigneeResolution(
+            raw, namespace=namespace, reason=REASON_ASSIGNEE_INVALID,
+            remedy=(
+                "assignee must name a profile after the namespace "
+                f"(e.g. {canonical or '<install>'}:default)"
+            ),
+        )
+
+    if namespace is not None:
+        return AssigneeResolution(raw, profile=profile, namespace=namespace, **_namespace_verdict(canonical, accepted, namespace, profile))
+
+
+    slug = _effective_board_slug(board)
+    board_ns = board_namespace(slug)
+    if board_ns is None:
+        if slug in _INSTALL_LOCAL_BOARD_SLUGS:
+            # This install's own board by construction — no declaration needed.
+            return AssigneeResolution(raw, profile=profile)
+        if profile.lower() in INSTALL_RELATIVE_ASSIGNEES:
+            return AssigneeResolution(
+                raw, profile=profile, reason=REASON_NAMESPACE_UNDECLARED,
+                remedy=(
+                    f"board {slug!r} declares no namespace, so bare {profile!r} is "
+                    "ambiguous — it could belong to either install"
+                    + (
+                        f"; declare one (`hermes kanban boards set-namespace {slug} {canonical}`) "
+                        f"or qualify the assignee as {canonical}:{profile}"
+                        if canonical else
+                        "; set kanban.namespace for this install, then declare the board's namespace"
+                    )
+                ),
+            )
+        # Bare, unique, undeclared board: unchanged behaviour (name partitioning).
+        return AssigneeResolution(raw, profile=profile)
+    verdict = _namespace_verdict(canonical, accepted, board_ns, profile, board=slug)
+    return AssigneeResolution(raw, profile=profile, board_namespace=board_ns, **verdict)
+
+
+def _namespace_verdict(
+    canonical: Optional[str],
+    accepted: "frozenset[str]",
+    namespace: str,
+    profile: str,
+    *,
+    board: Optional[str] = None,
+) -> dict:
+    """``{"reason", "remedy"}`` (empty when claimable) for a resolved namespace."""
+    if not accepted:
+        return {
+            "reason": REASON_NAMESPACE_UNRESOLVED,
+            "remedy": (
+                f"set kanban.namespace in config.yaml (or HERMES_KANBAN_NAMESPACE) so this "
+                f"install can prove it owns namespace {namespace!r}"
+            ),
+        }
+    if namespace not in accepted:
+        where = f"board {board!r} belongs to" if board else "assignee namespace"
+        return {
+            "reason": REASON_NAMESPACE_MISMATCH,
+            "remedy": (
+                f"{where} namespace {namespace!r}, this install is {canonical!r}; "
+                f"use {namespace}:{profile} with that install's dispatcher, or "
+                f"{canonical}:{profile} to run it here"
+            ),
+        }
+    return {}
+
+
+def _record_namespace_skip(
+    conn: sqlite3.Connection,
+    task_id: str,
+    resolution: AssigneeResolution,
+    board: Optional[str],
+    *,
+    dry_run: bool,
+) -> None:
+    """Make a namespace refusal VISIBLE: log line every tick + one durable event.
+
+    A refusal that leaves no trace is the bug class this gate exists to prevent
+    (``skipped_nonspawnable`` is invisible by design — no event, no run row, no log
+    line — so a card that lands there looks identical to one nobody ever
+    dispatched). Every skip is therefore logged on each tick and persisted as a
+    ``dispatch_skipped`` event ONCE per (task, assignee, reason): a durable,
+    dashboard-visible row carrying the remedy, without one event per tick.
+    """
+    slug = _effective_board_slug(board)
+    canonical, accepted = install_namespaces()
+    detail = {
+        "reason": resolution.reason,
+        "assignee": resolution.assignee,
+        "profile": resolution.profile,
+        "namespace": resolution.namespace,
+        "board": slug,
+        "board_namespace": resolution.board_namespace or board_namespace(slug),
+        "install_namespace": canonical,
+        "install_namespaces": sorted(accepted),
+        "remedy": resolution.remedy,
+    }
+    _kb._log.warning(
+        "kanban dispatch: task %s NOT claimed — assignee %r (reason=%s, board=%s, "
+        "board_namespace=%r, install_namespace=%r). %s",
+        task_id, resolution.assignee, resolution.reason, slug,
+        detail["board_namespace"], canonical, resolution.remedy or "",
+    )
+    if dry_run:
+        return
+    try:
+        for row in conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'dispatch_skipped' ORDER BY id DESC LIMIT 25",
+            (task_id,),
+        ):
+            try:
+                existing = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                existing = None
+            if (
+                isinstance(existing, dict)
+                and existing.get("reason") == resolution.reason
+                and existing.get("assignee") == resolution.assignee
+            ):
+                return  # already recorded for this task+assignee+reason
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "dispatch_skipped", detail)
+    except Exception as exc:  # pragma: no cover - never fail a tick on the record
+        _kb._log.debug("kanban dispatch: dispatch_skipped event write failed: %s", exc)
+
+
+def _has_spawnable(conn: sqlite3.Connection, status: str, board: Optional[str] = None) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
@@ -1769,26 +2177,38 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     ).fetchall()
     if not rows:
         return False
+    # A card this install may not claim is not "spawnable work waiting" — it is
+    # another install's queue (or a namespace mistake). Counting it would report a
+    # healthy board as stuck and hide the real signal.
+    claimable = [
+        resolved.profile for resolved in
+        (resolve_assignee(row["assignee"], board) for row in rows)
+        if resolved.claimable and resolved.profile
+    ]
+    if not claimable:
+        return False
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(profile_exists(name) for name in claimable)
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
+def has_spawnable_ready(conn: sqlite3.Connection, board: Optional[str] = None) -> bool:
+    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile
+    this install may claim on *board*.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
-    "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when ``profile_exists`` is unimportable.
+    "correctly idle" (only control-plane lanes waiting on ``claim_task``, cards
+    namespaced to another install, or an ambiguous bare ``default``). Falls back to
+    "any assigned" when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable(conn, "ready", board)
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+def has_spawnable_review(conn: sqlite3.Connection, board: Optional[str] = None) -> bool:
+    """``has_spawnable_ready`` for the review column (same ownership gate)."""
+    return _has_spawnable(conn, "review", board)
 
 
 def review_dispatch_enabled() -> bool:
@@ -1899,8 +2319,12 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
-    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    Boards are matched by their CANONICAL DB path and read through that path
+    directly: ``HERMES_KANBAN_DB`` pins EVERY slug to the caller's own file, so
+    resolving siblings with :func:`~hermes_cli.kanban_db.kanban_db_path` (and
+    opening them with a bare ``connect(board=slug)``) both collapsed the scan
+    onto the caller's board — a pinned worker reported 0 other-board workers, so
+    the host-level cap was silently not enforced. Fails open per board.
     """
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
@@ -1914,13 +2338,15 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.board_db_path_unpinned(slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
             if not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            # Explicit path, not board=slug: the pin would send every sibling
+            # back to the caller's own file and double-count it here.
+            other = _kbc.connect(db_path=path)
             try:
                 total += count_running_tasks(other)
             finally:
@@ -2036,18 +2462,56 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    quota_gate: Optional["QuotaGateState"] = None,
+    cost_window: Optional["CostWindowState"] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Assignee resolution (namespaces) BEFORE the profile check and before
+    # anything is claimed. ``default`` is install-relative: ``profiles.profile_exists``
+    # answers True for it in every install, so on a board two installs sweep the
+    # card was spawnable in both and ran in whichever dispatcher ticked first
+    # (proven: probe t_45f8aaac on the shared board ran here instead of in the
+    # owning install). ``<namespace>:<profile>`` names the owning install
+    # explicitly; a bare name resolves within the BOARD's namespace; an
+    # install-relative bare name with neither is refused — with a visible record,
+    # never a silent strand. Adjacent to the profile check so the per-profile cap
+    # and the respawn guard keep their existing order for every other assignee.
+    resolution = resolve_assignee(assignee, board)
+    if not resolution.claimable:
+        result.skipped_namespace.append(
+            (task_id, assignee, resolution.reason or REASON_ASSIGNEE_INVALID),
+        )
+        _record_namespace_skip(conn, task_id, resolution, board, dry_run=dry_run)
+        return False
+    profile = resolution.profile or assignee
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
+    if profile_exists is not None and not profile_exists(profile):
+        if resolution.namespace is not None or resolution.board_namespace is not None:
+            # The name was resolved through a NAMESPACE, so "no such profile here"
+            # is not the invisible control-plane case: it means this install's
+            # namespace has no such profile (e.g. bare ``sysadmin`` on a board whose
+            # namespace is the other install). That is operator-actionable and must
+            # be visible — say how to place it.
+            missing = AssigneeResolution(
+                resolution.assignee, profile=profile, namespace=resolution.namespace,
+                board_namespace=resolution.board_namespace,
+                reason=REASON_PROFILE_MISSING,
+                remedy=(
+                    f"this install's namespace has no profile {profile!r}; "
+                    f"assign an explicit <namespace>:{profile} for the install that has it"
+                ),
+            )
+            result.skipped_namespace.append((task_id, assignee, REASON_PROFILE_MISSING))
+            _record_namespace_skip(conn, task_id, missing, board, dry_run=dry_run)
+            return False
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
@@ -2064,12 +2528,71 @@ def _dispatch_lane_task(
                     _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
+    # must not be overwhelmed by a fan-out even with global headroom. Keyed on the
+    # RESOLVED profile so ``ama:default`` and a bare ``ama``-side ``default`` share
+    # one budget instead of pretending to be two profiles.
     if per_profile_cap is not None:
-        current = per_profile_running.get(assignee, 0)
+        current = per_profile_running.get(profile, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # --- Provider-quota gate (fleet-level pause) ---------------------------
+    # Outranks the per-task respawn guard: when the shared gate says the
+    # primary provider's quota window is closed, a task without an explicit
+    # ``quota_override`` waits rather than burning a worker slot on a 429.
+    # Skipped cards are recorded as ``quota_paused`` (not ``respawn_guarded``)
+    # so board telemetry distinguishes "paused by quota" from "stuck".
+    if quota_gate is not None and quota_gate.is_closed:
+        override_flag, pinned_provider = _task_quota_gate_flags(conn, task_id)
+        # A card permanently pinned to a healthy provider spends no quota on
+        # the walled one — it is exempt and spawns on its own pin.
+        exempt = quota_gate.is_exempt(pinned_provider)
+        if not exempt and (not override_flag or not quota_gate.fallback_model):
+            result.quota_paused.append(task_id)
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "quota_paused", {
+                        "reset_at": quota_gate.reset_at,
+                        "override": bool(override_flag),
+                        # An override with no configured fallback chain has
+                        # nowhere to route, so it pauses like everything else.
+                        "reason": (
+                            "no_fallback_route"
+                            if (override_flag and not quota_gate.fallback_model)
+                            else "gate_closed"
+                        ),
+                    })
+            return False
+
+    # --- Provider COST-window deferral (peak-price hold) -------------------
+    # Checked AFTER the quota gate, and independent of it: the quota gate
+    # answers "is this provider walled?", this one "is its discounted window
+    # shut?". A card that will run on a priced provider waits for off-peak
+    # unless it carries ``run_now``.
+    #
+    # The effective provider matters: an install whose PRIMARY is a flat-rate
+    # coding plan must not be deferred, because delaying it saves nothing. So
+    # resolve what this card will actually run on — an explicit pin wins, else
+    # the gated fallback route, else the configured primary.
+    if cost_window is not None and cost_window.is_deferred:
+        run_now_flag, pinned = _task_run_now_flag(conn, task_id)
+        if pinned:
+            effective_provider = pinned
+        elif quota_gate is not None and quota_gate.is_closed and quota_gate.fallback_provider:
+            effective_provider = quota_gate.fallback_provider
+        else:
+            effective_provider = _configured_primary_provider()
+        if cost_window.covers(effective_provider) and not run_now_flag:
+            result.cost_deferred.append(task_id)
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "cost_deferred", {
+                        "resume_at": cost_window.resume_at,
+                        "provider": effective_provider,
+                        "reason": "peak_hours",
+                    })
+            return False
+
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2087,16 +2610,16 @@ def _dispatch_lane_task(
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
+        # ticks re-query from the DB. Keyed on the RESOLVED profile name.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
+        _count_spawn(profile)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, profile=profile)
     if claimed is None:
         return False
     try:
@@ -2120,6 +2643,17 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    if (
+        quota_gate is not None and quota_gate.is_closed
+        and quota_gate.fallback_model and claimed.quota_override
+        # Never clobber a deliberate per-card pin: that routing decision is the
+        # card's own and outlives the pause (the two concepts stay separate).
+        and not claimed.provider_override and not claimed.model_override
+    ):
+        # Route THIS SPAWN to the fallback chain only. Nothing is persisted, so
+        # the moment the gate reopens the next dispatch returns to the primary.
+        claimed.model_override = quota_gate.fallback_model
+        claimed.provider_override = quota_gate.fallback_provider
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2266,6 +2800,61 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def _task_run_now_flag(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
+    """``(run_now, provider_override)`` for ``task_id``.
+
+    ``run_now`` forces a spawn inside the provider's peak-price window; the
+    provider pin decides whether the window applies to this card at all.
+    """
+    try:
+        row = conn.execute(
+            "SELECT run_now, provider_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False, None
+    if row is None:
+        return False, None
+    try:
+        return bool(row["run_now"]), (row["provider_override"] or None)
+    except (IndexError, KeyError):
+        # Pre-migration DB without the column: no override.
+        return False, None
+
+
+def _configured_primary_provider() -> Optional[str]:
+    """The install's configured default provider (``model.provider``).
+
+    Used to decide whether the cost window applies to an unpinned card: a
+    flat-rate primary must not be deferred, because waiting saves nothing.
+    Returns None when unreadable — the caller then treats the route as priced,
+    i.e. defers (matching ``CostWindowState.covers(None)``).
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        cfg = load_user_config_effective() or {}
+        return ((cfg.get("model") or {}).get("provider") or None)
+    except Exception:
+        return None
+
+
+def _task_quota_gate_flags(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
+    """``(quota_override, provider_override)`` for ``task_id``.
+
+    Read lazily (only while the gate is closed) and default to ``(False, None)``
+    on any error — an unreadable flag must never let a card skip the pause.
+    """
+    try:
+        row = conn.execute(
+            "SELECT quota_override, provider_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, None
+        return bool(row["quota_override"]), (row["provider_override"] or None)
+    except Exception:
+        return False, None
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
@@ -2291,6 +2880,13 @@ def _any_spawnable_review(
     otherwise ready task (one such row would pin ``ready_budget`` to 0).
     """
     if not review_rows:
+        return False
+    claimable = [
+        resolved.profile for resolved in
+        (resolve_assignee(row["assignee"], board) for row in review_rows)
+        if resolved.claimable and resolved.profile
+    ]
+    if not claimable:
         return False
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
@@ -2320,6 +2916,26 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
         if profile_exists is not None and not profile_exists(name):
             return None
     return name
+
+
+def _resolve_fallback_chain() -> Optional[list[dict]]:
+    """Read ``fallback_providers`` from the dispatcher's own config.
+
+    Returns the first fallback entry as ``[{"provider": ..., "model": ...}]``
+    or ``None`` when no fallback chain is configured.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        chain = cfg.get("fallback_providers") or cfg.get("fallback_model")
+        if isinstance(chain, list) and chain:
+            return [{"provider": e["provider"], "model": e["model"]}
+                    for e in chain if isinstance(e, dict) and e.get("provider") and e.get("model")]
+        if isinstance(chain, dict):
+            return [{"provider": chain.get("provider"), "model": chain.get("model")}]
+        return None
+    except Exception:
+        return None
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
@@ -2355,6 +2971,21 @@ def _dispatch_once_locked(
     )
     if not may_spawn:
         return result
+
+    # Read provider-quota gate state (fail closed per Adrian's requirement).
+    # The gate is shared via the yummi-admin board; if the mount is down
+    # the gate stays closed.
+    from hermes_cli.kanban_db import read_quota_gate_state
+    quota_gate = read_quota_gate_state(fallback_chain=_resolve_fallback_chain())
+    if quota_gate.is_closed:
+        result.quota_paused = []  # populated by _dispatch_lane_task
+
+    # Provider cost-window (peak-price) deferral — the twin of the quota gate,
+    # read the same way. Unlike the quota gate it FAILS OPEN: a broken clock or
+    # config means "spawn as usual", because misreading the time costs money,
+    # whereas misreading a quota wall costs a fleet of failed workers.
+    from hermes_cli.kanban_cost_window import read_cost_window_state
+    cost_window = read_cost_window_state()
 
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
@@ -2394,6 +3025,8 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        quota_gate=quota_gate,
+        cost_window=cost_window,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2404,9 +3037,22 @@ def _dispatch_once_locked(
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
             # park in 'ready' forever.
-            if not default_assignee or not _apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
+            if not default_assignee:
+                result.skipped_unassigned.append(row["id"])
+                continue
+            # An install-relative fallback that this board's namespace does not
+            # resolve here must not even be WRITTEN: assigning ``default`` there
+            # would mutate another install's card (and claim authorship of a
+            # routing decision this install has no standing to make). Refuse
+            # visibly instead.
+            fallback = resolve_assignee(default_assignee, board)
+            if not fallback.claimable:
+                result.skipped_namespace.append(
+                    (row["id"], default_assignee, fallback.reason or REASON_ASSIGNEE_INVALID),
+                )
+                _record_namespace_skip(conn, row["id"], fallback, board, dry_run=dry_run)
+                continue
+            if not _apply_default_assignee(conn, row["id"], default_assignee, dry_run=dry_run):
                 result.skipped_unassigned.append(row["id"])
                 continue
             row_assignee = default_assignee
@@ -2842,7 +3488,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
-    profile_arg = normalize_profile_name(task.assignee)
+    # The spawned profile is the assignee MINUS any namespace prefix: the claim
+    # already resolved ``(namespace, name)`` here, so ``yummi:default`` spawns
+    # ``default`` and ``ama:sysadmin`` on a foreign board spawns ``sysadmin``.
+    profile_arg = normalize_profile_name(assignee_profile(task.assignee))
 
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import _is_routed_home, build_subprocess_env, strip_launch_profile_env

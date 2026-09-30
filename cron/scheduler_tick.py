@@ -62,6 +62,16 @@ def _tick_admitted(
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
+        # Provider-quota gate: while the primary model's subscription window is closed,
+        # due jobs on the walled provider are held (next_run_at re-armed to the provider's
+        # reset time) instead of burning LLM calls that will 429. Exempt: jobs pinned to a
+        # healthy provider, and `quota_override` jobs (routed to the fallback chain below).
+        from cron import scheduler_quota as _quota_gate
+        _gate = _quota_gate.gate_state()
+        if _gate is not None:
+            due_jobs, _held = _quota_gate.hold_jobs(due_jobs, _gate)
+            _quota_gate.log_hold_summary(_held, _gate)
+
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
             if verbose:

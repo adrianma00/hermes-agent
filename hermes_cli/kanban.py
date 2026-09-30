@@ -173,6 +173,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
                         f"Create it with `hermes kanban boards create {normed}`.")
+        # A process pinned to ITS OWN board (a dispatcher worker or a descendant) may not route
+        # a CLI call at a sibling board: HERMES_KANBAN_DB outranks `--board` in the resolver, so
+        # this used to answer `--board <sibling>` from the pin and write the card to the WRONG
+        # board while printing "Created t_…". Refuse up front so the operator sees the scope
+        # conflict itself — the resolution layer raises the same error, but wrapped in init_db's
+        # generic "could not initialize database" message.
+        try:
+            kb.connection_db_path(normed)
+        except kb.BoardPinConflict as exc:
+            return _err(f"kanban: {exc}")
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:
@@ -215,7 +225,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir", "import",
+    "set-default-workdir", "set-namespace", "import",
 })
 
 
@@ -374,6 +384,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            quota_override=bool(getattr(args, "quota_override", False)),
+            run_now=bool(getattr(args, "run_now", False)),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -489,6 +501,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+        # Cross-board citations resolve on another board — not phantoms.
+        resolved_elsewhere = kb.other_board_task_ids(conn) if any(
+            getattr(e, "kind", None) == "suspected_hallucinated_references" for e in events
+        ) else set()
 
     if want_json:
         _print_json({
@@ -515,6 +531,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.quota_override:
+        field("quota-override", "on — runs while the provider-quota gate is closed")
+    if getattr(task, "run_now", False):
+        field("run-now", "on — spawns inside the provider peak-price window")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -528,7 +548,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph, resolved_elsewhere=resolved_elsewhere)
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -597,6 +618,44 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_quota_override(args: argparse.Namespace) -> int:
+    """Set/clear a task's quota-gate override (may run while the gate is closed)."""
+    raw = (getattr(args, "state", None) or "on").strip().lower()
+    if raw in {"on", "true", "1", "yes", "enable", "enabled"}:
+        enabled = True
+    elif raw in {"off", "false", "0", "no", "disable", "disabled", "clear"}:
+        enabled = False
+    else:
+        return _err(f"kanban: expected on|off, got {raw!r}", 2)
+    with kbc.connect_closing() as conn:
+        ok = kb.set_quota_override(conn, args.task_id, enabled)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    state = "set" if enabled else "cleared"
+    print(f"Quota override {state} on {args.task_id} "
+          f"({'runs on the fallback chain while the quota gate is closed' if enabled else 'waits with the fleet when the gate is closed'})")
+    return 0
+
+
+def _cmd_run_now(args: argparse.Namespace) -> int:
+    """Set/clear a task's cost-window override (may run during peak-price hours)."""
+    raw = (getattr(args, "state", None) or "on").strip().lower()
+    if raw in {"on", "true", "1", "yes", "enable", "enabled"}:
+        enabled = True
+    elif raw in {"off", "false", "0", "no", "disable", "disabled", "clear"}:
+        enabled = False
+    else:
+        return _err(f"kanban: expected on|off, got {raw!r}", 2)
+    with kbc.connect_closing() as conn:
+        ok = kb.set_run_now(conn, args.task_id, enabled)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    state = "set" if enabled else "cleared"
+    print(f"Run-now {state} on {args.task_id} "
+          f"({'spawns immediately, even inside the provider peak-price window' if enabled else 'waits for the off-peak discount again'})")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -625,6 +684,22 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _elsewhere(conn, task_ids: list[str]) -> set[str]:
+    """Task ids that exist on ANOTHER board, but only when one of ``task_ids``
+    actually carries a phantom event — otherwise the scan is pure overhead.
+    Feeds ``compute_task_diagnostics(resolved_elsewhere=...)`` so a cross-board
+    citation is not reported as a phantom reference."""
+    if not task_ids:
+        return set()
+    placeholders = ",".join("?" for _ in task_ids)
+    row = conn.execute(
+        f"SELECT 1 FROM task_events WHERE task_id IN ({placeholders}) "
+        "AND kind = 'suspected_hallucinated_references' LIMIT 1",
+        tuple(task_ids),
+    ).fetchone()
+    return kb.other_board_task_ids(conn) if row else set()
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -645,7 +720,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config,
+                resolved_elsewhere=_elsewhere(conn, [args.task]))}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -655,10 +731,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
+                elsewhere = _elsewhere(conn, ids)
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     resolved_elsewhere=elsewhere)
                     if dl:
                         diags_by_task[tid] = dl
 
@@ -1320,6 +1398,8 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "quota-override": _cmd_quota_override,
+    "run-now": _cmd_run_now,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
