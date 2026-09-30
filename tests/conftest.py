@@ -591,6 +591,10 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 # allow-list because test-level fixtures legitimately move HERMES_HOME to
 # sibling directories — an allow-list captured at setup time would see the
 # stale autouse-set value and falsely reject hermetic tests (#69385 review).
+#
+# The guard is armed on every ``kanban_db_connect`` module OBJECT this process
+# has imported, not merely on the one findable via ``sys.modules`` — see
+# ``_KANBAN_CONNECT_MODULES`` for the purge that made that distinction matter.
 
 
 def _capture_real_kanban_root() -> Path:
@@ -623,6 +627,91 @@ def _capture_real_kanban_root() -> Path:
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
+# Every ``hermes_cli.kanban_db_connect`` module OBJECT this session has imported.
+#
+# Patching only the object in ``sys.modules`` is not enough. A suite that purges
+# ``hermes_cli*`` / ``hermes_state*`` / ``hermes_constants`` out of
+# ``sys.modules`` and re-imports them to reset a memo
+# (``test_kanban_assignee_namespaces.fleet``) REPLACES the module object that
+# every already-imported test file still holds a reference to. The patch then
+# sits on an object nobody calls any more, and the guard is silently inert for
+# every test running after that suite in the same session — an order-dependent
+# RED in ``test_kanban_write_guard.py`` (2 failed with the namespace suite
+# first, 25 passed reversed), i.e. root cause 2 of the 2026-09-30 leak where 37
+# fixture cards reached the live boards. Every generation ever seen is kept here
+# and re-armed on each test; ``pytest_collection_modifyitems`` seeds this with
+# the object in ``sys.modules`` once all test modules are imported; the fixture
+# below re-seeds it each test.
+_KANBAN_CONNECT_MODULES: "list[object]" = []
+
+
+def _remember_kanban_connect_module() -> None:
+    """Register the connector module currently in ``sys.modules``, if any.
+
+    A ``sys.modules`` probe, never an import: the guard must not drag the kanban
+    stack into a test process that never touched it.
+    """
+    module = sys.modules.get("hermes_cli.kanban_db_connect")
+    if module is not None and module not in _KANBAN_CONNECT_MODULES:
+        _KANBAN_CONNECT_MODULES.append(module)
+
+
+def _kanban_guard_targets() -> "list[tuple[object, object, object]]":
+    """``(connector_module, its_kanban_db_module, connect)`` for each armed target.
+
+    ``kanban_db`` is resolved from the connector itself
+    (``connect.__globals__["_kb"]`` is the late-bound origin module), not from
+    ``sys.modules``: a test that monkeypatches ``kanban_db.kanban_db_path`` on
+    the object IT imported must have that honoured even when the connector it
+    calls belongs to a different generation than the live ``sys.modules`` entry.
+    """
+    _remember_kanban_connect_module()
+    targets = []
+    for module in _KANBAN_CONNECT_MODULES:
+        connect = getattr(module, "connect", None)
+        if connect is None:
+            # Observed MID-IMPORT: a half-initialized module has no callers yet
+            # (the AttributeError flake this probe used to raise on); the next
+            # round patches the completed module.
+            continue
+        kb_module = (getattr(connect, "__globals__", None) or {}).get("_kb")
+        if kb_module is None or getattr(kb_module, "kanban_db_path", None) is None:
+            continue
+        targets.append((module, kb_module, connect))
+    return targets
+
+
+def _arm_kanban_write_guard(monkeypatch, connector, kb_module, orig_connect) -> None:
+    """Patch ``connect`` on ONE connector module object with the deny-list guard."""
+
+    def _guarded_connect(db_path=None, *args, **kwargs):
+        if db_path is not None:
+            resolved = Path(db_path).expanduser().resolve()
+        else:
+            resolved = (
+                kb_module.kanban_db_path(board=kwargs.get("board"))
+                .expanduser()
+                .resolve()
+            )
+        try:
+            resolved.relative_to(_REAL_KANBAN_ROOT)
+        except ValueError:
+            # Resolved path is NOT under the real root — safe to write.
+            return orig_connect(db_path, *args, **kwargs)
+        raise RuntimeError(
+            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
+            f"Hermetic isolation has been bypassed — refusing to write "
+            f"to the real ~/.hermes. See #69283."
+        )
+
+    # Identity marker: lets a regression test assert the guard is ARMED on a
+    # given module object WITHOUT opening a database (see
+    # tests/hermes_cli/test_kanban_write_guard_purge_survival.py).
+    setattr(_guarded_connect, "__kanban_write_guard__", True)
+    monkeypatch.setattr(connector, "connect", _guarded_connect)
+
+
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
@@ -632,50 +721,19 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     ``~/.hermes`` captured at import time. Hermetic tests that legitimately
     move HERMES_HOME to sibling tempdirs are unaffected.
 
-    Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
-    — a ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
+    Armed on every ``kanban_db_connect`` module object the session has imported
+    (``_KANBAN_CONNECT_MODULES``), so a suite that purges and re-imports the
+    module cannot leave a still-referenced generation unguarded.
+
+    Only patches modules that are *already imported* — a ``sys.modules`` probe,
+    not an import — so the guard never drags the kanban module into unrelated
+    test processes.
 
     Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
     after each test (no stacked wrappers or state leakage across tests).
     """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
-    if _kdb is None or _kdbc is None:
-        return
-
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
-    _orig_connect = getattr(_kdbc, "connect", None)
-    if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
-        return
-
-    def _guarded_connect(db_path=None, *args, **kwargs):
-        if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
-        else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
-
-    monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+    for connector, kb_module, orig_connect in _kanban_guard_targets():
+        _arm_kanban_write_guard(monkeypatch, connector, kb_module, orig_connect)
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────
@@ -1232,6 +1290,13 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     skip is diagnosable rather than mysterious.
     """
     _reject_contradictory_platform_marks(items)
+
+    # Seed the kanban write guard's module-object registry: collection has now
+    # imported every test module, so the connector in ``sys.modules`` is the
+    # object their import-time references point at. A later ``sys.modules``
+    # purge replaces that object without invalidating those references (see
+    # ``_KANBAN_CONNECT_MODULES``), and the guard must still cover it.
+    _remember_kanban_connect_module()
 
     # platforms() gating: skip items whose specs exclude this host. The skip
     # markers (not -m expressions) are the authoritative host filter on
