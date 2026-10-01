@@ -91,17 +91,34 @@ def record_activation_inputs(stamps: Path, mtimes: dict[str, int], project_root:
         os.utime(stamp, ns=(mtime, mtime))
 
 
+def _sealed_payload_manifest(project_root: Path) -> dict | None:
+    """The manifest of the sealed payload a tree was shipped in, or ``None``.
+
+    A source checkout is never a payload: its parent is the install home -- the REAL
+    ``$HERMES_HOME`` even when a test isolated the home -- so probing beside a git work tree
+    reads outside the tree, and the test harness (tests/home_io_guard.py) refuses exactly
+    that. Sealed payloads ship without ``.git``, so the work tree decides without leaving the
+    tree, and no probe of the home happens at all.
+    """
+    root = Path(project_root).resolve()
+    if (root / ".git").exists():
+        return None
+    manifest_path = root.parent / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    return manifest if isinstance(manifest, dict) else None
+
+
 def payload_venv(project_root: Path) -> Path | None:
     """The environment a sealed payload ships beside its tree, or ``None``."""
     root = Path(project_root).resolve()
-    manifest_path = root.parent / "manifest.json"
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        if (root.parent / manifest.get("repo", "")).resolve() == root:
-            venv = (root.parent / manifest["venv"]).resolve()
-            if not venv.is_relative_to(root.parent):
-                raise RuntimeError("payload environment escapes its root")
-            return venv
+    manifest = _sealed_payload_manifest(root)
+    if manifest is not None and (root.parent / manifest.get("repo", "")).resolve() == root:
+        venv = (root.parent / manifest["venv"]).resolve()
+        if not venv.is_relative_to(root.parent):
+            raise RuntimeError("payload environment escapes its root")
+        return venv
     return None
 
 
@@ -115,14 +132,12 @@ def store_root(project_root: Path) -> Path:
     if override:
         return Path(override).resolve()
     root = Path(project_root).resolve()
-    manifest_path = root.parent / "manifest.json"
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        if (root.parent / manifest.get("repo", "")).resolve() == root:
-            store = (root.parent / manifest["store"]).resolve()
-            if not store.is_relative_to(root.parent):
-                raise RuntimeError("payload store escapes its root")
-            return store
+    manifest = _sealed_payload_manifest(root)
+    if manifest is not None and (root.parent / manifest.get("repo", "")).resolve() == root:
+        store = (root.parent / manifest["store"]).resolve()
+        if not store.is_relative_to(root.parent):
+            raise RuntimeError("payload store escapes its root")
+        return store
     from pm.paths import install_stamp_path
 
     for directory in (root, *root.parents):
