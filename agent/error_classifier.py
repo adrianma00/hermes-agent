@@ -1057,6 +1057,25 @@ def _status_429(c: _Ctx) -> Verdict:
         upstream = _extract_upstream_provider_name(c.body)
         ctx = {"upstream_provider": upstream} if upstream else {}
         return _v(_R.upstream_rate_limit, should_fallback=True, error_context=ctx)
+    # BytePlus/ModelArk structured error codes: the body carries the distinction
+    # between transient rate-limit and quota exhaustion in the structured ``code``
+    # field, while the message text is ambiguous (both contain "exceeded" and "wait").
+    # Check the code before the message-based heuristics below.
+    if c.code == "accountratelimitexceeded":
+        # Requests too frequent — transient. Rotate the credential so the
+        # rate-limited key cools down, but never close the quota gate.
+        return _V_RATE_LIMIT
+    if c.code == "accountquotaexceeded":
+        # Monthly usage quota exhausted. Try to extract the reset window from
+        # the message body (``_rate_limit_reset_seconds`` handles relative
+        # offsets; the credential pool's ``_normalize_error_context`` handles
+        # absolute timestamps like "reset at 2026-10-12 23:59:59 +0800 CST"
+        # via ``_extract_reset_at_from_message``). Without a reset time the
+        # verdict is billing (gate-close signal, no auto-reopen).
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        if reset:
+            return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
+        return _V_BILLING
     # Quota walls as 429 (Anthropic ``usage_limit_reached``, "quota", billing
     # phrases) are billing ONLY when the body is not itself a rate-limit phrase
     # ("Rate limit exceeded" contains "limit exceeded") and carries no reset/
