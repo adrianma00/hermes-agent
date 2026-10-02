@@ -2703,6 +2703,14 @@ def _dispatch_lane_task(
         # A card permanently pinned to a healthy provider spends no quota on
         # the walled one — it is exempt and spawns on its own pin.
         exempt = quota_gate.is_exempt(pinned_provider)
+        if not exempt:
+            # No explicit card-level pin: resolve the card's effective provider
+            # from the assigned profile's config (or the global default). A card
+            # whose effective provider differs from the walled provider should
+            # NOT be paused — the gate only blocks cards that would actually
+            # spend the walled provider's quota.
+            resolved = _resolve_card_provider(profile, pinned_provider)
+            exempt = quota_gate.is_exempt(resolved)
         if not exempt and (not override_flag or not quota_gate.fallback_model):
             result.quota_paused.append(task_id)
             if not dry_run:
@@ -2992,6 +3000,32 @@ def _configured_primary_provider() -> Optional[str]:
         return ((cfg.get("model") or {}).get("provider") or None)
     except Exception:
         return None
+
+
+def _resolve_card_provider(profile_name: str, pinned_provider: Optional[str] = None) -> Optional[str]:
+    """Resolve the effective provider a card assigned to *profile_name* would use.
+
+    Priority: card-level pin -> profile config -> global config.
+    Returns None when nothing is configured (caller should pause conservatively).
+    """
+    if pinned_provider:
+        return pinned_provider
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        from hermes_cli.config_effective import load_user_config_effective
+
+        if profile_exists(profile_name):
+            profile_dir = get_profile_dir(profile_name)
+            profile_cfg_path = profile_dir / "config.yaml"
+            if profile_cfg_path.is_file():
+                cfg = load_user_config_effective(profile_cfg_path) or {}
+                provider = ((cfg.get("model") or {}).get("provider") or "").strip()
+                if provider:
+                    return provider
+    except Exception:
+        pass
+    # Fall back to the global default
+    return _configured_primary_provider()
 
 
 def _task_quota_gate_flags(conn: sqlite3.Connection, task_id: str) -> "tuple[bool, Optional[str]]":
