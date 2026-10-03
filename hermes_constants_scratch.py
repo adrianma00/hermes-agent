@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 _REAP_GRACE_SECONDS = 3.0
 # ``.git`` files (linked worktrees) are looked for this deep; lanes nest repo/tree/subtree.
 _GIT_FILE_MAX_DEPTH = 4
+# Credential-shaped file patterns (matched against the first line of each file during prune).
+# PEM private key headers and Vault token prefixes. False-positive resistant: each pattern is a
+# fixed prefix, not a regex, so normal text cannot accidentally match.
+_CREDENTIAL_HEADERS = frozenset({
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----",
+    "hvs.",  # HashiCorp Vault token (96-char base64-ish, starts with hvs.)
+})
 
 
 def subtree_touched_since(path: Path, cutoff: float) -> bool:
@@ -164,10 +175,55 @@ def release_git_worktrees(repos: set[str]) -> None:
             logger.debug("git worktree prune in %s failed: %s", repo, exc)
 
 
+def _first_line(path: Path) -> str:
+    """Read the first line of a text file, or '' on error. Never blocks on a binary file."""
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(256)
+        return chunk.decode("utf-8", errors="replace").split("\n", 1)[0].strip()
+    except OSError:
+        return ""
+
+
+def _scan_and_shred_credentials(root: Path) -> int:
+    """Walk the scratch tree and shred/unlink any file whose first line matches a known
+    credential pattern (PEM private key header or Vault token prefix). Returns count removed.
+
+    This runs BEFORE the age-based prune, so credential-shaped files are removed immediately
+    regardless of how recently they were written — no 24h exposure window for accidentally
+    cached secrets.
+    """
+    removed = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda _e: None, followlinks=False):
+            for name in filenames:
+                fpath = Path(dirpath, name)
+                try:
+                    header = _first_line(fpath)
+                    if any(header.startswith(p) for p in _CREDENTIAL_HEADERS):
+                        logger.info("scratch prune: credential-shaped file %s (first line %r) — shredding",
+                                    fpath, header[:40])
+                        shutil.rmtree(fpath, ignore_errors=True) if fpath.is_dir() else fpath.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    if removed:
+        logger.info("scratch prune: removed %d credential-shaped file(s)", removed)
+    return removed
+
+
 def prune_idle_entries(root: Path, max_idle_hours: float, skip_names: frozenset[str]) -> int:
     """Delete top-level entries of *root* with no write anywhere in their subtree for
     *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
+    Also scans for credential-shaped files (PEM keys, Vault tokens) and shreds them
+    immediately regardless of age.
     Returns the count removed."""
+    # Credential scan runs BEFORE the age-based prune: credential-shaped files are removed
+    # immediately regardless of age, limiting exposure to the prune interval (≤1h) rather
+    # than the 24h idle window.
+    _scan_and_shred_credentials(root)
     cutoff = time.time() - max_idle_hours * 3600
     try:
         entries = [e for e in root.iterdir() if e.name not in skip_names]
