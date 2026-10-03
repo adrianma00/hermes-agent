@@ -163,7 +163,13 @@ def _home_thread_from_source(source) -> Optional[str]:
     that was never in a user-created thread).  The check is now platform-agnostic: if the thread
     id matches the message's own id, it's an auto-thread artifact and is dropped, not persisted.
     """
-    return None
+    thread_id = getattr(source, "thread_id", None)
+    if not thread_id:
+        return None
+    message_id = getattr(source, "message_id", None)
+    if message_id and str(thread_id) == str(message_id):
+        return None
+    return str(thread_id)
 
 
 class GatewaySlashCommandsMixin(
