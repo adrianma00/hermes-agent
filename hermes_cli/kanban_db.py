@@ -724,6 +724,27 @@ def connection_db_path(board: Optional[str] = None, db_path: Optional[Path] = No
     return canonical
 
 
+def board_db_path_unpinned(board: Optional[str] = None) -> Path:
+    """``kanban.db`` path for a *named* board, ignoring ``HERMES_KANBAN_DB``.
+
+    ``HERMES_KANBAN_DB`` is pinned into every dispatched worker and is only
+    authoritative for the caller's OWN board (:func:`kanban_db_path`). Resolving
+    a sibling board through it would collapse every slug onto the pinned file,
+    so cross-board lookups (:func:`_other_board_db_paths`) must use this helper:
+    pure path derivation, ``default`` -> ``<root>/kanban.db`` (back-compat),
+    else ``board_dir(slug)/kanban.db``.
+
+    Also ignores ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_ATTACHMENTS_ROOT``
+    (unrelated pins) — only the boards root and the slug feed the path.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins);
     ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
@@ -3421,8 +3442,12 @@ def _flag_phantom_prose_refs(
     (``_resolve_refs_across_boards``). One that resolves there is recorded as
     ``cross_board_references`` (informational — the citation was real, just not
     local) and is NOT treated as a hallucination. Only ids that resolve nowhere
-    count as phantoms, and only those spawn a ``verify:`` child task so the
-    hallucinated claim is independently re-checked."""
+    count as phantoms; those are recorded as
+    ``suspected_hallucinated_references``, and — only when the caller opted in via
+    ``kanban.auto_verify_phantom_refs`` — spawn a ``verify:`` child task so the
+    hallucinated claim is independently re-checked. Default is off: flag the
+    reference, do not manufacture a task from it.
+    """
     scan_text = " ".join(filter(None, [summary, result]))
     if not scan_text:
         return
@@ -3440,11 +3465,23 @@ def _flag_phantom_prose_refs(
             )
     if not phantom_refs:
         return
+    auto_verify = _auto_verify_phantom_refs_config()
     with write_txn(conn):
         _append_event(
             conn, task_id, "suspected_hallucinated_references",
-            {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
+            {"phantom_refs": phantom_refs, "source": "completion_summary",
+             "auto_verify_card": auto_verify},
+            run_id=run_id,
         )
+    if not auto_verify:
+        # Opt-in (``kanban.auto_verify_phantom_refs``, default off): flagging the
+        # reference is the detector's job; spawning work nobody requested is not.
+        _log.debug(
+            "auto verify child for phantom refs on %s suppressed (%s) — "
+            "set kanban.auto_verify_phantom_refs: true to spawn it",
+            task_id, ", ".join(phantom_refs),
+        )
+        return
     # Auto-create a re-verification child task so the phantom claim gets
     # independently checked by the same profile.
     try:
@@ -3470,6 +3507,26 @@ def _flag_phantom_prose_refs(
             )
     except Exception:
         _log.warning("Failed to create verify child for phantom refs on %s", task_id, exc_info=True)
+
+
+def _auto_verify_phantom_refs_config() -> bool:
+    """Whether an unresolved prose reference spawns an automatic ``verify:`` child.
+
+    Read from ``kanban.auto_verify_phantom_refs`` (``config.yaml``) and OPT-IN,
+    default false: the detector always records ``suspected_hallucinated_references``,
+    it just does not manufacture a task nobody requested. Any read failure is
+    treated as "off" — the detector's write path must never fail on config.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = ((load_config_readonly() or {}).get("kanban") or {})
+    except Exception:
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("auto_verify_phantom_refs", False))
+
 
 
 def _merge_completion_prose_artifacts(
