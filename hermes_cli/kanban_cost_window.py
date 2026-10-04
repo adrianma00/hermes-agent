@@ -8,12 +8,20 @@ same model — only the arrival time differs. That makes *when* the dispatcher
 spawns a card a pricing decision, and a fleet that dispatches the instant a card
 is created pays double for no benefit on any work that is not latency-critical.
 
-The holiday carve-out is deliberately NOT modelled. The schema below is a window
-set plus a day set, with no calendar, so on a holiday that falls Mon-Fri the gate
-still defers. That is the safe direction: a carve-out can only REMOVE a deferral,
-so a hand-kept holiday list gone stale — or a make-up workday misread as a
-holiday — dispatches INTO peak at double price, while not modelling it costs
-latency only, on batch work this gate is already delaying by design.
+The holiday carve-out is honoured ONLY from an explicitly configured snapshot, and
+fail-safe by construction. This module owns no calendar of its own: it reads
+``kanban.cost_window.holiday_calendar`` (a JSON snapshot produced by
+``~/.hermes/scripts/holiday_calendar_refresh.py``) and treats a date as a holiday
+only when the file parses, its ``valid_through`` has not passed, and the snapshot
+covers that year. Any doubt means PEAK.
+
+That direction is the whole point. A carve-out can only REMOVE a deferral, so
+believing a holiday that is not one dispatches INTO peak at double price, while
+ignoring a real one costs latency only — on batch work this gate is already
+delaying by design. Default is ``off`` (no snapshot, today's behaviour); an
+expired or corrupt snapshot therefore degrades to a little unnecessary deferral
+and can never spend money. The refresher is the loud half: it warns while
+coverage is still current, so this never silently switches itself off in January.
 
 This module is deliberately the twin of the provider-quota gate
 (``read_quota_gate_state``) with one structural difference that shapes the whole
@@ -49,9 +57,15 @@ _log = logging.getLogger(__name__)
 
 # Peak windows in UTC, as the provider publishes them. Overridable per install.
 DEFAULT_PEAK_WINDOWS_UTC = ("01:00-04:00", "06:00-10:00")
+# Where the Chinese public-holiday snapshot lives. Empty = the carve-out is not
+# honoured (every weekday defers). Any path is used ONLY while provably current:
+# see ``holiday_state`` — an unusable snapshot means peak, never a guess.
+DEFAULT_HOLIDAY_CALENDAR = ""
 # Peak days. DeepSeek's documented rule is Mon-Fri EXCLUDING Chinese public
 # holidays; weekends are entirely off-peak. Configurable because a provider can
-# change this. The holiday carve-out has no representation here on purpose: see
+# change this. The holiday carve-out is NOT encoded here — it comes from the
+# ``holiday_calendar`` snapshot, so a calendar that goes stale degrades to peak
+# instead of silently disabling the deferral. See
 # the module docstring — it can only remove a deferral, so getting it wrong pays
 # peak price, while ignoring it only defers on a day that was off-peak anyway.
 DEFAULT_PEAK_DAYS = ("mon", "tue", "wed", "thu", "fri")
@@ -179,6 +193,15 @@ class CostWindowState:
     # anyway. Its own field, not a ``reason``: the window evaluation still runs
     # and owns ``reason``, so folding the warning in there would erase it.
     clock_grace_elapsed: bool = False
+    # Holiday carve-out (opt-in via ``holiday_calendar``): the configured snapshot's
+    # usability and, when today is one, the holiday's name. ``holiday_reason`` says
+    # why an unusable snapshot was refused, so the status line can explain itself.
+    holiday_calendar: str = ""
+    holiday_usable: bool = False
+    holiday_valid_through: str = ""
+    holiday_reason: str = ""
+    holiday_off_days: int = 0
+    holiday_today: str = ""
 
     def covers(self, provider: Optional[str]) -> bool:
         """Whether this deferral applies to a card running on ``provider``.
@@ -209,6 +232,88 @@ def _cost_window_config() -> dict:
     except Exception:
         _log.debug("cost-window config unavailable", exc_info=True)
         return {}
+
+
+# ── Holiday carve-out (opt-in, fail-safe) ───────────────────────────────
+# The provider's peak days are Mon-Fri EXCLUDING Chinese public holidays. This module
+# keeps no calendar, so the carve-out is honoured only from a snapshot the operator
+# pointed at — and only while that snapshot is readable, unexpired and covers the date.
+_holiday_cache: dict = {"key": None, "data": None}
+# China Standard Time. The peak WINDOWS are UTC, but both of them sit inside one
+# Beijing day (09:00-12:00 and 14:00-18:00 CST), so the holiday's date is unambiguous.
+# No DST in CST, so a fixed offset is exact rather than an approximation.
+_BEIJING = timezone(timedelta(hours=8))
+
+
+def beijing_date(moment: datetime) -> str:
+    """The ISO date the provider's holiday rule refers to, for ``moment``."""
+    return moment.astimezone(_BEIJING).date().isoformat()
+
+
+def _holiday_snapshot(path: str) -> tuple[Optional[dict], str]:
+    """``(snapshot, error)`` — the parsed file, cached on (path, mtime, size).
+
+    The dispatcher asks on every tick, so this must not re-read a 5 KB JSON
+    constantly; it must also not serve a stale answer after the refresher rewrites
+    the file, hence the mtime+size key rather than a TTL.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError as exc:
+        return None, f"unreadable ({exc.strerror or exc})"
+    key = (path, stat.st_mtime, stat.st_size)
+    if _holiday_cache.get("key") != key:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            _holiday_cache["key"], _holiday_cache["data"] = key, None
+            return None, f"unparseable ({exc})"
+        _holiday_cache["key"], _holiday_cache["data"] = key, data
+    data = _holiday_cache.get("data")
+    if not isinstance(data, dict):
+        return None, "unparseable"
+    return data, ""
+
+
+def holiday_state(block: dict, moment: datetime) -> dict:
+    """Whether the holiday snapshot may be trusted, and whether TODAY is on it.
+
+    Fail-safe by construction — ``usable`` is False for an absent, unreadable,
+    unparseable, expired, or year-not-covered snapshot, and the caller then treats
+    the day as a normal weekday. A wrong answer in THAT direction costs latency; a
+    wrong answer the other way would dispatch into peak at double price.
+    """
+    path = str(block.get("holiday_calendar") or DEFAULT_HOLIDAY_CALENDAR).strip()
+    out = {"path": path, "usable": False, "valid_through": "", "when": "",
+           "name": "", "reason": "", "off_days": 0}
+    if not path or path.lower() in {"off", "none", "disabled", "false", "0"}:
+        out["reason"] = "off"
+        return out
+    snapshot, error = _holiday_snapshot(path)
+    if error or not snapshot:
+        out["reason"] = error or "unreadable"
+        return out
+    when = beijing_date(moment)
+    out["when"] = when
+    valid_through = str(snapshot.get("valid_through") or "")
+    out["valid_through"] = valid_through
+    if not valid_through:
+        out["reason"] = "snapshot has no valid_through"
+        return out
+    if when > valid_through:
+        out["reason"] = f"snapshot expired {valid_through}"
+        return out
+    years = snapshot.get("years")
+    year = years.get(when[:4]) if isinstance(years, dict) else None
+    if not isinstance(year, dict):
+        out["reason"] = f"{when[:4]} not covered by the snapshot"
+        return out
+    holidays = year.get("holidays") or {}
+    out["usable"] = True
+    out["off_days"] = len(holidays)
+    out["name"] = str(holidays.get(when) or "")
+    return out
 
 
 def _bypass_until(now: Optional[float] = None) -> Optional[float]:
@@ -373,6 +478,20 @@ def read_cost_window_state(
             state.clock_grace_elapsed = True
         else:
             _clock_unsynced_since = None
+
+    # The carve-out can only REMOVE a deferral, so it is answered before the window:
+    # on a Chinese public holiday there is no peak to wait out, and asking the window
+    # first would return a deferral that has to be undone.
+    holiday = holiday_state(block, moment)
+    state.holiday_calendar = holiday["path"]
+    state.holiday_usable = bool(holiday["usable"])
+    state.holiday_valid_through = str(holiday["valid_through"] or "")
+    state.holiday_reason = str(holiday["reason"] or "")
+    state.holiday_off_days = int(holiday["off_days"] or 0)
+    if holiday["usable"] and holiday["name"]:
+        state.holiday_today = str(holiday["name"])
+        state.reason = "off_peak_holiday"
+        return state
 
     resume = next_window_end(moment, windows, days)
     if resume is None:

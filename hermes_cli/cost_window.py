@@ -98,11 +98,7 @@ def cost_window_command(args) -> int:
     print(f"   enabled        : {bool(block.get('enabled', False))}")
     print(f"   peak windows   : {_fmt_windows(state.windows)}")
     print(f"   peak days      : {_fmt_days(state.days)}")
-    print(
-        "   peak carve-out : Chinese public holidays are off-peak for the "
-        "provider — NOT modelled, so the gate keeps deferring on them "
-        "(latency only, never the peak rate)"
-    )
+    print(f"   holiday carve-out: {_fmt_holidays(state)}")
     print(f"   priced providers: {', '.join(state.providers) or '(none)'}")
     _clock = {True: "synchronised (NTP)", False: "NOT synchronised", None: "unknown"}
     print(f"   clock           : {_clock.get(state.clock_synced, 'unknown')}")
@@ -123,6 +119,18 @@ def cost_window_command(args) -> int:
     return 0
 
 
+def _fmt_holidays(state) -> str:
+    """One line describing the holiday snapshot the gate is (or is not) using."""
+    if not getattr(state, "holiday_calendar", ""):
+        return ("off — every weekday defers (set kanban.cost_window.holiday_calendar "
+                "to the snapshot path to honour the carve-out)")
+    if not getattr(state, "holiday_usable", False):
+        why = getattr(state, "holiday_reason", "") or "unusable"
+        return f"UNAVAILABLE ({why}) — defers on every weekday, which is the safe direction"
+    return (f"active · valid through {state.holiday_valid_through} · "
+            f"{state.holiday_off_days} off-day(s) this year · src {state.holiday_calendar}")
+
+
 def _status_line(state) -> str:
     if state.reason == "disabled":
         return "Status: DISABLED — cards spawn immediately."
@@ -141,6 +149,11 @@ def _status_line(state) -> str:
             f"{', '.join(state.providers) or 'priced providers'} wait until "
             f"{_sgt(state.resume_at)}. Per-card override: "
             f"`hermes kanban run-now <id>`; fleet-wide: `hermes cost-window open 2h`."
+        )
+    if state.reason == "off_peak_holiday":
+        return (
+            f"Status: OFF-PEAK (Chinese public holiday: {state.holiday_today}) — cards "
+            f"spawn at the discounted rate."
         )
     return "Status: OFF-PEAK — cards spawn at the discounted rate."
 

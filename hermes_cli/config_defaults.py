@@ -1975,6 +1975,14 @@ DEFAULT_CONFIG = {
             # latency, never the peak rate. See kanban_cost_window.py.
             "peak_windows_utc": ["01:00-04:00", "06:00-10:00"],
             "peak_days": ["mon", "tue", "wed", "thu", "fri"],
+            # The provider's peak days EXCLUDE Chinese public holidays. This module keeps
+            # no calendar of its own, so the carve-out is honoured only from a snapshot
+            # you point at here (produced by scripts/holiday_calendar_refresh.py), and
+            # only while that snapshot is readable, unexpired (`valid_through`) and
+            # covers the date. Empty (default) = the carve-out is ignored, which is the
+            # safe direction: believing a holiday that is not one would dispatch INTO
+            # peak at double price, while ignoring a real one only defers the work.
+            "holiday_calendar": "",
             # Providers whose price varies by time of day. A flat-rate plan must NOT
             # be listed: deferring it wastes time and saves nothing.
             "providers": ["deepseek"],
