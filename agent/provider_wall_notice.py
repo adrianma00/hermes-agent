@@ -192,6 +192,58 @@ def _chain_entries(agent: Any) -> Iterable[dict]:
     return [entry for entry in chain if isinstance(entry, dict)]
 
 
+def route_pairs(config: Optional[dict]) -> set[tuple[str, str]]:
+    """``(provider, model)`` pairs a profile's config routes through: its primary + fallback chain.
+
+    Empty provider means "inherits the install default", which is how an unset
+    ``model.provider`` behaves at runtime.
+    """
+    pairs: set[tuple[str, str]] = set()
+    model_cfg = (config or {}).get("model")
+    if isinstance(model_cfg, dict):
+        model = str(model_cfg.get("default") or "").strip()
+        if model:
+            pairs.add((str(model_cfg.get("provider") or "").strip().lower(), model))
+    for entry in (config or {}).get("fallback_providers") or []:
+        if not isinstance(entry, dict):
+            continue
+        model = str(entry.get("model") or "").strip()
+        if model:
+            pairs.add((str(entry.get("provider") or "").strip().lower(), model))
+    return pairs
+
+
+def routes_affected(routes: set[tuple[str, str]], incident_routes: Optional[Iterable[dict]]) -> bool:
+    """True when any of *routes* is one of the incident's affected ``(provider, model)`` pairs.
+
+    Only the profiles that actually run an affected route are paged: a profile on an unrelated
+    model/provider must not be woken for someone else's wall.  Anything unknown fails OPEN —
+    an absent route list (older marker) or an unreadable config returns True, because
+    over-notifying costs one message while dropping a wall notice costs the incident.
+    """
+    pairs = {
+        (str(route.get("provider") or "").strip().lower(), str(route.get("model") or "").strip())
+        for route in (incident_routes or [])
+        if isinstance(route, dict)
+    }
+    pairs.discard(("", ""))
+    if not pairs or not routes:
+        return True
+    incident_models = {model for _provider, model in pairs if model}
+    incident_providers = {provider for provider, _model in pairs if provider}
+    for provider, model in routes:
+        if not model:
+            continue
+        if (provider, model) in pairs:
+            return True
+        # An unset provider inherits the install default, so the model alone identifies the route.
+        if not provider and model in incident_models:
+            return True
+        if provider and model in incident_models and provider in incident_providers:
+            return True
+    return False
+
+
 def _reason_detail(reason: Any) -> str:
     value = getattr(reason, "value", reason)
     return {

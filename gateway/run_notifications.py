@@ -979,6 +979,34 @@ class GatewayNotificationsMixin:
             except Exception:
                 logger.warning("Planned-restart notification remains pending", exc_info=True)
 
+    def _profile_runs_incident_route(self, profile, incident_routes) -> bool:
+        """True when a served profile's own config routes through an affected provider:model.
+
+        The wall notice is scoped to the profiles it can actually hurt: a profile running an
+        unrelated route keeps quiet.  Doubt resolves to True — an unreadable config or an older
+        marker without route info must not swallow the notice.
+        """
+        from agent.provider_wall_notice import route_pairs, routes_affected
+
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            home = None if profile is None else (
+                getattr(self, "_served_profile_homes", None) or {}).get(profile)
+            if profile is None or home is None:
+                config = load_config_readonly()
+            else:
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(Path(home), hydrate_secrets=False):
+                    config = load_config_readonly()
+        except Exception:
+            logger.debug(
+                "Provider wall notice: could not read the routes of %s — notifying",
+                profile or "the launch profile", exc_info=True)
+            return True
+        return routes_affected(route_pairs(config or {}), incident_routes)
+
     async def _replay_pending_provider_wall_notice(self, *, skip_chats: Optional[set] = None) -> None:
         """Fan a pending provider-wall notice out to every served profile's home channel.
 
@@ -1001,6 +1029,7 @@ class GatewayNotificationsMixin:
             return
 
         skipped = set(skip_chats or ())
+        incident_routes = payload.get("routes")
         delivered = {
             tuple(str(part) if part is not None else "" for part in target)
             for target in (payload.get("delivered_targets") or [])
@@ -1019,6 +1048,10 @@ class GatewayNotificationsMixin:
                 continue
             if chat in skipped:
                 # The chat that hit the wall already got the notice in-band — do not send it twice.
+                delivered.add(target)
+                continue
+            if not self._profile_runs_incident_route(profile, incident_routes):
+                # A profile on an unrelated model/provider is not paged for someone else's wall.
                 delivered.add(target)
                 continue
             if chat in notified_chats:

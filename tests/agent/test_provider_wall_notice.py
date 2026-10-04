@@ -227,3 +227,49 @@ def test_expired_marker_is_dropped(isolated_marker):
 
     assert wall.read_pending() is None
     assert not isolated_marker.exists()
+
+
+# ── which profiles are affected ──────────────────────────────────────────
+
+
+def test_route_pairs_reads_the_primary_and_the_chain():
+    pairs = wall.route_pairs({
+        "model": {"default": "deepseek-v4-flash", "provider": "Custom"},
+        "fallback_providers": [
+            {"provider": "deepseek", "model": "deepseek-v4-flash"},
+            {"model": "no-provider-inherits"},
+            "garbage",
+        ],
+    })
+
+    assert pairs == {
+        ("custom", "deepseek-v4-flash"),
+        ("deepseek", "deepseek-v4-flash"),
+        ("", "no-provider-inherits"),
+    }
+
+
+def test_route_pairs_of_an_empty_config_is_empty():
+    assert wall.route_pairs({}) == set()
+    assert wall.route_pairs(None) == set()
+
+
+def test_routes_affected_matches_the_provider_and_model_pair():
+    incident = [{"provider": "custom", "model": "deepseek-v4-flash"}]
+
+    assert wall.routes_affected({("custom", "deepseek-v4-flash")}, incident) is True
+    assert wall.routes_affected({("deepseek", "deepseek-v4-flash")}, incident) is False
+    assert wall.routes_affected({("custom", "some-other-model")}, incident) is False
+
+
+def test_routes_affected_treats_an_unset_provider_as_inherited():
+    incident = [{"provider": "custom", "model": "deepseek-v4-flash"}]
+
+    assert wall.routes_affected({("", "deepseek-v4-flash")}, incident) is True
+
+
+def test_routes_affected_fails_open_when_the_route_info_is_missing():
+    # An older marker with no route list, or a profile whose config could not be read.
+    assert wall.routes_affected({("xai", "grok-4")}, None) is True
+    assert wall.routes_affected(set(), [{"provider": "custom", "model": "m"}]) is True
+

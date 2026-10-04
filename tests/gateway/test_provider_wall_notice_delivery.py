@@ -36,10 +36,11 @@ def _write_pending(**overrides):
     return payload
 
 
-def _runner(adapter=None, *, notifications_enabled=True, monkeypatch=None):
+def _runner(adapter=None, *, notifications_enabled=True, monkeypatch=None, profile_config=None):
     runner, adapter = make_restart_runner(adapter)
     for name in (
         "_replay_pending_provider_wall_notice",
+        "_profile_runs_incident_route",
         "_served_home_channel_configs",
         "_served_home_channel_transports",
         "_home_channel_transports",
@@ -54,9 +55,12 @@ def _runner(adapter=None, *, notifications_enabled=True, monkeypatch=None):
     )})
     if monkeypatch is not None:
         import gateway.warning_notifications as warnings
+        import hermes_cli.config as hermes_config
 
         monkeypatch.setattr(warnings, "warning_notifications_enabled",
                             lambda platform, user_config=None: notifications_enabled)
+        monkeypatch.setattr(hermes_config, "load_config_readonly",
+                            lambda *args, **kwargs: profile_config or {})
     return runner, adapter
 
 
@@ -145,3 +149,74 @@ async def test_replay_without_a_marker_is_a_noop(tmp_path, monkeypatch):
     await runner._replay_pending_provider_wall_notice()
 
     assert adapter.sent == []
+
+
+# ── only the profiles the wall can actually hurt ─────────────────────────
+
+WALL_ROUTES = [{"provider": "custom", "model": "deepseek-v4-flash"}]
+
+
+@pytest.mark.asyncio
+async def test_fanout_reaches_a_profile_running_the_affected_route(tmp_path, monkeypatch):
+    marker = _marker(tmp_path, monkeypatch)
+    _write_pending(routes=WALL_ROUTES)
+    runner, adapter = _runner(
+        monkeypatch=monkeypatch,
+        profile_config={"model": {"default": "deepseek-v4-flash", "provider": "custom"}},
+    )
+
+    await runner._replay_pending_provider_wall_notice()
+
+    assert adapter.sent == [TEXT]
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_fanout_skips_a_profile_running_an_unrelated_route(tmp_path, monkeypatch):
+    marker = _marker(tmp_path, monkeypatch)
+    _write_pending(routes=WALL_ROUTES)
+    runner, adapter = _runner(
+        monkeypatch=monkeypatch,
+        profile_config={"model": {"default": "grok-4", "provider": "xai"}},
+    )
+
+    await runner._replay_pending_provider_wall_notice()
+
+    assert adapter.sent == []
+    assert not marker.exists()  # nothing owed here: the marker clears instead of lingering
+
+
+@pytest.mark.asyncio
+async def test_fanout_reaches_a_profile_whose_chain_uses_the_affected_route(tmp_path, monkeypatch):
+    _marker(tmp_path, monkeypatch)
+    _write_pending(routes=WALL_ROUTES)
+    runner, adapter = _runner(
+        monkeypatch=monkeypatch,
+        profile_config={
+            "model": {"default": "grok-4", "provider": "xai"},
+            "fallback_providers": [{"provider": "custom", "model": "deepseek-v4-flash"}],
+        },
+    )
+
+    await runner._replay_pending_provider_wall_notice()
+
+    assert adapter.sent == [TEXT]
+
+
+@pytest.mark.asyncio
+async def test_fanout_notifies_when_the_route_config_cannot_be_read(tmp_path, monkeypatch):
+    _marker(tmp_path, monkeypatch)
+    _write_pending(routes=WALL_ROUTES)
+    runner, adapter = _runner(monkeypatch=monkeypatch)
+
+    import hermes_cli.config as hermes_config
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(hermes_config, "load_config_readonly", _boom)
+
+    await runner._replay_pending_provider_wall_notice()
+
+    assert adapter.sent == [TEXT]  # doubt resolves to notifying, never to silence
+
