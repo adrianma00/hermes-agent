@@ -242,7 +242,6 @@ class _KanbanDispatcher:
                     if conn is not None:
                         with contextlib.suppress(Exception):
                             conn.close()
- (fix(kanban): fence the explicit-board override to unfenced callers)
         return False
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:

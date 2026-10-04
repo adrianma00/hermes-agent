@@ -385,7 +385,6 @@ def pin_first_board_resolution():
         yield
     finally:
         _PIN_FIRST_BOARD_RESOLUTION.reset(token)
- (fix(kanban): fence the explicit-board override to unfenced callers)
 
 
 @contextlib.contextmanager
@@ -396,22 +395,6 @@ def scoped_current_board(slug: str):
         yield
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
-
-
-@contextlib.contextmanager
-def pin_first_board_resolution():
-    """Machine-flow board resolution: env pins outrank the enumerated slug.
-
-    On a box whose env pins ``HERMES_KANBAN_DB``, every board slug must
-    resolve to the pinned file — the gateway notifier/watcher enumerates
-    slugs but must read (and write cursors to) the one DB workers write.
-    Without an env pin this is a no-op (no resolution change).
-    """
-    token = _PIN_FIRST_RESOLUTION.set(True)
-    try:
-        yield
-    finally:
-        _PIN_FIRST_RESOLUTION.reset(token)
 
 
 # Slug = directory name: strict enough to stop traversal / separators, loose
@@ -540,6 +523,38 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _pinned_board_slug() -> Optional[str]:
+    """The board the caller's pins identify, per the environment — or ``None``.
+
+    The dispatcher injects ``HERMES_KANBAN_BOARD`` next to ``HERMES_KANBAN_DB``,
+    and it is what makes the pin authoritative for the caller's OWN board even
+    when the pinned path cannot be compared to a derived one (``hermes -p``
+    rewriting ``HERMES_HOME``, Docker / symlink layouts — see the spawn path).
+    """
+    raw = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if not raw:
+        return None
+    try:
+        return _normalize_board_slug(raw)
+    except ValueError:
+        return None
+
+
+def _pin_answers_for(slug: str, pinned: Path, canonical: Path) -> bool:
+    """Whether the caller's pin may answer a request for ``slug``.
+
+    True when ``slug`` IS the caller's own board: ``HERMES_KANBAN_BOARD`` — injected
+    next to the pin by the dispatcher — says so, or (absent that declaration) the
+    pinned path already IS ``slug``'s canonical file. The declaration matters
+    because the pinned path cannot always be compared to a derived one: the pin
+    exists precisely to survive ``hermes -p`` rewriting ``HERMES_HOME`` (symlink /
+    Docker layouts — see the spawn path).
+    """
+    if _pinned_board_slug() == slug:
+        return True
+    return _same_db_file(pinned, canonical)
+
+
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
     """Explicit caller intent: a direct ``board=`` argument, else the scoped
     ``--board`` context (CLI ``hermes kanban --board``, dashboard plugin_api);
@@ -575,7 +590,6 @@ def _explicit_board_intent_pinned() -> bool:
         return True
     from agent.delegation_context import explicit_board_intent_is_pinned
     return explicit_board_intent_is_pinned()
- (fix(kanban): fence the explicit-board override to unfenced callers)
 
 
 def _board_path(
@@ -595,7 +609,6 @@ def _board_path(
     slug = _explicit_board_slug(board)
     if pin and (slug is None or _explicit_board_intent_pinned()):
         return Path(pin).expanduser()
- (fix(kanban): fence the explicit-board override to unfenced callers)
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -711,7 +724,7 @@ def connection_db_path(board: Optional[str] = None, db_path: Optional[Path] = No
     pinned = _pinned_db_override()
     if pinned is None:
         return kanban_db_path(slug)
-    if _PIN_FIRST_RESOLUTION.get():
+    if _PIN_FIRST_BOARD_RESOLUTION.get():
         # Machine-flow resolution: every board slug opens the pinned DB.
         return pinned
     canonical = board_db_path_unpinned(slug)
