@@ -1932,6 +1932,37 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
+def _emit_provider_wall_notice(agent, *, reason, reset_at) -> None:
+    """Record the operator-facing wall notice and surface it in the originating chat.
+
+    The incident text (one line per provider:model pair, with status and reset) is written to a
+    marker the gateway fans out to every served home channel; the in-band notice keeps the chat
+    that actually hit the wall equally clear.  Fires once per incident: a repeat of the same wall
+    records nothing and returns None from ``record_provider_wall``.  Never raises — this runs on
+    the retry path of a failing turn and must not mask the provider error.
+    """
+    try:
+        from agent.provider_wall_notice import read_pending, record_provider_wall
+
+        signature = record_provider_wall(agent, reason=reason, reset_at=reset_at)
+        if not signature:
+            return
+        callback = getattr(agent, "notice_callback", None)
+        if callback is None:
+            return
+        text = (read_pending() or {}).get("text")
+        if not text:
+            return
+        from agent.credits_tracker import AgentNotice
+
+        callback(AgentNotice(
+            text=text, level="warn", kind="sticky",
+            key=f"provider_wall.{signature}", id=f"provider_wall.{signature}",
+        ))
+    except Exception:
+        logger.debug("provider wall notice skipped", exc_info=True)
+
+
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
@@ -2084,18 +2115,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     # each re-hitting the same 429. Fires only when still ON the primary (the
     # cooldown helper already decided that) and only with a real reset instant.
     if not getattr(agent, "_fallback_activated", False):
+        _wall_ctx = getattr(agent, "_last_api_error_context", None) or {}
         try:
             from agent.quota_gate_trigger import maybe_close_gate
 
-            _ctx = getattr(agent, "_last_api_error_context", None) or {}
             maybe_close_gate(
                 provider=getattr(agent, "provider", None),
-                reset_at=_ctx.get("reset_at"),
+                reset_at=_wall_ctx.get("reset_at"),
                 reason=getattr(reason, "value", None) if reason is not None else None,
-                window=_ctx.get("window"),
+                window=_wall_ctx.get("window"),
             )
         except Exception:
             logger.debug("quota gate trigger skipped", exc_info=True)
+        _emit_provider_wall_notice(agent, reason=reason, reset_at=_wall_ctx.get("reset_at"))
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
