@@ -3,7 +3,10 @@
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
 another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+file path) > ``<root>/kanban/current`` > ``default`` — but only for unfenced callers; the dispatcher
+injects these into workers, and dispatched workers (``HERMES_KANBAN_TASK``), delegated children and
+board-enumerating machine flows (gateway notifier/watcher/dispatcher, ``pin_first_board_resolution``)
+always resolve through the pin, so workers physically cannot see other boards.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -356,14 +359,33 @@ DEFAULT_BOARD = "default"
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
-# Machine-flow resolution mode: when active and HERMES_KANBAN_DB is set,
-# every board slug resolves to the pinned DB regardless of the requested
-# board.  Used by the gateway notifier/watcher/dispatcher ticks on a
-# dispatcher-pinned box so per-slug enumeration opens the same file the
-# workers write to instead of each slug's own (empty) DB.
-_PIN_FIRST_RESOLUTION: ContextVar[bool] = ContextVar(
-    "hermes_kanban_pin_first_resolution", default=False,
+# Machine flows that enumerate boards (gateway notifier / watcher / dispatcher
+# ticks) resolve board paths env-pin-first — see pin_first_board_resolution().
+_PIN_FIRST_BOARD_RESOLUTION: ContextVar[bool] = ContextVar(
+    "hermes_kanban_pin_first_board_resolution", default=False,
 )
+
+
+@contextlib.contextmanager
+def pin_first_board_resolution():
+    """Resolve board paths env-pin-first for machine flows that enumerate boards.
+
+    The gateway notifier, per-subscription cursor writes and the embedded
+    dispatcher poll every board slug from ``list_boards()`` — the slug is not
+    caller intent, it is an iteration variable. On a box whose environment pins
+    ``HERMES_KANBAN_DB`` (the dispatcher default) every slug must map to that
+    one pinned file: the notifier dedupes resolved DB paths, and per-slug
+    paths read empty boards nobody writes, silently killing wake
+    notifications. Explicit cross-board intent (CLI ``--board``, a model
+    tool's ``board=``) is a USER property and must never run inside this
+    context; with no pin set this context changes nothing.
+    """
+    token = _PIN_FIRST_BOARD_RESOLUTION.set(True)
+    try:
+        yield
+    finally:
+        _PIN_FIRST_BOARD_RESOLUTION.reset(token)
+ (fix(kanban): fence the explicit-board override to unfenced callers)
 
 
 @contextlib.contextmanager
@@ -518,146 +540,62 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _pin_answers_for(slug: str, pinned: Path, canonical: Path) -> bool:
-    """Whether the caller's pin may answer a request for ``slug``.
+def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
+    """Explicit caller intent: a direct ``board=`` argument, else the scoped
+    ``--board`` context (CLI ``hermes kanban --board``, dashboard plugin_api);
+    ``None`` when the caller expressed neither."""
+    if board is not None:
+        return _normalize_board_slug(board)
+    # A caller-scoped board (CLI `hermes kanban --board B ...`, dashboard
+    # plugin_api) is explicit intent just like a direct board= argument —
+    # without this a worker-pinned HERMES_KANBAN_DB silently outranks --board
+    # (os-reviewer P1 on PR#107195 / t_11c4afd8).
+    ctx = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if ctx:
+        try:
+            return _normalize_board_slug(ctx)
+        except ValueError:
+            return None
+    return None
 
-    True when ``slug`` IS the caller's own board: ``HERMES_KANBAN_BOARD`` — injected
-    next to the pin by the dispatcher — says so, or (absent that declaration) the
-    pinned path already IS ``slug``'s canonical file. The declaration matters
-    because the pinned path cannot always be compared to a derived one: the pin
-    exists precisely to survive ``hermes -p`` rewriting ``HERMES_HOME`` (symlink /
-    Docker layouts — see the spawn path), where the two differ for the SAME board.
-    """
-    if _pinned_board_slug() == slug:
+
+def _explicit_board_intent_pinned() -> bool:
+    """Whether an explicit ``board=`` (or scoped ``--board``) must still resolve
+    through the ``HERMES_KANBAN_DB``-style env pins instead of its own board dir.
+
+    True for machine flows wrapped in :func:`pin_first_board_resolution` and
+    for every execution the dispatcher fences: its own workers (they carry
+    ``HERMES_KANBAN_TASK``) and delegated children / descendants (the
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` marker). The pins ARE the "workers
+    physically cannot see other boards" isolation (5ec6baa), and
+    ``agent.delegation_context.kanban_path_is_fenced`` checks the pinned path /
+    fenced root — an explicit board that resolved elsewhere would also escape
+    that fence."""
+    if _PIN_FIRST_BOARD_RESOLUTION.get():
         return True
-    return _same_db_file(pinned, canonical)
-
-
-def _override_board_request() -> Optional[str]:
-    """The board a call's ``scoped_current_board`` override names — or ``None``.
-
-    This is the CLI ``--board <slug>`` / dashboard per-request board: an EXPLICIT
-    board request made by the caller for ONE call, unlike the ``board`` argument
-    of the internal API (which callers pass for the board they are already bound
-    to — the dispatcher spawn path, for instance, runs pinned to its own DB and
-    passes that same board).
-
-    ``None`` means no override, so the legacy chain (``HERMES_KANBAN_DB`` ->
-    ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current`` -> ``default``) decides.
-    An override naming a board that does not exist falls through, mirroring
-    :func:`get_current_board`: a stale/malformed override must not invent a board.
-    """
-    raw = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
-    if not raw:
-        return None
-    try:
-        normed = _normalize_board_slug(raw)
-    except ValueError:
-        return None
-    return normed if normed and board_exists(normed) else None
-
-
-def _pinned_board_slug() -> Optional[str]:
-    """The board the caller's pins identify, per the environment — or ``None``.
-
-    The dispatcher injects ``HERMES_KANBAN_BOARD`` next to ``HERMES_KANBAN_DB``,
-    and it is what makes the pin authoritative for the caller's OWN board even
-    when the pinned path cannot be compared to a derived one (``hermes -p``
-    rewriting ``HERMES_HOME``, Docker / symlink layouts — see the spawn path).
-    """
-    raw = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
-    if not raw:
-        return None
-    try:
-        return _normalize_board_slug(raw)
-    except ValueError:
-        return None
-
-
-def _canonical_pinned_path(slug: str, default_parts: tuple[str, ...], leaf: str) -> Path:
-    """Where ``_board_path`` points for ``slug`` with NO env pin set.
-
-    ``default`` keeps the legacy layout (``<root>/kanban.db``, ``<root>/kanban/
-    workspaces``); every other board lives under its own directory.
-    """
-    if slug == DEFAULT_BOARD:
-        return kanban_home().joinpath(*default_parts)
-    return board_dir(slug) / leaf
+    from agent.delegation_context import explicit_board_intent_is_pinned
+    return explicit_board_intent_is_pinned()
+ (fix(kanban): fence the explicit-board override to unfenced callers)
 
 
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
     *, identity: bool = False,
 ) -> Path:
-    """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``.
-
-    The env override is a PIN: the dispatcher injects it into every worker and it
-    identifies that worker's OWN board, so a per-call board request must not be
-    answered through it unless it names that same board. The request that matters
-    here is the ``scoped_current_board`` override — the CLI ``--board <slug>`` and
-    the dashboard's per-request board — because that is the one users make for
-    ANOTHER board; the ``board`` argument keeps the legacy chain (its callers pass
-    the board they are already bound to, pin included). This collapse is why
-    ``hermes kanban --board <sibling> create`` printed ``Created t_…`` while the
-    row landed in the caller's own board (fourth site of the ``HERMES_KANBAN_DB``
-    pin collapse behind 6fdaa43d0). So an override naming another board ignores
-    the pin and derives that board's canonical path, and for the DB file itself
-    (``identity=True`` — the trust boundary) a board-scoped caller (dispatcher
-    worker / delegate child) is refused loudly instead of silently mis-delivered.
-    :func:`connection_db_path` applies the same rule to an explicit ``board=``
-    request on the connector side.
-
-    The ``board`` argument itself is also treated as a target request: when it is
-    set the pin is only honoured while it names the caller's own board, matching
-    ``scoped_current_board`` semantics.  ``pin_first_board_resolution()`` —
-    used by machine flows (notifier/watcher/dispatcher ticks) — temporarily
-    overrides this so every slug maps to the pinned DB.
-    """
-    # Unify the board argument and the scoped_current_board override into a
-    # single target slug — both are explicit requests for a specific board.
-    # Use the raw ContextVar directly (not _override_board_request(), which
-    # gates on board_exists): _board_path resolves paths, not routing, so a
-    # scoped_current_board("new-board") must work before the board exists.
-    #
-    # For a BOARD-SCOPED process (dispatched worker / delegate child) the
-    # board argument is automatically injected by the dispatcher and names
-    # the caller's OWN board — not an explicit request for a different one.
-    # Non-scoped callers (gateway, dashboard, interactive session) that pass
-    # an explicit board= ARE making a request for that board.
-    explicit_board = _normalize_board_slug(board)
-    context_override = (_CURRENT_BOARD_OVERRIDE.get() or "").strip() or None
-    if context_override is not None:
-        try:
-            context_override = _normalize_board_slug(context_override)
-        except ValueError:
-            context_override = None
-    target_slug = context_override
-    if target_slug is None and not _is_board_scoped_process():
-        target_slug = explicit_board
-
-    if env_var:
-        override = os.environ.get(env_var, "").strip()
-        if override:
-            pinned = Path(override).expanduser()
-            if target_slug is None:
-                # No explicit board request: the pin is authoritative.
-                return pinned
-            if _PIN_FIRST_RESOLUTION.get() and env_var == "HERMES_KANBAN_DB":
-                # Machine-flow resolution: every board slug collapses to the
-                # pinned DB, not each slug's canonical file.  Used by the
-                # gateway notifier/watcher on a dispatcher-pinned box.
-                return pinned
-            canonical = _canonical_pinned_path(target_slug, default_parts, leaf)
-            if _pin_answers_for(target_slug, pinned, canonical):
-                # The caller's OWN board (or the pinned path already IS this
-                # board's): the pin is the authority — it survives a rewritten
-                # HERMES_HOME, where the derived path differs for the SAME board.
-                return pinned
-            if identity and _is_board_scoped_process():
-                raise _board_pin_conflict(env_var, target_slug, pinned)
-            return canonical
-    slug = target_slug or get_current_board()
+    """Shared resolver. An explicit ``board=`` argument — or the scoped
+    ``--board`` context (:func:`scoped_current_board`) — outranks the ``env_var``
+    pin ONLY where no fence applies (see :func:`_explicit_board_intent_pinned`):
+    user-facing cross-board intent (CLI ``--board``, a model tool's ``board=``)
+    is honored, but machine flows that enumerate boards (gateway notifier /
+    watcher / dispatcher ticks) and dispatched or delegated workers keep
+    resolving through the pin. Without explicit intent the ``env_var`` override
+    pins the file, else legacy ``<root>/<default_parts>`` for the ``default``
+    board, else ``board_dir(slug)/leaf``."""
+    pin = os.environ.get(env_var, "").strip() if env_var else ""
+    slug = _explicit_board_slug(board)
+    if pin and (slug is None or _explicit_board_intent_pinned()):
+        return Path(pin).expanduser()
+ (fix(kanban): fence the explicit-board override to unfenced callers)
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
