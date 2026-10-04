@@ -3218,7 +3218,7 @@ def _dispatch_once_locked(
         return result
 
     # Read provider-quota gate state (fail closed per Adrian's requirement).
-    # The gate is shared via the yummi-admin board; if the mount is down
+    # The gate is shared via the yummi-board board; if the mount is down
     # the gate stays closed.
     from hermes_cli.kanban_db import read_quota_gate_state
     quota_gate = read_quota_gate_state(fallback_chain=_resolve_fallback_chain())

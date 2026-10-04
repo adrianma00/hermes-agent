@@ -1955,7 +1955,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             # Board that carries the gate card (one `quota-gate:<provider>` card in `scheduled`).
             # Shared across the fleet/tenants so every profile reads the same state.
-            "board": "yummi-admin",
+            "board": "yummi-board",
         },
         # Provider COST-window deferral: hold dispatch out of a provider's peak-price
         # hours so batch work runs at the discounted rate. The twin of quota_gate, with

@@ -5245,7 +5245,7 @@ class QuotaGateState:
 # Shared-board slug for the quota gate card.  Board is shared cross-tenant
 # between Em (ama) and Yummi (elise) so every profile in the fleet reads
 # the same gate state.
-_QUOTA_GATE_BOARD = "yummi-admin"
+_QUOTA_GATE_BOARD = "yummi-board"
 # Title prefix for the gate card; the full title is ``quota-gate:<provider>``
 # where ``provider`` is the credential-pool key (e.g. ``custom:modelark``).
 _QUOTA_GATE_TITLE_PREFIX = "quota-gate:"
