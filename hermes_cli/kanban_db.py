@@ -5086,14 +5086,21 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
 # ── Quota gate card writer ──────────────────────────────────────────────────
 
 
-def write_quota_gate_card(provider: str, body: dict) -> None:
+def write_quota_gate_card(provider: str, body: dict, *, board: Optional[str] = None) -> None:
     """Create or update the quota gate card on the shared board.
 
     ``body`` must carry ``v``, ``provider``, ``reset_at``, ``closed_at``,
     and optionally ``window``/``opened_at``.  The card lands in ``scheduled``
     status (inert — never dispatched) with no assignee.
+
+    ``board`` overrides the resolved gate board (:func:`quota_gate_board`:
+    ``kanban.quota_gate.board`` else :data:`_QUOTA_GATE_BOARD`).  The READER has
+    always honoured the config key; a writer that did not wrote to one board
+    while the dispatcher read another, so the gate never closed and dispatch kept
+    feeding the walled provider.
     """
-    db_path = _quota_gate_db_path()
+    slug = board or quota_gate_board()
+    db_path = _quota_gate_db_path(slug)
     if db_path is None:
         raise RuntimeError("Quota-gate board not found — cannot write the gate card")
     if not Path(db_path).exists():
@@ -5101,7 +5108,7 @@ def write_quota_gate_card(provider: str, body: dict) -> None:
         # path: a silent no-op here leaves the gate OPEN while a 429 says the
         # provider is walled, which is exactly how the dispatcher keeps spawning.
         raise RuntimeError(
-            f"Quota-gate board '{_QUOTA_GATE_BOARD}' not found at {db_path} — "
+            f"Quota-gate board '{slug}' not found at {db_path} — "
             "the shared board must exist before the gate can close"
         )
 
@@ -5135,12 +5142,16 @@ def write_quota_gate_card(provider: str, body: dict) -> None:
         conn.close()
 
 
-def delete_quota_gate_card(provider: str) -> bool:
-    """Remove the quota gate card for ``provider``.  Returns True when one was deleted."""
+def delete_quota_gate_card(provider: str, *, board: Optional[str] = None) -> bool:
+    """Remove the quota gate card for ``provider``.  Returns True when one was deleted.
+
+    ``board`` overrides the resolved gate board (:func:`quota_gate_board`) — the
+    open path must look where the close path wrote.
+    """
     title = f"{_QUOTA_GATE_TITLE_PREFIX}{provider}"
     import sqlite3
 
-    db_path = _quota_gate_db_path()
+    db_path = _quota_gate_db_path(board or quota_gate_board())
     if db_path is None:
         return False
     conn = sqlite3.connect(str(db_path))
@@ -5331,4 +5342,16 @@ def _quota_gate_config() -> "tuple[bool, str]":
     enabled = bool(cfg.get("enabled", False))
     board = str(cfg.get("board") or _QUOTA_GATE_BOARD).strip() or _QUOTA_GATE_BOARD
     return enabled, board
+
+
+def quota_gate_board() -> str:
+    """The configured quota-gate board slug: ``kanban.quota_gate.board``, else the default.
+
+    One resolution rule for the reader, the writer and the CLI, so a gate card is
+    always written to the board the dispatcher reads.  A writer that resolved this
+    differently wrote to a board nobody read: the gate never closed and dispatch
+    kept feeding the walled provider (seen live on an install whose config named a
+    board the writer ignored).
+    """
+    return _quota_gate_config()[1]
 

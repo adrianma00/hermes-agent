@@ -77,7 +77,7 @@ def _cmd_close(args: argparse.Namespace) -> int:
         "reset_at": int(reset_at),
         "opened_at": None,
     }
-    kb.write_quota_gate_card(provider, body)
+    kb.write_quota_gate_card(provider, body, board=kb.quota_gate_board())
     print(f"Gate CLOSED for {provider} "
           f"until {time.strftime('%H:%M:%S', time.localtime(reset_at))} "
           f"(window: {window})")
@@ -90,7 +90,7 @@ def _cmd_open(args: argparse.Namespace) -> int:
     if not provider:
         return _err("provider is required")
     kb = _kb()
-    removed = kb.delete_quota_gate_card(provider)
+    removed = kb.delete_quota_gate_card(provider, board=kb.quota_gate_board())
     if removed:
         print(f"Gate OPEN for {provider}")
     else:
@@ -197,7 +197,7 @@ def _cmd_probe(args: argparse.Namespace) -> int:
                 kb.write_quota_gate_card(provider, {
                     "v": 1, "provider": provider, "window": "5h",
                     "closed_at": int(time.time()), "reset_at": new_reset, "opened_at": None,
-                })
+                }, board=kb.quota_gate_board())
                 print(f"Gate still CLOSED for {provider} — "
                       f"re-armed to {time.strftime('%H:%M:%S', time.localtime(new_reset))}")
             else:

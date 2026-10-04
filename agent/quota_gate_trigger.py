@@ -51,7 +51,7 @@ def maybe_close_gate(
     try:
         from hermes_cli.kanban_db import read_quota_gate_state, write_quota_gate_card, _quota_gate_config
 
-        enabled, _board = _quota_gate_config()
+        enabled, board = _quota_gate_config()
         if not enabled:
             return False
 
@@ -68,7 +68,7 @@ def maybe_close_gate(
             "reset_at": int(reset_at),
             "opened_at": None,
             "source": "first-429",
-        })
+        }, board=board)
         logger.warning(
             "Provider-quota gate CLOSED for %s until %s (reason=%s) — kanban dispatch "
             "and cron jobs on this provider will hold until the window reopens.",
