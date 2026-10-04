@@ -1967,8 +1967,12 @@ DEFAULT_CONFIG = {
         "cost_window": {
             "enabled": False,
             # Peak windows in UTC, exactly as the provider publishes them.
-            # DeepSeek: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri; every other hour
-            # (incl. all weekend) is off-peak at half price.
+            # DeepSeek (terms revised 2026-10-04): 01:00-04:00 and 06:00-10:00 UTC,
+            # Mon-Fri EXCLUDING Chinese public holidays; every other hour — all
+            # weekend and those holidays in full — is off-peak at half price.
+            # The carve-out is intentionally unmodelled (there is no calendar key
+            # here): the gate keeps deferring on a holiday weekday, which costs
+            # latency, never the peak rate. See kanban_cost_window.py.
             "peak_windows_utc": ["01:00-04:00", "06:00-10:00"],
             "peak_days": ["mon", "tue", "wed", "thu", "fri"],
             # Providers whose price varies by time of day. A flat-rate plan must NOT

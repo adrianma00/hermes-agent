@@ -12,8 +12,9 @@ def build_cost_window_parser(subparsers, *, cmd_cost_window: Callable) -> None:
         help="Manage the provider cost-window gate (defer dispatch to off-peak hours)",
         description=(
             "Some providers price by time of day: DeepSeek bills peak rates "
-            "01:00-04:00 and 06:00-10:00 UTC, Mon-Fri, and off-peak at half price "
-            "every other hour (incl. all weekend). The cost-window gate holds "
+            "01:00-04:00 and 06:00-10:00 UTC, Mon-Fri EXCLUDING Chinese public "
+            "holidays, and off-peak at half price every other hour (all weekend "
+            "and those holidays in full). The cost-window gate holds "
             "kanban dispatch out of the peak windows so batch work runs at the "
             "discounted rate, instead of spawning the instant a card is created. "
             "It is the twin of the provider-quota gate, with two deliberate "

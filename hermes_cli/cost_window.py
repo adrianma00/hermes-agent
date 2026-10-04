@@ -98,6 +98,11 @@ def cost_window_command(args) -> int:
     print(f"   enabled        : {bool(block.get('enabled', False))}")
     print(f"   peak windows   : {_fmt_windows(state.windows)}")
     print(f"   peak days      : {_fmt_days(state.days)}")
+    print(
+        "   peak carve-out : Chinese public holidays are off-peak for the "
+        "provider — NOT modelled, so the gate keeps deferring on them "
+        "(latency only, never the peak rate)"
+    )
     print(f"   priced providers: {', '.join(state.providers) or '(none)'}")
     _clock = {True: "synchronised (NTP)", False: "NOT synchronised", None: "unknown"}
     print(f"   clock           : {_clock.get(state.clock_synced, 'unknown')}")

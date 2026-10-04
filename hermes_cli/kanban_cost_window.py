@@ -1,11 +1,19 @@
 """Provider cost-window gate: defer dispatch out of a provider's PEAK-price hours.
 
 DeepSeek bills by the UTC clock (since 2026-08-16): peak is 01:00-04:00 and
-06:00-10:00 UTC, Monday-Friday, and every other hour is off-peak at exactly half
-price. Same tokens, same model — only the arrival time differs. That makes
-*when* the dispatcher spawns a card a pricing decision, and a fleet that
-dispatches the instant a card is created pays double for no benefit on any work
-that is not latency-critical.
+06:00-10:00 UTC, Monday-Friday **excluding Chinese public holidays** (the
+provider revised the terms on 2026-10-04), and every other hour — all weekend
+AND those holidays in full — is off-peak at exactly half price. Same tokens,
+same model — only the arrival time differs. That makes *when* the dispatcher
+spawns a card a pricing decision, and a fleet that dispatches the instant a card
+is created pays double for no benefit on any work that is not latency-critical.
+
+The holiday carve-out is deliberately NOT modelled. The schema below is a window
+set plus a day set, with no calendar, so on a holiday that falls Mon-Fri the gate
+still defers. That is the safe direction: a carve-out can only REMOVE a deferral,
+so a hand-kept holiday list gone stale — or a make-up workday misread as a
+holiday — dispatches INTO peak at double price, while not modelling it costs
+latency only, on batch work this gate is already delaying by design.
 
 This module is deliberately the twin of the provider-quota gate
 (``read_quota_gate_state``) with one structural difference that shapes the whole
@@ -41,8 +49,11 @@ _log = logging.getLogger(__name__)
 
 # Peak windows in UTC, as the provider publishes them. Overridable per install.
 DEFAULT_PEAK_WINDOWS_UTC = ("01:00-04:00", "06:00-10:00")
-# Peak days. DeepSeek's documented rule is Mon-Fri; weekends are entirely
-# off-peak. Configurable because a provider can change this.
+# Peak days. DeepSeek's documented rule is Mon-Fri EXCLUDING Chinese public
+# holidays; weekends are entirely off-peak. Configurable because a provider can
+# change this. The holiday carve-out has no representation here on purpose: see
+# the module docstring — it can only remove a deferral, so getting it wrong pays
+# peak price, while ignoring it only defers on a day that was off-peak anyway.
 DEFAULT_PEAK_DAYS = ("mon", "tue", "wed", "thu", "fri")
 # Providers whose pricing varies by time of day. A flat-rate provider (a coding
 # plan) must NOT be listed: deferring it would cost time and save nothing.
