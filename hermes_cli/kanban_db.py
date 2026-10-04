@@ -356,6 +356,14 @@ DEFAULT_BOARD = "default"
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
+# Machine-flow resolution mode: when active and HERMES_KANBAN_DB is set,
+# every board slug resolves to the pinned DB regardless of the requested
+# board.  Used by the gateway notifier/watcher/dispatcher ticks on a
+# dispatcher-pinned box so per-slug enumeration opens the same file the
+# workers write to instead of each slug's own (empty) DB.
+_PIN_FIRST_RESOLUTION: ContextVar[bool] = ContextVar(
+    "hermes_kanban_pin_first_resolution", default=False,
+)
 
 
 @contextlib.contextmanager
@@ -366,6 +374,22 @@ def scoped_current_board(slug: str):
         yield
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
+
+
+@contextlib.contextmanager
+def pin_first_board_resolution():
+    """Machine-flow board resolution: env pins outrank the enumerated slug.
+
+    On a box whose env pins ``HERMES_KANBAN_DB``, every board slug must
+    resolve to the pinned file — the gateway notifier/watcher enumerates
+    slugs but must read (and write cursors to) the one DB workers write.
+    Without an env pin this is a no-op (no resolution change).
+    """
+    token = _PIN_FIRST_RESOLUTION.set(True)
+    try:
+        yield
+    finally:
+        _PIN_FIRST_RESOLUTION.reset(token)
 
 
 # Slug = directory name: strict enough to stop traversal / separators, loose
@@ -583,24 +607,57 @@ def _board_path(
     worker / delegate child) is refused loudly instead of silently mis-delivered.
     :func:`connection_db_path` applies the same rule to an explicit ``board=``
     request on the connector side.
+
+    The ``board`` argument itself is also treated as a target request: when it is
+    set the pin is only honoured while it names the caller's own board, matching
+    ``scoped_current_board`` semantics.  ``pin_first_board_resolution()`` —
+    used by machine flows (notifier/watcher/dispatcher ticks) — temporarily
+    overrides this so every slug maps to the pinned DB.
     """
-    requested = _override_board_request()
+    # Unify the board argument and the scoped_current_board override into a
+    # single target slug — both are explicit requests for a specific board.
+    # Use the raw ContextVar directly (not _override_board_request(), which
+    # gates on board_exists): _board_path resolves paths, not routing, so a
+    # scoped_current_board("new-board") must work before the board exists.
+    #
+    # For a BOARD-SCOPED process (dispatched worker / delegate child) the
+    # board argument is automatically injected by the dispatcher and names
+    # the caller's OWN board — not an explicit request for a different one.
+    # Non-scoped callers (gateway, dashboard, interactive session) that pass
+    # an explicit board= ARE making a request for that board.
+    explicit_board = _normalize_board_slug(board)
+    context_override = (_CURRENT_BOARD_OVERRIDE.get() or "").strip() or None
+    if context_override is not None:
+        try:
+            context_override = _normalize_board_slug(context_override)
+        except ValueError:
+            context_override = None
+    target_slug = context_override
+    if target_slug is None and not _is_board_scoped_process():
+        target_slug = explicit_board
+
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
             pinned = Path(override).expanduser()
-            if requested is None:
+            if target_slug is None:
+                # No explicit board request: the pin is authoritative.
                 return pinned
-            canonical = _canonical_pinned_path(requested, default_parts, leaf)
-            if _pin_answers_for(requested, pinned, canonical):
+            if _PIN_FIRST_RESOLUTION.get() and env_var == "HERMES_KANBAN_DB":
+                # Machine-flow resolution: every board slug collapses to the
+                # pinned DB, not each slug's canonical file.  Used by the
+                # gateway notifier/watcher on a dispatcher-pinned box.
+                return pinned
+            canonical = _canonical_pinned_path(target_slug, default_parts, leaf)
+            if _pin_answers_for(target_slug, pinned, canonical):
                 # The caller's OWN board (or the pinned path already IS this
                 # board's): the pin is the authority — it survives a rewritten
                 # HERMES_HOME, where the derived path differs for the SAME board.
                 return pinned
             if identity and _is_board_scoped_process():
-                raise _board_pin_conflict(env_var, requested, pinned)
+                raise _board_pin_conflict(env_var, target_slug, pinned)
             return canonical
-    slug = _normalize_board_slug(board) or requested
+    slug = target_slug or get_current_board()
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -716,6 +773,9 @@ def connection_db_path(board: Optional[str] = None, db_path: Optional[Path] = No
     pinned = _pinned_db_override()
     if pinned is None:
         return kanban_db_path(slug)
+    if _PIN_FIRST_RESOLUTION.get():
+        # Machine-flow resolution: every board slug opens the pinned DB.
+        return pinned
     canonical = board_db_path_unpinned(slug)
     if _pin_answers_for(slug, pinned, canonical):
         return pinned
