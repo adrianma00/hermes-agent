@@ -5,8 +5,13 @@ module constant instead.  On any install that sets the key, the writer closed th
 gate on a board nothing read (or failed outright when that board did not exist),
 the trigger's ``except`` swallowed it, and the dispatcher kept feeding the walled
 provider.  These tests pin writer/reader/CLI symmetry.
+
+The second half pins the OVERRIDE ROUTE symmetry: the board slug has one resolver, and so
+does the fallback chain (``kanban_db.quota_gate_fallback_chain``) — a CLI that read no chain
+of its own printed "Hard pause: no fallback route" while the dispatcher routed to one.
 """
 
+import argparse
 import sqlite3
 import time
 
@@ -107,3 +112,71 @@ def test_trigger_passes_the_configured_board_to_the_writer(monkeypatch):
     assert closed is True
     assert seen["provider"] == "custom"
     assert seen["board"] == "gate-a"  # not the module constant
+
+
+# --- the override route: one resolver, so the CLI cannot contradict the dispatcher -------------
+
+def _closed_gate(monkeypatch, board="gate-route"):
+    """A board carrying a future-reset gate card, selected as the gate board."""
+    kb.create_board(board)
+    _patch_config(monkeypatch, board)
+    kb.write_quota_gate_card("custom", _body(reset_at=int(time.time()) + 7 * 86400), board=board)
+    return board
+
+
+def _config_with(*entries, legacy=None):
+    cfg = {"fallback_providers": list(entries)}
+    if legacy is not None:
+        cfg["fallback_model"] = legacy
+    return cfg
+
+
+def test_status_reports_the_override_route_the_dispatcher_would_use(monkeypatch, capsys):
+    """The closed gate must not claim a hard pause while a fallback route exists."""
+    _closed_gate(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _config_with({"provider": "deepseek", "model": "deepseek-v4-flash"}),
+    )
+    from hermes_cli import quota as quota_cli
+
+    assert quota_cli._cmd_status(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "Override route: deepseek:deepseek-v4-flash" in out
+    assert "Hard pause" not in out
+
+
+def test_status_says_hard_pause_when_no_route_exists(monkeypatch, capsys):
+    _closed_gate(monkeypatch)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    from hermes_cli import quota as quota_cli
+
+    quota_cli._cmd_status(argparse.Namespace())
+
+    assert "Hard pause: no fallback route" in capsys.readouterr().out
+
+
+def test_cli_cron_and_dispatcher_resolve_one_chain(monkeypatch):
+    """All three readers of the override route agree, including the legacy key order."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _config_with(
+            {"provider": "deepseek", "model": "deepseek-v4-flash"},
+            legacy={"provider": "openrouter", "model": "legacy/model"},
+        ),
+    )
+    from cron import scheduler_quota as sq
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    shared = kb.quota_gate_fallback_chain()
+    assert shared is not None
+    assert [e["provider"] for e in shared] == ["deepseek", "openrouter"]
+    assert kbd._resolve_fallback_chain() == shared
+    assert sq._config_and_chain()[1] == shared
+
+
+def test_no_configured_route_resolves_to_none(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"fallback_providers": []})
+
+    assert kb.quota_gate_fallback_chain() is None

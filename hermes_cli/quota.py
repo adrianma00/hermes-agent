@@ -101,7 +101,10 @@ def _cmd_open(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     """Print the current gate state."""
     kb = _kb()
-    state = kb.read_quota_gate_state(enabled=True)
+    # The chain MUST ride along: without it ``state.fallback_model`` is always None, so a closed
+    # gate printed "Hard pause: no fallback route" on every install that has one while the
+    # dispatcher was happily routing ``quota_override`` cards to it.
+    state = kb.read_quota_gate_state(kb.quota_gate_fallback_chain(), enabled=True)
     if state.is_closed:
         walled = state.walled_provider or "unknown"
         win = f" [{state.window} window]" if state.window else ""

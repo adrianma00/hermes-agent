@@ -5355,3 +5355,25 @@ def quota_gate_board() -> str:
     """
     return _quota_gate_config()[1]
 
+
+def quota_gate_fallback_chain() -> "Optional[list[dict]]":
+    """The route the gate sends flagged work to: this profile's fallback chain.
+
+    ONE resolver for every reader of the override route — the kanban dispatcher, the
+    cron gate and ``hermes quota status``.  They must agree by construction: a CLI that
+    resolved its own chain (or none) reported "Hard pause: no fallback route" while the
+    dispatcher was routing ``quota_override`` cards to one, so the operator read a
+    pause that was not in effect.
+
+    Built on ``fallback_config.get_fallback_chain`` so a legacy ``fallback_model:``
+    entry and a malformed one are handled the same way on every path.  ``None`` when
+    no usable route exists (the callers then treat the gate as a hard pause).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        return get_fallback_chain(load_config_readonly() or {}) or None
+    except Exception:
+        return None
+

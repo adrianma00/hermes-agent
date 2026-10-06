@@ -20,16 +20,19 @@ logger = logging.getLogger(__name__)
 def _config_and_chain() -> Tuple[dict, list]:
     """``(cfg, fallback_chain)`` from the user config; ``({}, [])`` on any error.
 
-    Fails open on a config read error: a broken config must not hold the fleet.
+    The chain comes from the shared ``kanban_db.quota_gate_fallback_chain`` resolver — the
+    same one the kanban dispatcher and ``hermes quota status`` use — so the three surfaces
+    cannot disagree about the override route.  Fails open on a config read error: a broken
+    config must not hold the fleet.
     """
     try:
         from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
+        from hermes_cli.kanban_db import quota_gate_fallback_chain
 
         cfg = load_config_readonly() or {}
         if not isinstance(cfg, dict):
             return {}, []
-        return cfg, get_fallback_chain(cfg)
+        return cfg, quota_gate_fallback_chain() or []
     except Exception:
         logger.debug("cron quota gate: config/fallback read failed — not gating", exc_info=True)
         return {}, []

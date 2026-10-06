@@ -3164,21 +3164,15 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 
 
 def _resolve_fallback_chain() -> Optional[list[dict]]:
-    """Read ``fallback_providers`` from the dispatcher's own config.
+    """The profile's fallback chain — the route this dispatcher sends flagged cards to.
 
-    Returns the first fallback entry as ``[{"provider": ..., "model": ...}]``
-    or ``None`` when no fallback chain is configured.
+    Delegates to ``kanban_db.quota_gate_fallback_chain`` (the ONE resolver, also used by the
+    cron gate and ``hermes quota status``) instead of parsing ``fallback_providers`` here, so
+    the CLI cannot report "no fallback route" while this path routes to one.  ``None`` when no
+    usable chain is configured.
     """
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-        chain = cfg.get("fallback_providers") or cfg.get("fallback_model")
-        if isinstance(chain, list) and chain:
-            return [{"provider": e["provider"], "model": e["model"]}
-                    for e in chain if isinstance(e, dict) and e.get("provider") and e.get("model")]
-        if isinstance(chain, dict):
-            return [{"provider": chain.get("provider"), "model": chain.get("model")}]
-        return None
+        return _kb.quota_gate_fallback_chain()
     except Exception:
         return None
 
