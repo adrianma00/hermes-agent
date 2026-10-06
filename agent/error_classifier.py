@@ -1046,30 +1046,6 @@ def _status_404(c: _Ctx) -> Verdict:
     return _V_MODEL_NOT_FOUND if _model_id_missing_known_prefix(c.model_slug, c.provider_slug) else _V_UNKNOWN
 
 
-def _absolute_quota_reset(msg: str) -> Optional[float]:
-    """Epoch seconds of a provider-stated ABSOLUTE reset instant in *msg*, else ``None``.
-
-    ``_rate_limit_reset_seconds`` only understands relative offsets, so a wall whose body says
-    "It will reset at 2026-10-05 00:00:00 +0800 CST" arrives with no reset at all. The credential
-    pool already parses exactly that form (``_extract_reset_at_from_message`` → an entry's
-    ``last_error_reset_at``); reusing it here keeps ONE parser for the format instead of two that
-    disagree. Past instants return ``None`` so a stale body cannot produce a nonsense "resets now".
-    """
-    try:
-        from agent.credential_pool import _extract_reset_at_from_message
-
-        parsed = _extract_reset_at_from_message(msg)
-    except Exception:
-        return None
-    if parsed is None:
-        return None
-    try:
-        parsed = float(parsed)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > time.time() else None
-
-
 def _status_429(c: _Ctx) -> Verdict:
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
@@ -1103,18 +1079,6 @@ def _status_429(c: _Ctx) -> Verdict:
         reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
         if reset:
             return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
-        # The absolute form reached this branch with no reset at all, because only the credential
-        # pool parsed it — so the verdict degraded to a bare ``billing`` and every consumer lost
-        # the single fact the provider handed us (live: ModelArk weekly quota, 2026-10-04; the
-        # gate then had nothing to reopen from and the notice named no time). Parse it here too.
-        # The verdict STAYS ``billing``: retryable=False is deliberate for a window that reopens in
-        # hours — the retry loop must not re-hammer the wall — but with ``reset_at`` present the
-        # primary cooldown arms to the provider's own instant instead of exponential backoff, the
-        # fallback notice names the wait, and the quota gate closes until the real reset.
-        absolute_reset = _absolute_quota_reset(c.msg)
-        if absolute_reset:
-            return _v(_R.billing, retryable=False, **_ROTATE_FALLBACK,
-                      error_context={"reset_at": absolute_reset})
         return _V_BILLING
     # Quota walls as 429 (Anthropic ``usage_limit_reached``, "quota", billing
     # phrases) are billing ONLY when the body is not itself a rate-limit phrase

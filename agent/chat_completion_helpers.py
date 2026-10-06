@@ -2201,24 +2201,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             reset_codex_reasoning_replay(agent)
             agent._fallback_activated = True
 
+            _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
             if fb_provider == "moa":
                 from agent.moa_loop import bind_moa_runtime
                 bind_moa_runtime(agent, fb_model)
             else:
                 from agent.client_lifecycle import _swap_fallback_clients
                 _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
-
-            # Rebind the pool AFTER the client is installed, not before. The rebind DROPS the
-            # primary's pool when the provider changes, and a candidate whose client construction
-            # raises falls into this loop's ``except ... continue`` — so rebinding first left the
-            # session wearing the failed candidate's identity (provider/base_url/pool) with the
-            # PRIMARY's client still installed, which is precisely the cross-provider contamination
-            # the rebind exists to prevent. Verified by execution: a swap failure returned False with
-            # ``agent._credential_pool`` replaced and ``agent.provider`` already advanced.
-            # Nothing above needs the rebind first — ``_swap_fallback_clients`` and
-            # ``bind_moa_runtime`` both read the credential off the fallback CLIENT, not the pool —
-            # and ``sync_credential_pool_entry_id`` still runs after both.
-            _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
 
             from agent.agent_runtime_helpers import sync_credential_pool_entry_id
             sync_credential_pool_entry_id(agent)

@@ -1704,28 +1704,6 @@ def _cap_long_context_tier(agent: Any) -> int:
     return old_ctx
 
 
-def _reset_suffix(classified: Any) -> str:
-    """`` (resets in ~5h 53m)`` when the verdict carries a provider-declared reset, else ``""``.
-
-    The instant arrives on the classifier's ``error_context``. Naming it is the point of parsing it:
-    "billing or credits exhausted" with no time reads as a dead account, while "resets in ~6h" reads
-    as the temporary window it actually is — and sends the reader to the right remedy.
-    """
-    reset_at = (getattr(classified, "error_context", None) or {}).get("reset_at")
-    if reset_at is None:
-        return ""
-    try:
-        remaining = int(float(reset_at) - time.time())
-    except (TypeError, ValueError):
-        return ""
-    if remaining <= 0:
-        return ""
-    hours, remainder = divmod(remaining, 3600)
-    minutes = remainder // 60
-    wait = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-    return f" (resets in ~{wait})"
-
-
 def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_failure: bool) -> str:
     """Status line announcing an eager fallback switch."""
     if is_upstream:
@@ -1739,10 +1717,10 @@ def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_fail
                 "(unverified — may be a content-filter rejection) "
                 "— switching to fallback provider..."
             )
-        return f"⚠️ Billing or credits exhausted{_reset_suffix(classified)} — switching to fallback provider..."
+        return "⚠️ Billing or credits exhausted — switching to fallback provider..."
     if is_transport_failure:
         return "⚠️ Provider unreachable — switching to fallback provider..."
-    return f"⚠️ Rate limited{_reset_suffix(classified)} — switching to fallback provider..."
+    return "⚠️ Rate limited — switching to fallback provider..."
 
 
 def activate_codex_app_server_fallback(agent: Any, result: Dict[str, Any]) -> bool:

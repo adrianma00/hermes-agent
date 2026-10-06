@@ -366,33 +366,6 @@ def is_routable_provider(provider: Optional[str]) -> bool:
 # ── runtime builders ───────────────────────────────────────────────────────────────────────
 
 
-def _pool_credential_despite_cooldown(rp, pool):
-    """A stored credential for *pool* even when ``select()`` refuses to hand one out.
-
-    ``select()`` returns ``None`` the moment every entry sits in an exhaustion cooldown. Returning
-    ``None`` here is not neutral: the caller resolves a custom provider that carries no ``api_key``
-    of its own, substitutes the keyless ``no-key-required`` placeholder, and sends it to an
-    auth-required host — which answers ``401 "The API key format is incorrect"`` (live: ModelArk,
-    2026-10-04, after a weekly-quota 429 put the install's only entry into cooldown). A quota-walled
-    key then reads as a corrupted key: the provider's real error is destroyed, the notice tells the
-    user their credential failed to authenticate, and the pool marks a healthy key exhausted.
-
-    Hand the stored key back instead. The provider answers for itself, and the cooldown keeps doing
-    its actual job — ordering rotation and arming the per-turn reset gate. ``STATUS_DEAD`` entries
-    stay excluded: those are terminal auth failures, not credentials waiting out a window.
-    """
-    from agent.credential_pool import STATUS_DEAD
-
-    return next(
-        (
-            candidate
-            for candidate in pool.entries()
-            if candidate.last_status != STATUS_DEAD and rp._pool_entry_api_key(candidate)
-        ),
-        None,
-    )
-
-
 def _try_resolve_from_custom_pool(
     base_url: str, provider_label: str, api_mode_override: Optional[str] = None, provider_name: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -408,8 +381,6 @@ def _try_resolve_from_custom_pool(
         try:
             pool = rp.load_pool(pool_key)
             entry = pool.select() if pool.has_credentials() else None
-            if entry is None:
-                entry = _pool_credential_despite_cooldown(rp, pool)
             pool_api_key = rp._pool_entry_api_key(entry) if entry is not None else ""
             if not pool_api_key:
                 continue
