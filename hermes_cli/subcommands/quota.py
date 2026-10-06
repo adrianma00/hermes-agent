@@ -9,13 +9,14 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
     """Attach the ``quota`` subcommand to ``subparsers``."""
     p = subparsers.add_parser(
         "quota",
-        help="Manage the provider-quota gate (close/open/status/probe)",
+        help="Manage the provider-quota gate (close/open/status/probe/release-all)",
         description=(
             "The provider-quota gate holds queued kanban work and cron jobs while the "
             "primary model's subscription window is exhausted, instead of spawning "
             "workers that bounce off the same 429. State lives in one "
             "'quota-gate:<provider>' card on the shared board, so every profile in the "
-            "fleet reads the same gate."
+            "fleet reads the same gate. `release-all on` is the operator's switch to stop "
+            "holding KANBAN cards and route them to the fallback instead."
         ),
     )
     sp = p.add_subparsers(dest="action", required=True)
@@ -36,5 +37,22 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
     probe.add_argument("--base-url", help="Override the primary API base URL")
     probe.add_argument("--api-key", help="Override the primary API key")
     probe.add_argument("--model", help="Model for the probe call (default: the profile's)")
+
+    release = sp.add_parser(
+        "release-all",
+        help="Turn the kanban release-all switch ON/OFF for the current wall",
+        description=(
+            "The gate's on/off switch for KANBAN cards, stored on the gate card itself. "
+            "`on` = gate OFF for kanban: ready cards are not held and each spawn is routed "
+            "to the fallback head (use when the reset is too far away to wait). `off` = "
+            "gate ON for kanban: cards wait for the reset unless they carry a manual "
+            "`quota_override` (use when the reset is close). It rides the wall, so it is "
+            "settable only while the gate is closed, and the next wall starts in HOLD mode."
+        ),
+    )
+    release.add_argument(
+        "state", choices=["on", "off"],
+        help="on = gate OFF for kanban (release every ready card), off = hold again",
+    )
 
     p.set_defaults(func=cmd_quota)

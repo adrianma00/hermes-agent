@@ -5086,6 +5086,100 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
 # ── Quota gate card writer ──────────────────────────────────────────────────
 
 
+# Body keys on the gate card that carry OPERATOR POLICY rather than incident
+# state. Every writer (the first-429 trigger, `hermes quota close`, the probe's
+# re-close) rebuilds the body from scratch, so without this carry a routine
+# refresh of `reset_at`/`closed_at` mid-wall would silently revert the
+# release-all switch to HOLD — the operator would see the fleet start holding
+# again with nothing in the logs to explain it.
+_GATE_POLICY_KEYS = ("release_all",)
+
+
+def _carry_gate_policy(body: dict, existing_body: Optional[str]) -> dict:
+    """Re-apply :data:`_GATE_POLICY_KEYS` from the card on the board.
+
+    The incoming ``body`` always wins for keys it carries; the policy keys are
+    only filled in when absent, so a refresh CANNOT clear them and only
+    :func:`set_quota_gate_release_all` (or the card being deleted when the gate
+    opens) can.
+    """
+    carried = dict(body)
+    if not existing_body:
+        return carried
+    try:
+        prior = json.loads(existing_body)
+    except (TypeError, ValueError):
+        return carried
+    if not isinstance(prior, dict):
+        return carried
+    for key in _GATE_POLICY_KEYS:
+        if key not in carried and key in prior:
+            carried[key] = prior[key]
+    return carried
+
+
+def _load_gate_card(conn: "sqlite3.Connection") -> Optional["sqlite3.Row"]:
+    """The newest ``quota-gate:<provider>`` card on the board, or ``None``.
+
+    Newest-wins mirrors :func:`read_quota_gate_state` exactly, so a writer can
+    never edit a card the dispatcher is not reading.
+    """
+    return conn.execute(
+        "SELECT id, title, body FROM tasks "
+        "WHERE title LIKE ? AND status = 'scheduled' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (f"{_QUOTA_GATE_TITLE_PREFIX}%",),
+    ).fetchone()
+
+
+def set_quota_gate_release_all(enabled: bool, *, board: Optional[str] = None) -> dict:
+    """Flip the gate's release-all switch on the card already on the board.
+
+    ON means "the gate is OFF for kanban": every ready card the gate would hold is
+    instead routed to the fallback head at spawn time. It is a POLICY on the
+    incident card, not a separate flag store, which buys two properties:
+
+    * one flip governs every install reading the shared board (they all read this
+      card), and
+    * it dies with the wall, so the next wall starts in HOLD mode rather than
+      inheriting a decision made against a different reset distance.
+
+    Consequently there is nothing to toggle while the gate is OPEN — this returns
+    ``{"ok": False, "reason": "no_gate_card"}`` instead of inventing a card, and
+    the CLI reports that as a failure rather than a silent success.
+    """
+    slug = board or quota_gate_board()
+    db_path = _quota_gate_db_path(slug)
+    if db_path is None or not Path(db_path).exists():
+        return {"ok": False, "reason": "board_not_found", "board": slug}
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = _load_gate_card(conn)
+        if row is None:
+            return {"ok": False, "reason": "no_gate_card", "board": slug}
+        try:
+            body = json.loads(row["body"]) if row["body"] else {}
+        except (TypeError, ValueError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        body["release_all"] = bool(enabled)
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), row["id"]))
+        conn.commit()
+        return {
+            "ok": True,
+            "board": slug,
+            "task_id": row["id"],
+            "provider": body.get("provider"),
+            "reset_at": body.get("reset_at"),
+            "release_all": bool(enabled),
+        }
+    finally:
+        conn.close()
+
+
 def write_quota_gate_card(provider: str, body: dict, *, board: Optional[str] = None) -> None:
     """Create or update the quota gate card on the shared board.
 
@@ -5121,9 +5215,10 @@ def write_quota_gate_card(provider: str, body: dict, *, board: Optional[str] = N
         conn.row_factory = sqlite3.Row
         # Upsert: find existing card for this provider, or insert.
         existing = conn.execute(
-            "SELECT id FROM tasks WHERE title = ? AND status = 'scheduled'",
+            "SELECT id, body FROM tasks WHERE title = ? AND status = 'scheduled'",
             (title,),
         ).fetchone()
+        body = _carry_gate_policy(body, existing["body"] if existing else None)
         if existing:
             conn.execute(
                 "UPDATE tasks SET body = ? WHERE id = ?",
@@ -5186,6 +5281,12 @@ class QuotaGateState:
     window: Optional[str] = None
     fallback_model: Optional[str] = None
     fallback_provider: Optional[str] = None
+    # The operator's fleet-wide RELEASE-ALL switch, carried on the gate card itself
+    # (body key ``release_all``). True = "while this provider is walled, do not hold
+    # ready kanban cards — route each spawn to the fallback head". It rides the
+    # incident card deliberately: it dies with the wall, so the next wall starts in
+    # HOLD mode (``hermes quota status`` prints which mode is in effect).
+    release_all: bool = False
 
     @property
     def skip_spawn(self) -> bool:
@@ -5313,6 +5414,7 @@ def read_quota_gate_state(
                 window=gate.get("window"),
                 fallback_model=fb_model,
                 fallback_provider=fb_provider,
+                release_all=bool(gate.get("release_all")),
             )
         # reset_at in the past (or absent) → gate is open
         return QuotaGateState(is_closed=False)

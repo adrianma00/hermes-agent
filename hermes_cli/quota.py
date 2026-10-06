@@ -36,6 +36,8 @@ def quota_command(args: argparse.Namespace) -> int:
         return _cmd_status(args)
     if action == "probe":
         return _cmd_probe(args)
+    if action == "release-all":
+        return _cmd_release_all(args)
     return _err(f"unknown quota action: {action!r}")
 
 
@@ -129,16 +131,73 @@ def _cmd_status(args: argparse.Namespace) -> int:
             print(f"  Override route: {state.fallback_provider}:{state.fallback_model}")
         else:
             print("  Hard pause: no fallback route — cards wait for the reset.")
+        # The switch is the difference between "cards are waiting" and "cards are
+        # being routed", so the status line has to name it: with release-all on, a
+        # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
+        if state.release_all:
+            print("  Mode: RELEASE-ALL (gate OFF for kanban) — ready cards are NOT held; "
+                  "each spawn routes to the fallback head. `hermes quota release-all off` "
+                  "to hold again.")
+        else:
+            print("  Mode: HOLD (gate ON for kanban) — ready cards wait for the reset "
+                  "unless they carry `quota_override`.")
     else:
         print("Gate OPEN — all providers available")
     return 0
 
 
+def _cmd_release_all(args: argparse.Namespace) -> int:
+    """Turn the gate's release-all switch ON/OFF for the wall that is currently closed.
+
+    The switch is the operator's answer to "is it worth waiting out this reset?":
+
+      * ``on``  — gate OFF for kanban: ready cards are no longer held; each spawn is
+                  routed to the fallback head (the cost window still defers them to
+                  that provider's discount hours, unchanged).
+      * ``off`` — gate ON for kanban: ready cards wait for the reset again, unless
+                  they carry ``quota_override``.
+
+    It rides the gate card, so it exists only while a wall does: with no card
+    (gate open) there is nothing to switch and the command fails rather than
+    reporting a success it did not achieve.
+    """
+    enabled = args.state == "on"
+    kb = _kb()
+    result = kb.set_quota_gate_release_all(enabled)
+    if not result.get("ok"):
+        if result.get("reason") == "no_gate_card":
+            return _err(
+                f"No gate card on {result.get('board')} — the gate is OPEN, so there is "
+                "nothing to release. The switch rides the wall: set it once a wall is closed."
+            )
+        return _err(f"Cannot reach the quota-gate board {result.get('board')!r}")
+
+    walled = result.get("provider") or "the primary"
+    reset_at = result.get("reset_at")
+    until = (
+        f" until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_at))}"
+        if isinstance(reset_at, (int, float)) else ""
+    )
+    if not enabled:
+        print(f"Gate mode: ON for kanban — {walled} walled{until}; ready cards wait for "
+              "the reset unless they carry `quota_override`")
+        return 0
+
+    chain = kb.quota_gate_fallback_chain()
+    print(f"Gate mode: OFF for kanban — {walled} walled{until}; ready cards are no longer "
+          "held and each spawn is routed to the fallback head")
+    if chain:
+        head = chain[0]
+        print(f"  Route: {head.get('provider')}:{head.get('model')}")
+    else:
+        print("  WARNING: no fallback route is configured — cards will still be held "
+              "(an authorisation with nowhere to route pauses like everything else). "
+              "Check `fallback_providers`.")
+    return 0
+
+
 def _cmd_probe(args: argparse.Namespace) -> int:
     """Verify the primary provider's quota window is open by making ONE call.
-
-    Uses the shared gate card's provider/base_url config (falling back to the
-    current profile's primary).  On success: opens the gate and returns 0.
     On 429 (still walled): re-closes the gate with the new reset time from
     the error body and returns 1.
     On other errors: prints the error and returns 1.

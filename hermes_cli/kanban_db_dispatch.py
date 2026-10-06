@@ -2700,6 +2700,13 @@ def _dispatch_lane_task(
     # so board telemetry distinguishes "paused by quota" from "stuck".
     if quota_gate is not None and quota_gate.is_closed:
         override_flag, pinned_provider = _task_quota_gate_flags(conn, task_id)
+        # ``release_all`` is the operator's fleet-wide switch on the gate card: it
+        # authorises EVERY card the gate would otherwise hold, so the pause collapses
+        # to the same question as ``quota_override`` — "may this card run while the
+        # gate is closed?".  The route is still computed at spawn time and never
+        # stored, so flipping the switch back to HOLD returns the cards to the primary.
+        release_all = bool(getattr(quota_gate, "release_all", False))
+        authorised = bool(override_flag) or release_all
         # A card permanently pinned to a healthy provider spends no quota on
         # the walled one — it is exempt and spawns on its own pin.
         exempt = quota_gate.is_exempt(pinned_provider)
@@ -2711,18 +2718,19 @@ def _dispatch_lane_task(
             # spend the walled provider's quota.
             resolved = _resolve_card_provider(profile, pinned_provider)
             exempt = quota_gate.is_exempt(resolved)
-        if not exempt and (not override_flag or not quota_gate.fallback_model):
+        if not exempt and (not authorised or not quota_gate.fallback_model):
             result.quota_paused.append(task_id)
             if not dry_run:
                 with _kb.write_txn(conn):
                     _kb._append_event(conn, task_id, "quota_paused", {
                         "reset_at": quota_gate.reset_at,
                         "override": bool(override_flag),
-                        # An override with no configured fallback chain has
+                        "release_all": release_all,
+                        # An authorisation with no configured fallback chain has
                         # nowhere to route, so it pauses like everything else.
                         "reason": (
                             "no_fallback_route"
-                            if (override_flag and not quota_gate.fallback_model)
+                            if (authorised and not quota_gate.fallback_model)
                             else "gate_closed"
                         ),
                     })
@@ -2809,7 +2817,8 @@ def _dispatch_lane_task(
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     if (
         quota_gate is not None and quota_gate.is_closed
-        and quota_gate.fallback_model and claimed.quota_override
+        and quota_gate.fallback_model
+        and (claimed.quota_override or quota_gate.release_all)
         # Never clobber a deliberate per-card pin: that routing decision is the
         # card's own and outlives the pause (the two concepts stay separate).
         and not claimed.provider_override and not claimed.model_override
@@ -2818,6 +2827,12 @@ def _dispatch_lane_task(
         # the moment the gate reopens the next dispatch returns to the primary.
         claimed.model_override = quota_gate.fallback_model
         claimed.provider_override = quota_gate.fallback_provider
+        if not claimed.quota_override:
+            # Released by the fleet switch rather than by the card's own flag: a row
+            # per spawn (a released card spawns once), so a diagnosis can tell
+            # "released by release_all" from "nothing reached the pause" — the
+            # absence of `quota_paused` rows is otherwise read as a dead dispatcher.
+            _record_quota_released(conn, claimed.id, quota_gate)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -3043,6 +3058,32 @@ def _task_quota_gate_flags(conn: sqlite3.Connection, task_id: str) -> "tuple[boo
         return bool(row["quota_override"]), (row["provider_override"] or None)
     except Exception:
         return False, None
+
+
+def _record_quota_released(conn: sqlite3.Connection, task_id: str, quota_gate) -> None:
+    """Note that the fleet RELEASE-ALL switch — not the card's own flag — routed this spawn.
+
+    Best-effort telemetry, deliberately not fatal: the gate has already authorised the
+    spawn, so a failed bookkeeping write must not cost the card its run. One row per
+    spawn (a released card spawns once), so unlike ``quota_paused`` this cannot become
+    per-tick noise. It exists because a board with the gate closed and NO
+    ``quota_paused`` rows is otherwise indistinguishable from a dispatcher that has
+    stopped ticking — exactly the wrong read while the switch is on.
+    """
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "quota_released", {
+                "provider": quota_gate.fallback_provider,
+                "model": quota_gate.fallback_model,
+                "reset_at": quota_gate.reset_at,
+                "source": "release_all",
+            })
+    except Exception:
+        _kb._log.warning(
+            "kanban: could not record the release-all route for %s (spawn still routed "
+            "to %s:%s)", task_id, quota_gate.fallback_provider, quota_gate.fallback_model,
+            exc_info=True,
+        )
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
