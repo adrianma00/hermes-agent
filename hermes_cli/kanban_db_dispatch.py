@@ -2705,6 +2705,7 @@ def _dispatch_lane_task(
         # to the same question as ``quota_override`` — "may this card run while the
         # gate is closed?".  The route is still computed at spawn time and never
         # stored, so flipping the switch back to HOLD returns the cards to the primary.
+        # The cron tick reads the same field off the same card (scheduler_quota).
         release_all = bool(getattr(quota_gate, "release_all", False))
         authorised = bool(override_flag) or release_all
         # A card permanently pinned to a healthy provider spends no quota on

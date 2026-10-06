@@ -26,7 +26,7 @@ def test_passed_gate_tick_and_queued_job_remain_busy_until_real_worker_exit(tmp_
         assert release_tick.wait(10)
         return due()
 
-    def process_job(*args):
+    def process_job(*args, **kwargs):
         running.set()
         assert release_job.wait(10)
         return True

@@ -40,19 +40,20 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
 
     release = sp.add_parser(
         "release-all",
-        help="Turn the kanban release-all switch ON/OFF for the current wall",
+        help="Turn the release-all switch ON/OFF for the current wall (kanban + cron)",
         description=(
-            "The gate's on/off switch for KANBAN cards, stored on the gate card itself. "
-            "`on` = gate OFF for kanban: ready cards are not held and each spawn is routed "
-            "to the fallback head (use when the reset is too far away to wait). `off` = "
-            "gate ON for kanban: cards wait for the reset unless they carry a manual "
-            "`quota_override` (use when the reset is close). It rides the wall, so it is "
-            "settable only while the gate is closed, and the next wall starts in HOLD mode."
+            "The gate's on/off switch for the work that OBEYS the gate — kanban cards and "
+            "cron jobs — stored on the gate card itself. `on` = gate OFF: ready cards and "
+            "due cron jobs are not held and each is routed to the fallback head (use when "
+            "the reset is too far away to wait). `off` = gate ON: they wait for the reset "
+            "unless they carry a manual `quota_override` (use when the reset is close). It "
+            "rides the wall, so it is settable only while the gate is closed, and the next "
+            "wall starts in HOLD mode."
         ),
     )
     release.add_argument(
         "state", choices=["on", "off"],
-        help="on = gate OFF for kanban (release every ready card), off = hold again",
+        help="on = gate OFF (release ready cards and due jobs), off = hold again",
     )
 
     p.set_defaults(func=cmd_quota)

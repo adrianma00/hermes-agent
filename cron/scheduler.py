@@ -4227,8 +4227,14 @@ def _sweep_mcp_orphans() -> None:
         logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
 
 
-def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
-    """Run one due job via the shared ``run_one_job`` body."""
+def _process_due_job(job: dict, adapters, loop, verbose: bool, gate=None) -> bool:
+    """Run one due job via the shared ``run_one_job`` body.
+
+    ``gate`` is the tick's already-resolved quota-gate state (``None`` when the gate is
+    open or disabled). It is THREADED IN rather than re-read here so the decision to fire
+    this job and the route it runs on come from one read of the shared card: a job the
+    release-all switch released cannot be routed by a second read that disagrees.
+    """
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
@@ -4239,20 +4245,30 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
-    # A `quota_override` job runs while the provider-quota gate is closed, routed to the
-    # fallback chain FOR THIS RUN ONLY (in-memory, never persisted) — so the next run after
-    # the window reopens goes back to the primary automatically. Only queried for jobs
-    # carrying the flag, so the common path pays nothing.
-    if job.get("quota_override"):
+    # A job runs while the provider-quota gate is closed when it carries `quota_override`
+    # OR when the operator's fleet-wide switch is on the gate card (the same field the
+    # kanban dispatcher reads). Either way the route is FOR THIS RUN ONLY (in-memory, never
+    # persisted), so the next run after the window reopens goes back to the primary.
+    # Both authorisations are judged from the INBOUND job — the record the tick scanned and
+    # decided to fire — exactly as before this change.
+    _switch_on = bool(getattr(gate, "release_all", False))
+    if job.get("quota_override") or _switch_on:
         from cron import scheduler_quota as _quota_gate
-        _gate = _quota_gate.gate_state()
-        if _gate is not None:
-            _route = _quota_gate.override_route(claimed_job, _gate)
-            if _route is not None:
-                claimed_job["provider"], claimed_job["model"] = _route
-                logger.info(
-                    "Job '%s': quota override active — running on fallback %s/%s",
-                    job.get("name") or job.get("id"), _route[0], _route[1])
+        # A script job IS its script and spends none of the walled quota, so the switch has
+        # nothing to route for it — and must not log that it did.
+        released_by_switch = _switch_on and _quota_gate.job_needs_model(job)
+        if job.get("quota_override") or released_by_switch:
+            observed = gate if gate is not None else _quota_gate.gate_state()
+            if observed is not None:
+                _route = _quota_gate.override_route(claimed_job, observed)
+                if _route is not None:
+                    claimed_job["provider"], claimed_job["model"] = _route
+                    logger.info(
+                        "Job '%s': %s — running on fallback %s/%s",
+                        job.get("name") or job.get("id"),
+                        ("released by the quota release-all switch" if released_by_switch
+                         else "quota override active"),
+                        _route[0], _route[1])
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

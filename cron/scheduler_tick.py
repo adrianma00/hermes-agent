@@ -65,7 +65,9 @@ def _tick_admitted(
         # Provider-quota gate: while the primary model's subscription window is closed,
         # due jobs on the walled provider are held (next_run_at re-armed to the provider's
         # reset time) instead of burning LLM calls that will 429. Exempt: jobs pinned to a
-        # healthy provider, and `quota_override` jobs (routed to the fallback chain below).
+        # healthy provider, `quota_override` jobs, and — while the operator's fleet-wide
+        # `release_all` switch is on the card — every model-calling job; all three are
+        # routed to the fallback chain below.
         from cron import scheduler_quota as _quota_gate
         _gate = _quota_gate.gate_state()
         if _gate is not None:
@@ -100,7 +102,9 @@ def _tick_admitted(
                 _max_workers if _max_workers else "unbounded")
 
         def _process_job(job: dict) -> bool:
-            return _sched._process_due_job(job, adapters, loop, verbose)
+            # The tick's gate is threaded through so the fire decision and the route it
+            # runs on come from ONE read of the shared card (see _process_due_job).
+            return _sched._process_due_job(job, adapters, loop, verbose, gate=_gate)
 
         # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
         # re-arms next_run_at on completion, so no catch-up queue is needed.

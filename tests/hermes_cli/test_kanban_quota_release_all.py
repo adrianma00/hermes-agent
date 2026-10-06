@@ -212,8 +212,8 @@ def test_cli_release_all_on_names_the_route_and_the_gate_state(gate_board, monke
 
     out = capsys.readouterr().out
     assert rc == 0
-    # The operator's own vocabulary: "on" here means the gate is OFF for kanban.
-    assert "Gate mode: OFF for kanban" in out
+    # The operator's own vocabulary: "on" here means the gate is OFF.
+    assert "Gate mode: OFF" in out
     assert "deepseek:deepseek-v4-flash" in out
     assert kb.read_quota_gate_state(enabled=True).release_all is True
 
@@ -225,7 +225,7 @@ def test_cli_release_all_off_returns_to_hold(gate_board, monkeypatch, capsys):
     rc = quota_cli.quota_command(argparse.Namespace(action="release-all", state="off"))
 
     assert rc == 0
-    assert "Gate mode: ON for kanban" in capsys.readouterr().out
+    assert "Gate mode: ON" in capsys.readouterr().out
     assert kb.read_quota_gate_state(enabled=True).release_all is False
 
 

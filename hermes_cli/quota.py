@@ -135,12 +135,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # being routed", so the status line has to name it: with release-all on, a
         # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
         if state.release_all:
-            print("  Mode: RELEASE-ALL (gate OFF for kanban) — ready cards are NOT held; "
-                  "each spawn routes to the fallback head. `hermes quota release-all off` "
+            print("  Mode: RELEASE-ALL (gate OFF) — ready cards and due cron jobs are NOT "
+                  "held; each is routed to the fallback head. `hermes quota release-all off` "
                   "to hold again.")
         else:
-            print("  Mode: HOLD (gate ON for kanban) — ready cards wait for the reset "
-                  "unless they carry `quota_override`.")
+            print("  Mode: HOLD (gate ON) — ready cards and due cron jobs wait for the "
+                  "reset unless they carry `quota_override`.")
     else:
         print("Gate OPEN — all providers available")
     return 0
@@ -149,13 +149,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _cmd_release_all(args: argparse.Namespace) -> int:
     """Turn the gate's release-all switch ON/OFF for the wall that is currently closed.
 
-    The switch is the operator's answer to "is it worth waiting out this reset?":
+    The switch is the operator's answer to "is it worth waiting out this reset?", and it
+    governs BOTH work sources that obey the gate — kanban cards and cron jobs:
 
-      * ``on``  — gate OFF for kanban: ready cards are no longer held; each spawn is
-                  routed to the fallback head (the cost window still defers them to
-                  that provider's discount hours, unchanged).
-      * ``off`` — gate ON for kanban: ready cards wait for the reset again, unless
-                  they carry ``quota_override``.
+      * ``on``  — gate OFF: ready cards and due model-calling cron jobs are no longer
+                  held; each is routed to the fallback head (the cost window still defers
+                  them to that provider's discount hours, unchanged).
+      * ``off`` — gate ON: ready cards and due jobs wait for the reset again, unless they
+                  carry ``quota_override``.
 
     It rides the gate card, so it exists only while a wall does: with no card
     (gate open) there is nothing to switch and the command fails rather than
@@ -179,19 +180,19 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
         if isinstance(reset_at, (int, float)) else ""
     )
     if not enabled:
-        print(f"Gate mode: ON for kanban — {walled} walled{until}; ready cards wait for "
-              "the reset unless they carry `quota_override`")
+        print(f"Gate mode: ON — {walled} walled{until}; ready cards and due cron jobs wait "
+              "for the reset unless they carry `quota_override`")
         return 0
 
     chain = kb.quota_gate_fallback_chain()
-    print(f"Gate mode: OFF for kanban — {walled} walled{until}; ready cards are no longer "
-          "held and each spawn is routed to the fallback head")
+    print(f"Gate mode: OFF — {walled} walled{until}; ready cards and due cron jobs are no "
+          "longer held and each is routed to the fallback head")
     if chain:
         head = chain[0]
         print(f"  Route: {head.get('provider')}:{head.get('model')}")
     else:
-        print("  WARNING: no fallback route is configured — cards will still be held "
-              "(an authorisation with nowhere to route pauses like everything else). "
+        print("  WARNING: no fallback route is configured — cards and jobs will still be "
+              "held (an authorisation with nowhere to route pauses like everything else). "
               "Check `fallback_providers`.")
     return 0
 

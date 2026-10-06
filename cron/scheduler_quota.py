@@ -5,6 +5,11 @@ Sibling of ``cron.scheduler`` (late-binds it as ``_sched``), mirroring the kanba
 dispatcher's gate so ONE shared gate card governs both work sources — a single
 `quota-gate:<provider>` card on the shared board, read by every profile.
 
+Two authorisations let a job through the closed gate, and both are read off that card:
+a per-job ``quota_override`` flag, and the fleet-wide ``release_all`` switch the operator
+sets on the card itself (``hermes quota release-all on``). The switch is the same field
+the kanban dispatcher honours, so one flip covers kanban cards AND cron jobs.
+
 Split out of ``cron.scheduler`` per the facade+siblings rule (new behaviour goes in a
 topical sibling, never appended to the loop module).
 """
@@ -100,14 +105,27 @@ def job_is_exempt(job: dict, cfg: dict, gate) -> bool:
     return gate.is_exempt(_job_effective_provider(job, cfg))
 
 
-def override_route(job: dict, gate) -> Optional[Tuple[str, str]]:
-    """``(provider, model)`` for a ``quota_override`` job running while the gate is closed.
+def release_all(gate) -> bool:
+    """Whether the operator's fleet-wide release-all switch is on the gate card.
 
-    ``None`` when the job carries no override or no fallback route is configured —
-    the caller then holds the job like any other (running it would just bounce off
-    the wall).
+    The SAME card field the kanban dispatcher reads (``QuotaGateState.release_all``), so
+    one flip covers both work sources. ``getattr`` by design: the gate may be a test
+    double or a state object predating the field, and an unknown switch value must read as
+    HOLD, never as "release everything".
     """
-    if not job.get("quota_override"):
+    return bool(getattr(gate, "release_all", False))
+
+
+def override_route(job: dict, gate) -> Optional[Tuple[str, str]]:
+    """``(provider, model)`` for a job authorised to run while the gate is closed.
+
+    Authorised means EITHER the job carries ``quota_override`` (the per-job lever) OR the
+    fleet-wide ``release_all`` switch is on the gate card — the same flag the kanban
+    dispatcher honours. ``None`` when neither applies, or when no fallback route is
+    configured: the caller then holds the job like any other, because running it would
+    just bounce off the wall.
+    """
+    if not job.get("quota_override") and not release_all(gate):
         return None
     provider = str(gate.fallback_provider or "").strip()
     model = str(gate.fallback_model or "").strip()
@@ -125,7 +143,9 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
     the catch-up window would otherwise be skipped permanently once the gate opens.
 
     An ``override`` job is exempt from holding — the caller routes it to the fallback
-    chain for that run.
+    chain for that run. So is ANY model-calling job while the fleet ``release_all`` switch
+    is on the card: the switch is the operator saying "this reset is too far away to wait
+    for, spend the fallback instead".
     """
     from datetime import datetime, timedelta
 

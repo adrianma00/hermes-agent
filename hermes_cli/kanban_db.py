@@ -5135,9 +5135,10 @@ def _load_gate_card(conn: "sqlite3.Connection") -> Optional["sqlite3.Row"]:
 def set_quota_gate_release_all(enabled: bool, *, board: Optional[str] = None) -> dict:
     """Flip the gate's release-all switch on the card already on the board.
 
-    ON means "the gate is OFF for kanban": every ready card the gate would hold is
-    instead routed to the fallback head at spawn time. It is a POLICY on the
-    incident card, not a separate flag store, which buys two properties:
+    ON means "the gate is OFF": every ready kanban card AND every due model-calling cron
+    job the gate would hold is instead routed to the fallback head for that spawn/run.
+    Both of the work sources that obey the gate read this one field off this one card
+    (``kanban_db_dispatch`` and ``cron.scheduler_quota``), which buys two properties:
 
     * one flip governs every install reading the shared board (they all read this
       card), and
@@ -5282,9 +5283,9 @@ class QuotaGateState:
     fallback_model: Optional[str] = None
     fallback_provider: Optional[str] = None
     # The operator's fleet-wide RELEASE-ALL switch, carried on the gate card itself
-    # (body key ``release_all``). True = "while this provider is walled, do not hold
-    # ready kanban cards — route each spawn to the fallback head". It rides the
-    # incident card deliberately: it dies with the wall, so the next wall starts in
+    # (body key ``release_all``). True = "while this provider is walled, do not hold ready
+    # kanban cards or due cron jobs — route each to the fallback head instead". It rides
+    # the incident card deliberately: it dies with the wall, so the next wall starts in
     # HOLD mode (``hermes quota status`` prints which mode is in effect).
     release_all: bool = False
 
