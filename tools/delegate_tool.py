@@ -206,6 +206,8 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Per-call reasoning override from delegate_task preset.
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
     # Configuration block that owns the selected provider/model route. Internal
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
@@ -255,6 +257,7 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
+        override_reasoning_config=override_reasoning_config,
         routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
@@ -415,6 +418,28 @@ def _build_children(
     }
     children = []
     for i, t in enumerate(task_list):
+        # Per-task preset: resolve model + reasoning from delegation.presets.<name>
+        _task_preset = t.get("preset") or ""
+        _task_model = creds.get("model")
+        _task_reasoning_config = None
+        if _task_preset:
+            _presets = (routing_cfg or {}).get("presets", {})
+            _preset_entry = _presets.get(_task_preset)
+            if _preset_entry is None:
+                return [], f"Unknown delegate_task preset '{_task_preset}'. Available presets: {list(_presets)}"
+            _preset_model = str(_preset_entry.get("model") or "").strip()
+            _preset_effort = _preset_entry.get("reasoning_effort")
+            if _preset_model:
+                _task_model = _preset_model
+            if _preset_effort is not None:
+                try:
+                    from hermes_constants import parse_reasoning_effort
+                    _parsed = parse_reasoning_effort(_preset_effort)
+                    if _parsed is not None:
+                        _task_reasoning_config = _parsed
+                except Exception:
+                    pass
+
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -423,8 +448,9 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=_task_model, max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                override_reasoning_config=_task_reasoning_config, **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -725,6 +751,14 @@ DELEGATE_TASK_SCHEMA = {
                             "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
                             "files do NOT belong here — put paths in 'context' instead.",
                             items={"type": "string"},
+                        ),
+                        "preset": _p(
+                            "string",
+                            "Optional: a named model preset from delegation.presets in config.yaml. "
+                            "Selects the model and reasoning effort for this subagent — "
+                            "'default' (no reasoning), 'medium' (capped reasoning), "
+                            "'full' (full default reasoning). Overrides the delegation model "
+                            "for this task only.",
                         ),
                         "group": _p(
                             "string",

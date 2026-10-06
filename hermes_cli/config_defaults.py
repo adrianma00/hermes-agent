@@ -1374,6 +1374,25 @@ DEFAULT_CONFIG = {
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
         # "none" (empty = inherit)
         "reasoning_effort": "",
+        # Named presets for delegate_task — model + reasoning_effort per tier.
+        # When delegate_task receives a `preset` parameter, the preset's values
+        # override the child's model and reasoning for that call. Empty model
+        # inherits delegation.model; empty reasoning_effort inherits the model
+        # default. Define new presets here and reference them by name.
+        "presets": {
+            "default": {
+                "model": "",
+                "reasoning_effort": "none",
+            },
+            "medium": {
+                "model": "",
+                "reasoning_effort": "medium",
+            },
+            "full": {
+                "model": "",
+                "reasoning_effort": "",
+            },
+        },
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,
