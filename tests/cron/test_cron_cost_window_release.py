@@ -18,7 +18,9 @@ non-deferring state rather than parking the fleet.
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -262,6 +264,85 @@ def test_as_epoch_passes_through_a_plain_number_and_rejects_junk():
     assert sq._as_epoch(None) is None
     assert sq._as_epoch(True) is None
     assert sq._as_epoch("2026-10-07") is None
+
+
+# ── the Chinese public-holiday carve-out reaches cron too ──────────────────
+#
+# The provider's rule is Mon-Fri EXCLUDING Chinese public holidays, and the carve-out lives
+# INSIDE `read_cost_window_state` (it is answered before the peak-window math, because it can
+# only REMOVE a deferral). So cron inherits it by consulting the same reader — but that is
+# exactly the kind of parity that rots, so it is pinned here against the REAL reader rather
+# than a stubbed state: a cron-specific window check that bypassed the holiday branch would
+# pay double on a day the kanban dispatcher knows is cheap.
+
+
+def _real_reader(monkeypatch, tmp_path, *, holidays, valid_through="2026-12-31"):
+    """Point the REAL cost-window reader at a synthetic holiday snapshot.
+
+    Returns the pinned instant (a weekday inside the 01:00-04:00 UTC peak window).
+    """
+    from hermes_cli import kanban_cost_window as kcw
+
+    cal = tmp_path / "cn-public-holidays.json"
+    cal.write_text(json.dumps({
+        "version": 1,
+        "valid_through": valid_through,
+        "years": {"2026": {"holidays": holidays, "workdays": {}}},
+    }), encoding="utf-8")
+    kcw._holiday_cache.update({"key": None, "data": None})  # no cross-test cache
+    block = {
+        "enabled": True,
+        "peak_windows_utc": ["01:00-04:00", "06:00-10:00"],
+        "peak_days": ["mon", "tue", "wed", "thu", "fri"],
+        "holiday_calendar": str(cal),
+    }
+    monkeypatch.setattr(kcw, "_cost_window_config", lambda: block)
+    monkeypatch.setattr(kcw, "_bypass_until", lambda now=None: None)
+    monkeypatch.setattr(kcw, "_ntp_synchronized", lambda now=None: True)
+    # 2026-10-05 is a Monday; 02:00 UTC is inside peak and 10:00 Beijing the same day.
+    at = datetime(2026, 10, 5, 2, 0, tzinfo=timezone.utc)
+    return at.timestamp()
+
+
+def test_a_chinese_holiday_releases_the_released_job(monkeypatch, tmp_path):
+    """Same treatment as a kanban card: the carve-out removes the deferral for cron too."""
+    epoch = _real_reader(monkeypatch, tmp_path, holidays={"2026-10-05": "国庆节(休)"})
+
+    job = _job()
+    fire, held = sq.hold_jobs([job], _gate(True), now=epoch)
+
+    assert fire == [job], "a released job must run on a holiday weekday, not wait"
+    assert held == []
+
+
+def test_without_the_carve_out_the_same_job_is_held(monkeypatch, tmp_path):
+    """The control: the SAME weekday and instant, with no holiday snapshot, defers.
+
+    This is what makes the test above meaningful — it proves the release is caused by the
+    carve-out rather than by the instant simply being off-peak.
+    """
+    epoch = _real_reader(monkeypatch, tmp_path, holidays={})
+
+    job = _job()
+    fire, held = sq.hold_jobs([job], _gate(True), now=epoch)
+
+    assert fire == []
+    assert held == [job]
+
+
+def test_an_expired_holiday_snapshot_falls_back_to_peak(monkeypatch, tmp_path):
+    """Fail-safe direction: a stale calendar must defer, never guess a holiday."""
+    epoch = _real_reader(
+        monkeypatch, tmp_path,
+        holidays={"2026-10-05": "国庆节(休)"},
+        valid_through="2026-01-01",  # already expired
+    )
+
+    job = _job()
+    fire, held = sq.hold_jobs([job], _gate(True), now=epoch)
+
+    assert fire == [], "an expired snapshot must not be believed"
+    assert held == [job]
 
 
 # ── the re-arm targets the window end, not the quota reset ─────────────────
