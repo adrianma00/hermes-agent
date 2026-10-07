@@ -393,3 +393,105 @@ def test_a_card_pinned_to_another_provider_still_spawns_on_its_own_pin(
     assert [t.id for t in spawned] == [task_id]
     assert spawned[0].provider_override == "deepseek"
     assert result.quota_paused == []
+
+
+# ── 4. a released card still observes the cost window ──────────────────────
+#
+# RELEASE-ALL routes each spawn to the FALLBACK head, which is a metered provider with
+# peak and off-peak hours. Releasing a card authorises spending the fallback; it must not
+# license the peak rate. The dispatcher already defers a card to the fallback's discount
+# window (see ``kanban_cost_window``), and these pin that the release does not bypass it —
+# the property is easy to lose because the two gates are separate code paths.
+
+
+def _peak_window(monkeypatch, *, deferred: bool = True, resume_in: float = 3600.0):
+    """Make the cost window report peak (or off-peak) on the metered fallback."""
+    from hermes_cli.kanban_cost_window import CostWindowState
+
+    state = CostWindowState(
+        is_deferred=deferred,
+        resume_at=time.time() + resume_in,
+        providers=("deepseek",),  # the fallback, from FALLBACK above
+        reason="peak_hours",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_cost_window.read_cost_window_state", lambda **kw: state,
+    )
+    return state
+
+
+def test_a_released_card_is_still_deferred_out_of_the_fallbacks_peak_hours(
+    gate_board, all_assignees_spawnable, monkeypatch,
+):
+    """The core property: release passes the QUOTA gate, not the PRICE gate."""
+    _close_gate(monkeypatch, gate_board, release_all=True)
+    _peak_window(monkeypatch, deferred=True)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="held-card", assignee="alice")
+
+    result, spawned = _dispatch(gate_board, monkeypatch)
+
+    assert spawned == [], "a released card must not spawn at peak price"
+    assert result.quota_paused == []
+    assert result.cost_deferred == [task_id]
+
+    with kbc.connect() as conn:
+        deferred = _events(conn, task_id, "cost_deferred")
+    assert len(deferred) == 1
+    # Priced against the provider the release ROUTES to, not the walled primary.
+    assert deferred[0]["provider"] == FALLBACK["provider"]
+
+
+def test_a_released_card_spawns_once_the_discount_window_opens(
+    gate_board, all_assignees_spawnable, monkeypatch,
+):
+    """Off-peak: the release does what it promises — the card runs on the fallback."""
+    _close_gate(monkeypatch, gate_board, release_all=True)
+    _peak_window(monkeypatch, deferred=False)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="held-card", assignee="alice")
+
+    result, spawned = _dispatch(gate_board, monkeypatch)
+
+    assert [t.id for t in spawned] == [task_id]
+    assert spawned[0].provider_override == FALLBACK["provider"]
+    assert result.cost_deferred == []
+
+
+def test_hold_mode_never_consults_the_cost_window(
+    gate_board, all_assignees_spawnable, monkeypatch,
+):
+    """Control: with the switch OFF the card waits for the RESET, and the price is moot.
+
+    A card the gate never released is not routed to the metered fallback, so reading the
+    cost window would be both pointless and misleading — the hold it produces is the
+    quota hold.
+    """
+    _close_gate(monkeypatch, gate_board, release_all=False)
+    _peak_window(monkeypatch, deferred=True)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="held-card", assignee="alice")
+
+    result, spawned = _dispatch(gate_board, monkeypatch)
+
+    assert spawned == []
+    assert result.quota_paused == [task_id]
+    assert result.cost_deferred == []
+
+
+def test_run_now_forces_a_released_card_through_peak(
+    gate_board, all_assignees_spawnable, monkeypatch,
+):
+    """The per-card escape hatch survives the release: explicit intent wins over price."""
+    _close_gate(monkeypatch, gate_board, release_all=True)
+    _peak_window(monkeypatch, deferred=True)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="urgent-card", assignee="alice")
+        conn.execute("UPDATE tasks SET run_now = 1 WHERE id = ?", (task_id,))
+        conn.commit()
+
+    result, spawned = _dispatch(gate_board, monkeypatch)
+
+    assert [t.id for t in spawned] == [task_id]
+    assert spawned[0].provider_override == FALLBACK["provider"]
+    assert result.cost_deferred == []

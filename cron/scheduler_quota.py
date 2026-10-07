@@ -10,6 +10,14 @@ a per-job ``quota_override`` flag, and the fleet-wide ``release_all`` switch the
 sets on the card itself (``hermes quota release-all on``). The switch is the same field
 the kanban dispatcher honours, so one flip covers kanban cards AND cron jobs.
 
+A job the gate releases is then subject to the SAME provider cost-window deferral the
+kanban dispatcher applies (``kanban_cost_window``): releasing a job from the quota wall
+routes it to the metered fallback, and running that fallback inside its peak-price hours
+costs double for no benefit on work that is not latency-critical. So a released job waits
+for the fallback's off-peak window exactly as a released card does — the two work sources
+that share this gate must not disagree about when the discounted hours are. ``run_now`` on
+the job forces it immediately, mirroring the card flag.
+
 Split out of ``cron.scheduler`` per the facade+siblings rule (new behaviour goes in a
 topical sibling, never appended to the loop module).
 """
@@ -134,6 +142,96 @@ def override_route(job: dict, gate) -> Optional[Tuple[str, str]]:
     return provider, model
 
 
+def _as_epoch(now) -> Optional[float]:
+    """``now`` as a float epoch, or ``None``. Accepts an epoch, a ``datetime``, or None.
+
+    ``hold_jobs`` threads ``now`` straight through from its caller, and it is a plain
+    injection point — so the value can arrive as either shape. The cost-window reader takes
+    an epoch only, and a ``TypeError`` raised there would be swallowed by the fail-open
+    handler and silently disable the deferral for that tick, which is exactly the wrong
+    failure mode for a pricing decision.
+    """
+    if now is None:
+        return None
+    if isinstance(now, bool):
+        return None
+    if isinstance(now, (int, float)):
+        return float(now)
+    to_epoch = getattr(now, "timestamp", None)
+    if callable(to_epoch):
+        try:
+            return float(to_epoch())
+        except (TypeError, ValueError, OSError):
+            return None
+    return None
+
+
+def released_route_provider(gate) -> Optional[str]:
+    """The provider a gate-released job will actually RUN on, for the cost window.
+
+    The fire path (``_process_due_job``) routes a released job by OVERWRITING its
+    provider/model with the gate's fallback head — a job pinned to the WALLED provider is
+    released and rerouted like every other, while a job pinned to a DIFFERENT provider never
+    reaches this branch at all (``job_is_exempt`` fires it untouched, spending none of the
+    walled quota). So for anything that gets here the answer is the fallback head, and this
+    must ask about the fallback's discount hours — not the walled provider's, whose flat-rate
+    plan has no time-of-day price at all.
+
+    ``None`` when the gate carries no fallback route: the caller then treats the route as
+    priced, matching ``CostWindowState.covers(None)``.
+    """
+    fallback = str(getattr(gate, "fallback_provider", "") or "").strip()
+    if fallback:
+        return fallback
+    return None
+
+
+def cost_window_deferral(job: dict, gate, *, now: Optional[float] = None):
+    """``CostWindowState`` for a gate-released job, or ``None`` when it may run now.
+
+    The cron mirror of the dispatcher's cost-window block: a job the gate released is
+    routed to the metered fallback, and the discount for that provider is a time-of-day
+    question the gate card says nothing about. Releasing a job must therefore defer it
+    into the fallback's off-peak hours rather than buying the same tokens at double
+    price — the release is an authorisation to SPEND the fallback, not a licence to pay
+    peak for it.
+
+    Two deliberate refusals, both matching the dispatcher:
+
+    * a **script job** (``no_agent``) makes no model call, so there is nothing to price
+      and nothing to wait for; and
+    * a job carrying ``run_now`` is the operator (or the job's own definition) asking for
+      it immediately, exactly as the per-card flag does on the board.
+
+    The reader FAILS OPEN (see ``read_cost_window_state``), so a clock or config problem
+    returns a non-deferring state and the job runs — the cost of guessing wrong here is
+    money, never a stalled fleet.
+    """
+    if not job_needs_model(job):
+        return None
+    if job.get("run_now"):
+        return None
+    try:
+        from hermes_cli.kanban_cost_window import read_cost_window_state
+    except Exception:
+        logger.debug("cron cost window: reader unavailable — not deferring", exc_info=True)
+        return None
+    try:
+        # The reader takes an EPOCH (``datetime.fromtimestamp(now)``); ``hold_jobs`` exposes
+        # ``now`` as an injection point for tests, so normalise anything datetime-shaped
+        # rather than letting a TypeError escape into the tick.
+        epoch = _as_epoch(now)
+        state = read_cost_window_state(now=epoch)
+    except Exception:
+        logger.debug("cron cost window: state read failed — not deferring", exc_info=True)
+        return None
+    if not state.is_deferred:
+        return None
+    if not state.covers(released_route_provider(gate)):
+        return None
+    return state
+
+
 def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
     """Split ``due_jobs`` into ``(fire, held)`` for one tick and re-arm the held ones.
 
@@ -146,6 +244,13 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
     chain for that run. So is ANY model-calling job while the fleet ``release_all`` switch
     is on the card: the switch is the operator saying "this reset is too far away to wait
     for, spend the fallback instead".
+
+    A job the switch releases is then checked against the provider COST window, because
+    its route is a metered fallback: if that provider is inside its peak-price hours the
+    job is held again — this time until the discount window opens rather than until the
+    quota reset. Releasing a job authorises spending the fallback; it must not license
+    paying double for the same tokens. Such a job is re-armed to ``resume_at`` from the
+    cost window, so the two holds compose (quota reset first, then off-peak).
     """
     from datetime import datetime, timedelta
 
@@ -156,6 +261,9 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
     fire: list = []
     held: list = []
     reset_at = gate.reset_at
+    # ``(job, resume_epoch, why)`` for jobs held by the COST window rather than the quota
+    # reset, so each is re-armed to the instant that actually unblocks it.
+    peak_held: list = []
 
     for job in due_jobs:
         if not job_needs_model(job):
@@ -166,11 +274,18 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
             fire.append(job)
             continue
         if override_route(job, gate) is not None:
+            # Authorised through the gate — but the route is a metered fallback, so the
+            # cost window still decides WHEN. A peak-hours deferral here is the whole
+            # point of this branch: releasing must not mean paying double.
+            cost_state = cost_window_deferral(job, gate, now=now)
+            if cost_state is not None:
+                peak_held.append((job, cost_state.resume_at, cost_state.reason))
+                continue
             fire.append(job)  # routed to the fallback chain by the caller
             continue
         held.append(job)
 
-    if not held:
+    if not held and not peak_held:
         return fire, held
 
     # One hour past the reset: a little slack so the window is genuinely open when the
@@ -202,15 +317,58 @@ def hold_jobs(due_jobs: list, gate, *, now=None) -> Tuple[list, list]:
             job.get("name") or job_id, gate.walled_provider or "primary",
             target_iso or "unknown",
         )
+
+    # Jobs held by the COST window are re-armed to the discount window's own end, not the
+    # quota reset: the release already authorised the spend, so the only thing left to wait
+    # for is the price. Kept separate from the quota re-arm above because the two instants
+    # are independent — a job can be off-peak long before the quota resets, and re-arming
+    # it to the reset would waste the discount hours it was released to use.
+    for job, resume_at, why in peak_held:
+        job_id = str(job.get("id") or "")
+        peak_iso = None
+        if isinstance(resume_at, (int, float)):
+            peak_iso = datetime.fromtimestamp(float(resume_at)).isoformat()
+        try:
+            updates: dict[str, Any] = {}
+            if peak_iso:
+                updates["next_run_at"] = peak_iso
+            updates["last_error"] = (
+                f"released by the quota switch but held for the fallback's off-peak "
+                f"window until {peak_iso or 'the discount hours open'}"
+            )
+            if job_id:
+                update_job(job_id, updates)
+        except Exception:
+            logger.warning(
+                "cron cost window: could not re-arm released job %s — it stays due and "
+                "will be deferred again next tick", job_id, exc_info=True,
+            )
+        logger.info(
+            "Job '%s' released by the quota switch but held for the fallback's off-peak "
+            "window (%s, until %s)", job.get("name") or job_id, why or "peak_hours",
+            peak_iso or "unknown",
+        )
+
+    # A peak-deferred job is still a job that did NOT fire, so it belongs in what the
+    # caller reads as "held" — a caller that only looks at `held` must not conclude the
+    # fleet ran work it actually deferred. It was re-armed above to the cost window's own
+    # end, so it is appended AFTER the quota re-arm loop and never re-armed twice.
+    held.extend(job for job, _resume, _why in peak_held)
     return fire, held
 
 
 def log_hold_summary(held: list, gate, exc: Optional[Exception] = None) -> None:
-    """One line per tick summarising the hold — avoids per-job log spam on 60s ticks."""
+    """One line per tick summarising the hold — avoids per-job log spam on 60s ticks.
+
+    Covers both reasons a job can now be held: the wall itself, and the fallback's peak
+    price after the release-all switch authorised the spend. The per-job lines say which;
+    this says how many, and that the reason is a deliberate gate rather than a stall.
+    """
     if not held:
         return
     logger.info(
-        "Provider-quota gate: holding %d cron job(s) until the %s window reopens (%s)",
-        len(held), gate.walled_provider or "primary",
+        "Provider-quota gate: holding %d cron job(s) until the %s window reopens (%s); "
+        "jobs released onto a metered fallback are held for that provider's off-peak "
+        "hours instead", len(held), gate.walled_provider or "primary",
         "reset known" if gate.reset_at else "reset unknown",
     )

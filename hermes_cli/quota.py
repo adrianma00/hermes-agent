@@ -136,7 +136,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
         if state.release_all:
             print("  Mode: RELEASE-ALL (gate OFF) — ready cards and due cron jobs are NOT "
-                  "held; each is routed to the fallback head. `hermes quota release-all off` "
+                  "held; each is routed to the fallback head and still waits for that "
+                  "provider's off-peak hours. `hermes quota release-all off` "
                   "to hold again.")
         else:
             print("  Mode: HOLD (gate ON) — ready cards and due cron jobs wait for the "
@@ -190,6 +191,11 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     if chain:
         head = chain[0]
         print(f"  Route: {head.get('provider')}:{head.get('model')}")
+        # Released work is routed to a METERED provider, so the price still applies: the
+        # release authorises the spend, it does not license the peak rate.
+        print("  Note: released work still waits for that provider's off-peak (discount) "
+              "hours — `hermes cost-window status` to see the window. A card's `run_now`, "
+              "or a job's `run_now`, forces it through at peak price.")
     else:
         print("  WARNING: no fallback route is configured — cards and jobs will still be "
               "held (an authorisation with nowhere to route pauses like everything else). "

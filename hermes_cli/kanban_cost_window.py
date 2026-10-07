@@ -36,9 +36,13 @@ Scope is deliberately narrow:
 - **Only priced providers.** ``custom`` (a flat-rate coding plan) has no
   time-of-day pricing, so the clock is irrelevant to it. The window applies only
   when the card's effective provider is in ``providers`` (default: deepseek).
-- **Never interactive chat.** Only kanban dispatch and cron consult this.
+- **Never interactive chat.** Only kanban dispatch and cron consult this. Both read it
+  for work they are about to run on a priced provider — including work the quota gate has
+  RELEASED onto the metered fallback, because releasing a card or job authorises the spend
+  without licensing the peak rate.
 - **Defer, don't fail.** A deferred card is untouched and ready; it spawns
-  unchanged when the window ends. ``run_now`` on the card forces it immediately.
+  unchanged when the window ends. ``run_now`` on the card (or on the cron job) forces it
+  immediately.
 """
 
 from __future__ import annotations
