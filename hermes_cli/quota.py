@@ -135,12 +135,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # being routed", so the status line has to name it: with release-all on, a
         # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
         if state.release_all:
-            print("  Mode: RELEASE-ALL (gate OFF) — ready cards and due cron jobs are NOT "
+            print("  Mode: RELEASE-ALL (gate OFF) — ready cards, due cron jobs and inbound "
+                  "peer DMs are NOT "
                   "held; each is routed to the fallback head. `hermes quota release-all off` "
                   "to hold again.")
         else:
             print("  Mode: HOLD (gate ON) — ready cards and due cron jobs wait for the "
-                  "reset unless they carry `quota_override`.")
+                  "reset unless they carry `quota_override`; inbound peer DMs are refused "
+                  "with the reset time instead of being run.")
     else:
         print("Gate OPEN — all providers available")
     return 0
@@ -150,13 +152,15 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     """Turn the gate's release-all switch ON/OFF for the wall that is currently closed.
 
     The switch is the operator's answer to "is it worth waiting out this reset?", and it
-    governs BOTH work sources that obey the gate — kanban cards and cron jobs:
+    governs ALL the work that obeys the gate — kanban cards, cron jobs, and inbound peer
+    DMs (``api_server`` turns):
 
-      * ``on``  — gate OFF: ready cards and due model-calling cron jobs are no longer
-                  held; each is routed to the fallback head (the cost window still defers
-                  them to that provider's discount hours, unchanged).
+      * ``on``  — gate OFF: ready cards, due model-calling cron jobs and peer messages are
+                  no longer held; each is routed to the fallback head (the cost window still
+                  defers them to that provider's discount hours, unchanged).
       * ``off`` — gate ON: ready cards and due jobs wait for the reset again, unless they
-                  carry ``quota_override``.
+                  carry ``quota_override``; a peer message is refused with the reset time
+                  instead of being run, because there is no queue on either side of a DM.
 
     It rides the gate card, so it exists only while a wall does: with no card
     (gate open) there is nothing to switch and the command fails rather than
@@ -181,11 +185,13 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     )
     if not enabled:
         print(f"Gate mode: ON — {walled} walled{until}; ready cards and due cron jobs wait "
-              "for the reset unless they carry `quota_override`")
+              "for the reset unless they carry `quota_override` (inbound peer DMs are "
+              "refused with the reset time)")
         return 0
 
     chain = kb.quota_gate_fallback_chain()
-    print(f"Gate mode: OFF — {walled} walled{until}; ready cards and due cron jobs are no "
+    print(f"Gate mode: OFF — {walled} walled{until}; ready cards, due cron jobs and inbound "
+          "peer DMs are no "
           "longer held and each is routed to the fallback head")
     if chain:
         head = chain[0]

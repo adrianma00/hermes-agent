@@ -24,6 +24,7 @@ except ImportError:
     # would reset the already-imported ``web`` to None (500 on POST /v1/runs).
     RequestKey = None  # type: ignore[assignment,misc]
 
+from gateway.platforms import api_server_quota_gate as _quota_gate
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
@@ -957,7 +958,28 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        # What the CLIENT asked for, captured before the gate may re-route this run: the
+        # request's own provider/model still has to appear as ``requested`` in the runtime
+        # metadata, or a released run would report the fallback route as a client choice.
+        caller_requested = {k: run.agent_kwargs.get(f"requested_{k}") for k in ("provider", "model")}
         with self._profile_scope(run.request_profile):
+            # Provider-quota gate: the same decision ``_run_agent`` makes for session-chat turns,
+            # so a run launched into a wall is held or routed instead of 429-ing its caller.
+            # See gateway/platforms/api_server_quota_gate.py.
+            _quota = _quota_gate.decide_for_turn(
+                pinned_provider=run.agent_kwargs.get("requested_provider"),
+                session_provider=(self._session_model_override_for(
+                    run.gateway_session_key or run.session_id) or {}).get("provider"),
+                confirmed_runtime_lock=bool(run.agent_kwargs.get("confirmed_runtime_lock")))
+            if _quota.is_held:
+                _quota_gate.log_hold(_quota, session_id=run.session_id or "", door="run")
+                _finish("failed", {"reason": "quota_hold"}, error=_quota_gate.hold_text(_quota))
+                return
+            if _quota.is_routed:
+                # For THIS run only (the route is never persisted), exactly like a released card.
+                _quota_gate.log_release(_quota, session_id=run.session_id or "", door="run")
+                run.agent_kwargs["requested_provider"] = _quota.provider
+                run.agent_kwargs["requested_model"] = _quota.model
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
@@ -978,7 +1000,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # ``runtime`` rides on both the pollable status and the run.completed event via _finish, in the
             # canonical shape every other api_server surface emits (route_source/requested, cleaned ids).
-            requested = {k: run.agent_kwargs.get(f"requested_{k}") for k in ("provider", "model")}
+            requested = caller_requested
             served_runtime = self._sanitize_runtime_metadata(
                 runtime=served_runtime, requested_runtime=requested if any(requested.values()) else None,
                 route_source=("model_routes" if run.agent_kwargs.get("route")

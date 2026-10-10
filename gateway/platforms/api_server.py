@@ -138,6 +138,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_quota_gate as _api_quota_gate
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
@@ -4259,14 +4260,37 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
                 try:
+                    # Provider-quota gate, once for every caller (same reason the
+                    # _ProviderAuthResolutionError handler lives here): an inbound peer DM is the
+                    # one api_server path that cannot wait on a board, and until this call it was
+                    # also the one path that got neither the hold NOR the fallback route — it ran
+                    # on the walled provider and handed the caller its raw 429. See
+                    # gateway/platforms/api_server_quota_gate.py.
+                    _session_provider = (self._session_model_override_for(
+                        gateway_session_key or session_id) or {}).get("provider")
+                    _quota = _api_quota_gate.decide_for_turn(
+                        pinned_provider=requested_provider, session_provider=_session_provider,
+                        confirmed_runtime_lock=confirmed_runtime_lock)
+                    if _quota.is_held:
+                        # Held, not 429'd: the caller gets the explanation as the turn's reply
+                        # (the provider-auth shape), so a peer learns the reason and the reset
+                        # instead of a bare provider error.
+                        _api_quota_gate.log_hold(_quota, session_id=session_id or "")
+                        return _api_quota_gate.held_result(_quota, muted=muted)
+                    turn_provider, turn_model = requested_provider, requested_model
+                    if _quota.is_routed:
+                        # For THIS turn only — nothing is persisted, so the turn after the window
+                        # reopens goes back to the primary, exactly like a released card or job.
+                        _api_quota_gate.log_release(_quota, session_id=session_id or "")
+                        turn_provider, turn_model = _quota.provider, _quota.model
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
                         stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         interim_assistant_callback=interim_assistant_callback,
                         reasoning_callback=reasoning_callback, status_callback=status_callback,
-                        gateway_session_key=gateway_session_key, requested_model=requested_model,
-                        requested_provider=requested_provider, model_options=model_options, route=route,
+                        gateway_session_key=gateway_session_key, requested_model=turn_model,
+                        requested_provider=turn_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
