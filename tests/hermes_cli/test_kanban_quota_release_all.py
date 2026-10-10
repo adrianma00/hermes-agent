@@ -160,6 +160,114 @@ def test_a_fresh_wall_starts_in_hold(gate_board):
     assert kb.read_quota_gate_state(enabled=True).release_all is False
 
 
+# ── 1b. the switch must die with the wall even when the wall ENDS ON ITS OWN ──
+#
+# The gate opens by CLOCK: `read_quota_gate_state` returns is_closed=False once reset_at has
+# passed, without deleting the card. So a wall nobody explicitly opened leaves its card — and
+# the operator's `release_all` on it — sitting on the board, and the next wall re-arms that
+# same card (carrying the policy by design). These pin the reap that closes that gap.
+
+
+def _expire_the_wall(gate_board, *, seconds_ago: float = 60):
+    """Rewrite the gate card's reset_at into the past — as `time` does to a real wall."""
+    path = kb._quota_gate_db_path(gate_board)
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute("SELECT id, body FROM tasks WHERE status = 'scheduled'").fetchone()
+        body = json.loads(row[1])
+        body["reset_at"] = int(time.time() - seconds_ago)
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), row[0]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _gate_card_count(gate_board) -> int:
+    path = kb._quota_gate_db_path(gate_board)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'quota-gate:%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_an_expired_wall_reads_as_open_but_leaves_its_card_behind(gate_board):
+    """The premise of the bug, stated plainly: opening by clock does not clean up."""
+    _close_gate(None, gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+
+    assert kb.read_quota_gate_state(enabled=True).is_closed is False
+    assert _gate_card_count(gate_board) == 1, "the card outlives the wall it described"
+
+
+def test_the_sweep_reaps_an_expired_card(gate_board):
+    _close_gate(None, gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+
+    assert kb.sweep_expired_quota_gate_card(board=gate_board) is True
+    assert _gate_card_count(gate_board) == 0
+    # A second sweep is a no-op, not an error: it runs on every tick.
+    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
+
+
+def test_the_sweep_never_touches_a_live_wall(gate_board):
+    """The dangerous direction: deleting a live card would release a paused fleet."""
+    _close_gate(None, gate_board, release_all=True)  # reset 6 days out
+
+    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
+    assert _gate_card_count(gate_board) == 1
+    assert kb.read_quota_gate_state(enabled=True).is_closed is True
+
+
+def test_the_sweep_refuses_to_guess_when_reset_at_is_unreadable(gate_board):
+    """Unparseable state is not evidence of expiry — leave it for a human."""
+    _close_gate(None, gate_board, release_all=True)
+    path = kb._quota_gate_db_path(gate_board)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("UPDATE tasks SET body = ? WHERE status = 'scheduled'", ("{not json",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
+    assert _gate_card_count(gate_board) == 1
+
+
+def test_a_wall_that_ended_by_clock_does_not_carry_the_switch_into_the_next_one(gate_board):
+    """The property the consumer cares about, end to end.
+
+    Wall 1: the operator throws the switch. It ends on its own (the clock passes). The next
+    wall must start in HOLD — not inherit a decision made against a different reset.
+    """
+    _close_gate(None, gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+
+    # Whatever the fleet's tick does on noticing the wall is over.
+    kb.sweep_expired_quota_gate_card(board=gate_board)
+
+    # A genuinely new wall arrives (a fresh 429, card rebuilt from scratch).
+    _close_gate(None, gate_board)
+
+    state = kb.read_quota_gate_state(enabled=True)
+    assert state.is_closed is True
+    assert state.release_all is False, "the previous wall's switch was inherited"
+
+
+def test_without_the_sweep_the_switch_would_be_inherited(gate_board):
+    """The negative control: proves the sweep is what prevents the inheritance."""
+    _close_gate(None, gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+    # No sweep.
+    _close_gate(None, gate_board)  # the next wall re-arms the SAME card
+
+    assert kb.read_quota_gate_state(enabled=True).release_all is True, (
+        "if this ever stops being True the inheritance hazard has moved elsewhere"
+    )
+
+
 def test_toggle_round_trips_on_the_card(gate_board):
     _close_gate(None, gate_board)
 

@@ -5143,7 +5143,12 @@ def set_quota_gate_release_all(enabled: bool, *, board: Optional[str] = None) ->
     * one flip governs every install reading the shared board (they all read this
       card), and
     * it dies with the wall, so the next wall starts in HOLD mode rather than
-      inheriting a decision made against a different reset distance.
+      inheriting a decision made against a different reset distance. That second
+      property needs the wall to actually END the card: a wall closed with
+      ``hermes quota close``/``open`` always did, but a wall that simply ran out
+      (``reset_at`` passing) left the card on the board, so
+      :func:`sweep_expired_quota_gate_card` is now run by both hot readers to reap
+      it and keep the claim true.
 
     Consequently there is nothing to toggle while the gate is OPEN — this returns
     ``{"ok": False, "reason": "no_gate_card"}`` instead of inventing a card, and
@@ -5258,6 +5263,66 @@ def delete_quota_gate_card(provider: str, *, board: Optional[str] = None) -> boo
         )
         affected = cur.rowcount
         conn.commit()
+        return affected > 0
+    finally:
+        conn.close()
+
+
+def sweep_expired_quota_gate_card(*, board: Optional[str] = None, now: Optional[float] = None) -> bool:
+    """Delete a gate card whose ``reset_at`` has passed. Returns True when one was reaped.
+
+    The gate opens by CLOCK: :func:`read_quota_gate_state` returns ``is_closed=False`` once
+    ``reset_at`` is in the past, without touching the board. That is deliberate — the reader
+    is called on every dispatch tick and must stay read-only. The consequence, though, is
+    that the card (and any OPERATOR POLICY riding it, i.e. ``release_all``) outlives the wall
+    it was set against. The next wall re-arms that same card, and ``_carry_gate_policy``
+    preserves the policy by design, so a switch thrown against a 6-day reset would silently
+    govern a later 5-hour one — exactly the inheritance the switch's placement on the
+    incident card was meant to prevent ("it dies with the wall, so the next wall starts in
+    HOLD").
+
+    So the expiry is made explicit here, off the read path, and called by the two hot readers
+    (the kanban dispatcher and the cron tick) before they trust a gate. Deleting the card is
+    the same thing ``hermes quota open`` does, so the state a sweep leaves behind is exactly
+    the state an operator open leaves behind — there is no second code path to reason about.
+
+    Only an EXPIRED card is touched: a live wall is never deleted, and a card whose
+    ``reset_at`` is missing or unparseable is left alone (unreadable state is not evidence of
+    expiry, and deleting a live wall would release a paused fleet).
+    """
+    moment = float(now) if now is not None else time.time()
+    slug = board or quota_gate_board()
+    db_path = _quota_gate_db_path(slug)
+    if db_path is None or not Path(db_path).exists():
+        return False
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, body FROM tasks "
+            "WHERE title LIKE ? AND status = 'scheduled' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"{_QUOTA_GATE_TITLE_PREFIX}%",),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            reset_at = (json.loads(row["body"]) or {}).get("reset_at") if row["body"] else None
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(reset_at, (int, float)) or reset_at > moment:
+            # Live wall, or a body we cannot read: never delete on a guess.
+            return False
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (row["id"],))
+        affected = cur.rowcount
+        conn.commit()
+        if affected:
+            _log.info(
+                "quota gate: reaped the expired gate card %s on %s (reset_at %s passed) — "
+                "its operator policy does not carry into the next wall",
+                row["id"], slug, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(reset_at))),
+            )
         return affected > 0
     finally:
         conn.close()

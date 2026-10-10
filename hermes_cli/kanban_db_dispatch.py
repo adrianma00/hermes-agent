@@ -3256,7 +3256,15 @@ def _dispatch_once_locked(
     # Read provider-quota gate state (fail closed per Adrian's requirement).
     # The gate is shared via the yummi-board board; if the mount is down
     # the gate stays closed.
-    from hermes_cli.kanban_db import read_quota_gate_state
+    from hermes_cli.kanban_db import read_quota_gate_state, sweep_expired_quota_gate_card
+    # Reap a card whose reset has passed BEFORE reading: the gate opens by clock rather than
+    # by deleting the card, so an expired wall would otherwise leave the operator's
+    # `release_all` policy on the board for the next wall to re-arm (see the sweep's
+    # docstring). Best-effort — a failed sweep must never stop dispatch.
+    try:
+        sweep_expired_quota_gate_card()
+    except Exception:
+        _kb._log.debug("kanban: expired quota-gate card sweep failed", exc_info=True)
     quota_gate = read_quota_gate_state(fallback_chain=_resolve_fallback_chain())
     if quota_gate.is_closed:
         result.quota_paused = []  # populated by _dispatch_lane_task
