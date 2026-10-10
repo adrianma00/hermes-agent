@@ -11,12 +11,13 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
         "quota",
         help="Manage the provider-quota gate (close/open/status/probe/release-all)",
         description=(
-            "The provider-quota gate holds queued kanban work and cron jobs while the "
+            "The provider-quota gate holds queued kanban work, due cron jobs and inbound "
+            "peer DMs while the "
             "primary model's subscription window is exhausted, instead of spawning "
             "workers that bounce off the same 429. State lives in one "
             "'quota-gate:<provider>' card on the shared board, so every profile in the "
             "fleet reads the same gate. `release-all on` is the operator's switch to stop "
-            "holding KANBAN cards and route them to the fallback instead."
+            "holding them and route each to the fallback instead."
         ),
     )
     sp = p.add_subparsers(dest="action", required=True)
@@ -40,14 +41,16 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
 
     release = sp.add_parser(
         "release-all",
-        help="Turn the release-all switch ON/OFF for the current wall (kanban + cron)",
+        help="Turn the release-all switch ON/OFF for the current wall (kanban + cron + peer DMs)",
         description=(
-            "The gate's on/off switch for the work that OBEYS the gate — kanban cards and "
-            "cron jobs — stored on the gate card itself. `on` = gate OFF: ready cards and "
-            "due cron jobs are not held and each is routed to the fallback head (use when "
-            "the reset is too far away to wait); released work still waits for that "
+            "The gate's on/off switch for the work that OBEYS the gate — kanban cards, "
+            "cron jobs and inbound peer DMs — stored on the gate card itself. `on` = gate "
+            "OFF: ready cards, due cron jobs and peer messages are not held and each is "
+            "routed to the fallback head (use when "
+            "the reset is too far away to wait); released cards and jobs still wait for that "
             "fallback's off-peak discount hours, so the release buys you progress without "
-            "buying the peak rate. `off` = gate ON: they wait for the reset "
+            "buying the peak rate, while an inbound peer DM runs at once because the peer is "
+            "blocked on the reply. `off` = gate ON: they wait for the reset "
             "unless they carry a manual `quota_override` (use when the reset is close). It "
             "rides the wall, so it is settable only while the gate is closed, and the next "
             "wall starts in HOLD mode."
@@ -55,7 +58,7 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
     )
     release.add_argument(
         "state", choices=["on", "off"],
-        help="on = gate OFF (release ready cards and due jobs), off = hold again",
+        help="on = gate OFF (release ready cards, due jobs and peer DMs), off = hold again",
     )
 
     p.set_defaults(func=cmd_quota)

@@ -135,13 +135,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # being routed", so the status line has to name it: with release-all on, a
         # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
         if state.release_all:
-            print("  Mode: RELEASE-ALL (gate OFF) — ready cards and due cron jobs are NOT "
-                  "held; each is routed to the fallback head and still waits for that "
-                  "provider's off-peak hours. `hermes quota release-all off` "
+            # Cards and jobs are QUEUED work, so releasing them buys progress without buying
+            # the peak rate: they still wait for the metered fallback's off-peak hours. A peer
+            # DM is interactive — someone else's next step is blocked on the reply (R37) — so
+            # there is nothing to defer and it is routed immediately, discount window or not.
+            print("  Mode: RELEASE-ALL (gate OFF) — ready cards, due cron jobs and inbound "
+                  "peer DMs are NOT "
+                  "held; each is routed to the fallback head. Cards and jobs still wait for "
+                  "that provider's off-peak hours; an inbound peer DM runs at once. "
+                  "`hermes quota release-all off` "
                   "to hold again.")
         else:
             print("  Mode: HOLD (gate ON) — ready cards and due cron jobs wait for the "
-                  "reset unless they carry `quota_override`.")
+                  "reset unless they carry `quota_override`; inbound peer DMs are refused "
+                  "with the reset time instead of being run.")
     else:
         print("Gate OPEN — all providers available")
     return 0
@@ -151,13 +158,16 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     """Turn the gate's release-all switch ON/OFF for the wall that is currently closed.
 
     The switch is the operator's answer to "is it worth waiting out this reset?", and it
-    governs BOTH work sources that obey the gate — kanban cards and cron jobs:
+    governs ALL the work that obeys the gate — kanban cards, cron jobs, and inbound peer
+    DMs (``api_server`` turns):
 
-      * ``on``  — gate OFF: ready cards and due model-calling cron jobs are no longer
-                  held; each is routed to the fallback head (the cost window still defers
-                  them to that provider's discount hours, unchanged).
+      * ``on``  — gate OFF: ready cards, due model-calling cron jobs and peer messages are
+                  no longer held; each is routed to the fallback head (cards and jobs still
+                  wait for the cost window's discount hours; a peer DM runs at once, since
+                  the peer is blocked on the reply).
       * ``off`` — gate ON: ready cards and due jobs wait for the reset again, unless they
-                  carry ``quota_override``.
+                  carry ``quota_override``; a peer message is refused with the reset time
+                  instead of being run, because there is no queue on either side of a DM.
 
     It rides the gate card, so it exists only while a wall does: with no card
     (gate open) there is nothing to switch and the command fails rather than
@@ -182,20 +192,24 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     )
     if not enabled:
         print(f"Gate mode: ON — {walled} walled{until}; ready cards and due cron jobs wait "
-              "for the reset unless they carry `quota_override`")
+              "for the reset unless they carry `quota_override` (inbound peer DMs are "
+              "refused with the reset time)")
         return 0
 
     chain = kb.quota_gate_fallback_chain()
-    print(f"Gate mode: OFF — {walled} walled{until}; ready cards and due cron jobs are no "
+    print(f"Gate mode: OFF — {walled} walled{until}; ready cards, due cron jobs and inbound "
+          "peer DMs are no "
           "longer held and each is routed to the fallback head")
     if chain:
         head = chain[0]
         print(f"  Route: {head.get('provider')}:{head.get('model')}")
         # Released work is routed to a METERED provider, so the price still applies: the
-        # release authorises the spend, it does not license the peak rate.
-        print("  Note: released work still waits for that provider's off-peak (discount) "
-              "hours — `hermes cost-window status` to see the window. A card's `run_now`, "
-              "or a job's `run_now`, forces it through at peak price.")
+        # release authorises the spend, it does not license the peak rate. The one exception
+        # is an inbound peer DM: nobody queues it, and the peer is blocked on the reply.
+        print("  Note: released cards and cron jobs still wait for that provider's off-peak "
+              "(discount) hours — `hermes cost-window status` to see the window. A card's "
+              "`run_now`, or a job's `run_now`, forces it through at peak price. An inbound "
+              "peer DM is routed immediately: the sending bot is blocked on the reply.")
     else:
         print("  WARNING: no fallback route is configured — cards and jobs will still be "
               "held (an authorisation with nowhere to route pauses like everything else). "
