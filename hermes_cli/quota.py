@@ -162,8 +162,9 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     DMs (``api_server`` turns):
 
       * ``on``  — gate OFF: ready cards, due model-calling cron jobs and peer messages are
-                  no longer held; each is routed to the fallback head (the cost window still
-                  defers them to that provider's discount hours, unchanged).
+                  no longer held; each is routed to the fallback head (cards and jobs still
+                  wait for the cost window's discount hours; a peer DM runs at once, since
+                  the peer is blocked on the reply).
       * ``off`` — gate ON: ready cards and due jobs wait for the reset again, unless they
                   carry ``quota_override``; a peer message is refused with the reset time
                   instead of being run, because there is no queue on either side of a DM.
