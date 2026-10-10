@@ -20,14 +20,20 @@ These tests pin the decision table and the two call sites (``_run_agent`` for th
   * closed, released, turn pinned to the walled provider → held with ``pinned_to_walled`` (the
                                  pin, not a missing route, is the reason), never re-routed;
   * an exempt provider (request pin, session ``/model`` pin, or the install's own primary)
-                               → never paused.
+                               → never paused;
+  * a gate card whose wall ENDED (``reset_at`` passed) but which is still on the board
+                               → reaped before the read, so its ``release_all`` cannot govern a
+                                 later wall's peer DM.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +43,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms import api_server_quota_gate as _qg
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_runs as _runs
+from hermes_cli import kanban_db as _kb
 from hermes_cli.kanban_db import QuotaGateState
 from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
 
@@ -469,3 +476,173 @@ async def test_an_exempt_run_is_not_held(monkeypatch):
 
     assert reached == [True]
     assert adapter._statuses["run3"].get("reason") != "quota_hold"
+
+
+# ── the FIFTH behaviour case: a wall that ENDED cannot govern a peer DM ────
+#
+# `release_all` rides the INCIDENT card so that it dies with the wall: the next wall starts in
+# HOLD rather than inheriting a decision made against a different reset distance. That held for a
+# wall closed explicitly, but NOT for one that simply ran out — the gate opens by CLOCK
+# (`read_quota_gate_state` returns is_closed=False once reset_at has passed) without deleting the
+# card, and `_carry_gate_policy` preserves `release_all` through exactly the writers that re-arm
+# it. So a dead wall's switch silently governed the next one.
+#
+# `a3961f42d4` closed that for the two DISPATCHED readers by reaping an expired card before
+# trusting it, and left the peer reader (this module) untouched. These two cases are the peer
+# half: the reproduction is that commit's own — the gate card goes 1 -> 0 once the reader has run
+# — and the negative control proves the reap is what stops the inheritance.
+#
+# ── harness ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def gate_board(tmp_path, monkeypatch):
+    """An isolated home whose gate card is the one the real reader resolves.
+
+    Mirrors ``tests/hermes_cli/test_kanban_quota_release_all.py``'s fixture, so the peer reader is
+    exercised against a REAL board rather than a stubbed ``QuotaGateState``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _kb.init_db()
+    board = "gate-board"
+    _kb.create_board(board)
+    monkeypatch.setattr(_kb, "_quota_gate_config", lambda: (True, board))
+    # The fallback route the gate would send a released turn to.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"fallback_providers": [{"provider": FALLBACK[0], "model": FALLBACK[1]}]})
+    # A turn on the install's own primary IS a turn on the walled provider, unless pinned.
+    monkeypatch.setattr(_qg, "configured_primary_provider", lambda: WALLED)
+    # The reap has its own cadence; give every test a fresh window.
+    monkeypatch.setattr(_qg, "_last_gate_sweep_at", 0.0)
+    return board
+
+
+def _arm_the_wall(gate_board, *, release_all=None, reset_in=6 * 86400):
+    """A future-reset gate card on ``gate_board``, optionally with the switch thrown."""
+    _kb.write_quota_gate_card(WALLED, {
+        "v": 1, "provider": WALLED, "window": "monthly",
+        "closed_at": int(time.time()), "reset_at": int(time.time()) + reset_in, "opened_at": None,
+    }, board=gate_board)
+    if release_all is not None:
+        assert _kb.set_quota_gate_release_all(release_all, board=gate_board)["ok"]
+
+
+def _expire_the_wall(gate_board):
+    """Rewrite the card's reset_at into the past — as the clock does to a real wall."""
+    path = _kb._quota_gate_db_path(gate_board)
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute("SELECT id, body FROM tasks WHERE status = 'scheduled'").fetchone()
+        body = json.loads(row[1])
+        body["reset_at"] = int(time.time()) - 60
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), row[0]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _gate_card_count(gate_board) -> int:
+    path = _kb._quota_gate_db_path(gate_board)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'quota-gate:%'").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_wall_that_ended_by_clock_cannot_govern_a_peer_dm(gate_board):
+    """The fifth behaviour case, end to end.
+
+    Wall 1: the operator throws the switch. It ends on its own. A genuinely NEW wall then
+    arrives; the peer DM against it must be HELD — not routed by a switch thrown against the
+    wall that already ended.
+    """
+    _arm_the_wall(gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+    # The premise, stated plainly: the clock says OPEN while the card is still on the board.
+    assert _gate_card_count(gate_board) == 1, "the card outlives the wall it described"
+
+    # One peer turn is enough to notice — the reader reaps before it trusts the gate.
+    assert _qg.gate_state() is None, "an ended wall reads as an OPEN gate"
+    assert _gate_card_count(gate_board) == 0, "card 1 -> 0 after the reader ran"
+
+    # A genuinely new wall arrives (a fresh 429, card rebuilt from scratch, nothing to inherit).
+    _arm_the_wall(gate_board)
+
+    decision = _qg.decide_for_turn()
+
+    assert decision.action == _qg.HOLD
+    assert decision.reason == "gate_closed"
+    assert decision.source == ""
+
+
+def test_without_the_peer_reap_the_previous_walls_switch_is_inherited(gate_board, monkeypatch):
+    """The negative control with teeth: neuter the peer-side reap and the DM IS re-routed.
+
+    Without the reap the expired card survives — so the next wall re-arms it, `_carry_gate_policy`
+    preserves the switch through that write, and the peer DM is routed to the fallback on the
+    strength of a decision made against a wall that had already ended.
+    """
+    monkeypatch.setattr(_qg, "reap_expired_gate_card", lambda: False)  # neutered
+
+    _arm_the_wall(gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+
+    assert _qg.gate_state() is None  # the turn sees an open gate either way
+    assert _gate_card_count(gate_board) == 1, "without the reap the card outlives its wall"
+
+    _arm_the_wall(gate_board)  # the next wall re-arms the SAME card
+
+    decision = _qg.decide_for_turn()
+
+    assert decision.action == _qg.ROUTE, "the previous wall's switch was inherited"
+    assert (decision.provider, decision.model) == FALLBACK
+    assert decision.source == _qg.RELEASE_SOURCE
+
+
+def test_the_peer_reap_keeps_its_own_cadence(gate_board, monkeypatch):
+    """Not once per turn: the reap is bounded to one attempt per interval, however many turn.
+
+    The two dispatched readers sweep once per TICK; the peer reader has no tick, so its cadence
+    is the interval. This is the property that keeps a burst of peer DMs from doing a read-write
+    board connect per request.
+    """
+    _arm_the_wall(gate_board, release_all=True)
+    _expire_the_wall(gate_board)
+
+    calls: list = []
+    real = _kb.sweep_expired_quota_gate_card
+    monkeypatch.setattr(
+        _kb, "sweep_expired_quota_gate_card",
+        lambda **kw: (calls.append(1), real(**kw))[1])
+
+    assert _qg.reap_expired_gate_card() is True   # first turn: the sweep runs
+    assert _qg.reap_expired_gate_card() is False  # immediately after: bounded, no second connect
+    assert _qg.reap_expired_gate_card() is False
+    assert len(calls) == 1
+
+    # ... and the window opens again.
+    monkeypatch.setattr(_qg, "_last_gate_sweep_at", 0.0)
+    assert _qg.reap_expired_gate_card() is True
+    assert len(calls) == 2
+
+
+def test_a_failing_peer_reap_never_costs_the_peer_channel(gate_board, monkeypatch):
+    """Best-effort, like both other callers: a broken sweep must not stop the gate being read."""
+    _arm_the_wall(gate_board)  # a LIVE wall, switch off
+
+    def _boom(**_kw):
+        raise RuntimeError("board is on fire")
+
+    monkeypatch.setattr(_kb, "sweep_expired_quota_gate_card", _boom)
+
+    state = _qg.gate_state()
+
+    assert state is not None and state.is_closed is True
+    assert _qg.decide_for_turn().action == _qg.HOLD
+
