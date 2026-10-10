@@ -135,9 +135,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # being routed", so the status line has to name it: with release-all on, a
         # board with zero `quota_paused` rows is healthy, not a dead dispatcher.
         if state.release_all:
+            # Cards and jobs are QUEUED work, so releasing them buys progress without buying
+            # the peak rate: they still wait for the metered fallback's off-peak hours. A peer
+            # DM is interactive — someone else's next step is blocked on the reply (R37) — so
+            # there is nothing to defer and it is routed immediately, discount window or not.
             print("  Mode: RELEASE-ALL (gate OFF) — ready cards, due cron jobs and inbound "
                   "peer DMs are NOT "
-                  "held; each is routed to the fallback head. `hermes quota release-all off` "
+                  "held; each is routed to the fallback head. Cards and jobs still wait for "
+                  "that provider's off-peak hours; an inbound peer DM runs at once. "
+                  "`hermes quota release-all off` "
                   "to hold again.")
         else:
             print("  Mode: HOLD (gate ON) — ready cards and due cron jobs wait for the "
@@ -196,6 +202,13 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     if chain:
         head = chain[0]
         print(f"  Route: {head.get('provider')}:{head.get('model')}")
+        # Released work is routed to a METERED provider, so the price still applies: the
+        # release authorises the spend, it does not license the peak rate. The one exception
+        # is an inbound peer DM: nobody queues it, and the peer is blocked on the reply.
+        print("  Note: released cards and cron jobs still wait for that provider's off-peak "
+              "(discount) hours — `hermes cost-window status` to see the window. A card's "
+              "`run_now`, or a job's `run_now`, forces it through at peak price. An inbound "
+              "peer DM is routed immediately: the sending bot is blocked on the reply.")
     else:
         print("  WARNING: no fallback route is configured — cards and jobs will still be "
               "held (an authorisation with nowhere to route pauses like everything else). "

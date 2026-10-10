@@ -1982,7 +1982,9 @@ DEFAULT_CONFIG = {
         # time, never stop the fleet) and it holds no cross-install state, because the
         # boundary recurs daily and every install can compute it from the clock.
         # Off by default. A per-card `run_now` flag (or a `cost-window:bypass` card)
-        # forces an immediate spawn.
+        # forces an immediate spawn; a cron job carries the same `run_now` key to force
+        # its own run, and the quota gate's `release_all` does NOT override this — a
+        # released card or job still waits for the discount hours.
         "cost_window": {
             "enabled": False,
             # Peak windows in UTC, exactly as the provider publishes them.
