@@ -17,8 +17,11 @@ This module makes that third reader behave like the other two:
                                            a raw provider error;
   * closed, switch RELEASE-ALL           → ROUTE this turn to the fallback head, for THIS
                                            turn only, and log it with ``source=release_all``;
-  * closed, released, no fallback route  → HOLD ``no_fallback_route``, exactly as the kanban
-                                           dispatcher and the cron tick do;
+  * closed, released, no fallback route  → HOLD ``no_fallback_route`` — the route really is
+                                           missing — exactly as the kanban dispatcher and the
+                                           cron tick do;
+  * closed, released, but the turn pins  → HOLD ``pinned_to_walled``: the pin, not a missing
+    the walled provider itself              route, is why this turn is not routed;
   * caller (or its session ``/model``) pinned to a provider that is not the walled one
                                          → exempt, RUN untouched.
 
@@ -29,11 +32,12 @@ Three asymmetries with the dispatched sources, each a consequence of what a peer
     the case R37 names — someone else's next step is blocked on this turn — so delaying it to
     save peak-price tokens would be the wrong trade. ``release_all`` on the gate card is the
     operator's authorisation to spend that fallback.
-  * A held turn is NOT queued for later. A card waits on the board and a job is re-armed to
-    the reset; an interactive request has no queue on either side (``hermes peer dm`` blocks
-    on the HTTP response, and the sending agent is fire-and-forget), so the honest answer is
-    to say the turn was not run and when to re-send. The message itself is already in the
-    session transcript — it is the TURN that is held, not the delivery.
+  * A held turn is NOT queued for later, and nothing about it is stored. A card waits on the
+    board and a job is re-armed to the reset; an interactive request has no queue on either
+    side (``hermes peer dm`` blocks on the HTTP response, and the sending agent is
+    fire-and-forget), and a held turn returns before any agent is created — so the inbound
+    message is never persisted anywhere. The honest answer is therefore: the turn was not
+    run, the message was not stored, re-send it after the reset.
   * A deliberate provider pin is never overridden. A pin at the request, at the session
     (``/model``), or a confirmed Browser runtime lock outlives the wall, exactly as a
     card-level pin does in the dispatcher — it RUNS while its provider is healthy and is HELD
@@ -80,6 +84,10 @@ class QuotaTurnDecision:
     walled_provider: Optional[str] = None
     window: Optional[str] = None
     source: str = ""
+    #: Whether a fallback route EXISTS for this turn (independent of whether it may be used).
+    #: Carried so ``hold_text`` can tell a pinned turn whether dropping the pin is enough, or
+    #: whether the route is missing too, without re-reading the gate.
+    route_available: bool = False
 
     @property
     def is_held(self) -> bool:
@@ -100,6 +108,7 @@ class QuotaTurnDecision:
             "walled_provider": self.walled_provider,
             "window": self.window,
             "reset_at": self.reset_at,
+            "route_available": self.route_available,
         }
 
 
@@ -186,17 +195,27 @@ def decide_turn(
     released = bool(getattr(state, "release_all", False))
     fallback_provider = str(getattr(state, "fallback_provider", "") or "").strip()
     fallback_model = str(getattr(state, "fallback_model", "") or "").strip()
+    routable = bool(fallback_provider and fallback_model)
 
-    # Authorised AND routable AND no pin of its own to preserve → route this turn. The route
-    # is computed per turn and never persisted, so the moment the gate reopens the next turn
-    # returns to the primary, exactly like a released card or job.
-    if released and fallback_provider and fallback_model and not pin and not session_pin:
+    if released:
+        # A pin that reached this point can only be a pin to the WALLED provider (a pin to any
+        # other provider is exempt, above). It is held whatever the switch says, and it must
+        # not be reported as "no fallback route" — the pin is the reason, and saying otherwise
+        # sends the caller hunting for a config that is not the problem.
+        if pin or session_pin:
+            return QuotaTurnDecision(
+                HOLD, "pinned_to_walled", route_available=routable, **fields)
+        # Authorised AND routable → route this turn. The route is computed per turn and never
+        # persisted, so the moment the gate reopens the next turn returns to the primary,
+        # exactly like a released card or job.
+        if routable:
+            return QuotaTurnDecision(
+                ROUTE, "released", provider=fallback_provider, model=fallback_model,
+                source=RELEASE_SOURCE, route_available=True, **fields)
         return QuotaTurnDecision(
-            ROUTE, "released", provider=fallback_provider, model=fallback_model,
-            source=RELEASE_SOURCE, **fields)
+            HOLD, "no_fallback_route", route_available=False, **fields)
 
-    return QuotaTurnDecision(
-        HOLD, "no_fallback_route" if released else "gate_closed", **fields)
+    return QuotaTurnDecision(HOLD, "gate_closed", route_available=routable, **fields)
 
 
 def decide_for_turn(
@@ -225,9 +244,15 @@ def _relative(seconds: float) -> str:
 def hold_text(decision: QuotaTurnDecision) -> str:
     """The reply a held turn returns to its caller instead of a provider error.
 
-    Written to be actionable by BOTH readers of a peer reply: an agent on the other end (do
-    not resend blindly — the message is already in this transcript) and a human operator
-    (the one command that changes the outcome).
+    Written to be actionable by BOTH readers of a peer reply: an agent on the other end (the
+    turn did not run and the message was NOT stored, so it must re-send after the reset) and a
+    human operator (the one command that changes the outcome).
+
+    Every variant has to say the message was not stored. A held turn returns before an agent is
+    created (``_create_agent`` is never reached), and the api_server never appends an inbound
+    message itself — the row is written by the agent's turn-start persist. So nothing has kept
+    the text, and a reply that implied otherwise would leave the peer waiting for an answer
+    that no one will produce.
     """
     walled = decision.walled_provider or "the primary provider"
     win = f" [{decision.window} window]" if decision.window else ""
@@ -236,18 +261,34 @@ def hold_text(decision: QuotaTurnDecision) -> str:
         left = float(decision.reset_at) - time.time()
         when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(float(decision.reset_at)))
         until = f" until {when}" + (f" ({_relative(left)})" if left > 0 else "")
-    if decision.reason == "no_fallback_route":
+    if decision.reason == "pinned_to_walled":
+        why = (f"this turn carries a pin to {walled} (the request's `provider`, or the session's "
+               "`/model`) and a deliberate pin is never silently re-routed")
+        if decision.route_available:
+            unblock = ("Re-send it without the pin — drop the request's `provider` field, or "
+                       "clear the session `/model` — and it will be routed to the fallback head "
+                       "while the switch is RELEASE-ALL.")
+        else:
+            unblock = ("No fallback route is configured either (`fallback_providers`), so waiting "
+                       "for the reset is the only way out.")
+    elif decision.reason == "no_fallback_route":
         why = ("the fleet switch is RELEASE-ALL but no fallback route is configured "
                "(`fallback_providers`), so there is nowhere to send this turn")
+        unblock = ("Re-send it once the window reopens (do not resend before then), or have the "
+                   "operator configure `fallback_providers` so released peer DMs have somewhere "
+                   "to go.")
     else:
         why = ("the fleet switch is in HOLD mode, so inbound peer messages wait for the "
                "reset like ready kanban cards and due cron jobs")
+        unblock = ("Re-send it once the window reopens (do not resend before then), or have the "
+                   "operator run `hermes quota release-all on` to route peer DMs, cards and "
+                   "cron jobs to the fallback head for the rest of the wall.")
     return (
         f"{HOLD_PREFIX} This turn was NOT run: {walled}{win} is quota-walled{until}, and {why}. "
-        "Nothing was queued — your message is already in this session's transcript and is "
-        "unanswered, so re-send it once the window reopens (do not resend before then). "
-        "Operator: `hermes quota release-all on` routes peer DMs, cards and cron jobs to the "
-        "fallback head for the rest of the wall."
+        "Nothing was queued and nothing was stored — a held turn stops before an agent is "
+        "created, so this message is NOT in the session transcript. "
+        f"{unblock} "
+        "Operator: `hermes quota status` shows the wall, the reset and the current switch."
     )
 
 

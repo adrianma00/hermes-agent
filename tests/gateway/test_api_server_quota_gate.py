@@ -17,6 +17,8 @@ These tests pin the decision table and the two call sites (``_run_agent`` for th
   * closed, RELEASE-ALL        → the turn runs on the fallback head, for that turn only, and
                                  is recorded with ``source=release_all``;
   * closed, released, no route → held with ``no_fallback_route``, like a released card/job;
+  * closed, released, turn pinned to the walled provider → held with ``pinned_to_walled`` (the
+                                 pin, not a missing route, is the reason), never re-routed;
   * an exempt provider (request pin, session ``/model`` pin, or the install's own primary)
                                → never paused.
 """
@@ -115,18 +117,39 @@ def test_an_install_whose_primary_is_not_the_walled_provider_is_exempt():
 
 def test_a_pin_to_the_walled_provider_still_waits_and_is_never_silently_rerouted():
     """Same refusal as a card-level pin in the dispatcher: the caller's choice is not overridden
-    — it waits (and is told so) rather than spending the walled quota."""
-    for gate in (_gate(False), _gate(True)):
-        decision = _qg.decide_turn(gate, pinned_provider=WALLED, primary_provider=WALLED)
+    — it waits (and is told why) rather than spending the walled quota. The reason differs by
+    gate mode: with the switch OFF the wall is the reason; with RELEASE-ALL the PIN is, and
+    saying "no fallback route" there would send the caller after a config that is not at fault."""
+    decision = _qg.decide_turn(_gate(False), pinned_provider=WALLED, primary_provider=WALLED)
 
-        assert decision.action == _qg.HOLD
-        assert decision.provider is None and decision.model is None
+    assert decision.action == _qg.HOLD
+    assert decision.reason == "gate_closed"
+    assert decision.provider is None and decision.model is None
+
+    released = _qg.decide_turn(_gate(True), pinned_provider=WALLED, primary_provider=WALLED)
+
+    assert released.action == _qg.HOLD
+    assert released.reason == "pinned_to_walled"
+    assert released.provider is None and released.model is None
+    # The route IS configured — the decision has to carry that, or the copy lies.
+    assert released.route_available is True
 
 
 def test_a_session_pin_to_the_walled_provider_waits_the_same_way():
     decision = _qg.decide_turn(_gate(True), session_provider=WALLED, primary_provider=WALLED)
 
     assert decision.action == _qg.HOLD
+    assert decision.reason == "pinned_to_walled"
+
+
+def test_a_pinned_turn_with_no_route_is_still_reported_as_pinned():
+    """Both facts are true here; the pin is the one the caller can act on."""
+    decision = _qg.decide_turn(
+        _gate(True, route=False), pinned_provider=WALLED, primary_provider=WALLED)
+
+    assert decision.action == _qg.HOLD
+    assert decision.reason == "pinned_to_walled"
+    assert decision.route_available is False
 
 
 def test_a_confirmed_runtime_lock_is_left_alone():
@@ -177,6 +200,48 @@ def test_hold_text_explains_a_missing_route():
 
     assert "no fallback route" in text
     assert decision.reason in text or "fallback_providers" in text
+
+
+def test_hold_text_for_a_pinned_turn_blames_the_pin_not_a_missing_route():
+    """The defect this pins: RELEASE-ALL + a pin to the walled provider used to tell the caller
+    that no fallback route was configured, when the route was configured and the pin was the
+    reason the turn did not use it."""
+    decision = _qg.decide_turn(_gate(True), pinned_provider=WALLED, primary_provider=WALLED)
+
+    text = _qg.hold_text(decision)
+
+    assert "pin" in text
+    assert "no fallback route" not in text
+    assert "fallback_providers" not in text
+    # The route exists, so the copy can name the way out: drop the pin.
+    assert "without the pin" in text
+
+
+def test_hold_text_for_a_pinned_turn_without_a_route_says_both():
+    decision = _qg.decide_turn(
+        _gate(True, route=False), pinned_provider=WALLED, primary_provider=WALLED)
+
+    text = _qg.hold_text(decision)
+
+    assert "pin" in text
+    assert "No fallback route is configured either" in text
+
+
+def test_no_hold_variant_claims_the_message_was_stored():
+    """Nothing writes the inbound row on the held path (no agent is created), so every variant
+    must tell the peer the message is gone and has to be re-sent."""
+    decisions = [
+        _qg.decide_turn(_gate(False), primary_provider=WALLED),
+        _qg.decide_turn(_gate(True, route=False), primary_provider=WALLED),
+        _qg.decide_turn(_gate(True), pinned_provider=WALLED, primary_provider=WALLED),
+    ]
+
+    for decision in decisions:
+        text = _qg.hold_text(decision)
+
+        assert "NOT in the session transcript" in text
+        assert "already in this session's transcript" not in text
+        assert "re-send" in text.lower() or "Re-send" in text
 
 
 def test_a_held_result_is_not_a_failure_and_is_never_retried():
@@ -373,13 +438,18 @@ async def test_a_held_run_fails_with_the_hold_text_and_never_builds_an_agent(mon
 
 @pytest.mark.asyncio
 async def test_a_run_pinned_to_the_walled_provider_is_held_not_429d(monkeypatch):
-    adapter = _RunAdapter(monkeypatch, _gate(False))
+    """The run door holds a pinned run in both gate modes, and under RELEASE-ALL it says the pin
+    is why — the same reason the chat door reports."""
+    for state, needle in ((_gate(False), "HOLD mode"), (_gate(True), "pin")):
+        adapter = _RunAdapter(monkeypatch, state)
 
-    await _runs._execute_run(
-        adapter, _launch(adapter, "run2", requested_provider=WALLED), _api_server=_FAKE_API_SERVER)
+        await _runs._execute_run(
+            adapter, _launch(adapter, "run2", requested_provider=WALLED), _api_server=_FAKE_API_SERVER)
 
-    assert adapter._statuses["run2"]["reason"] == "quota_hold"
-    assert adapter.created == 0
+        status = adapter._statuses["run2"]
+        assert status["reason"] == "quota_hold"
+        assert needle in status["error"]
+        assert adapter.created == 0
 
 
 @pytest.mark.asyncio
