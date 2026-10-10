@@ -5147,8 +5147,9 @@ def set_quota_gate_release_all(enabled: bool, *, board: Optional[str] = None) ->
       property needs the wall to actually END the card: a wall closed with
       ``hermes quota close``/``open`` always did, but a wall that simply ran out
       (``reset_at`` passing) left the card on the board, so
-      :func:`sweep_expired_quota_gate_card` is now run by both hot readers to reap
-      it and keep the claim true.
+      :func:`sweep_expired_quota_gate_card` is now run by ALL THREE hot readers (kanban
+      dispatch, the cron tick, and the api_server peer gate) to reap it and keep the claim
+      true.
 
     Consequently there is nothing to toggle while the gate is OPEN — this returns
     ``{"ok": False, "reason": "no_gate_card"}`` instead of inventing a card, and
@@ -5281,8 +5282,9 @@ def sweep_expired_quota_gate_card(*, board: Optional[str] = None, now: Optional[
     incident card was meant to prevent ("it dies with the wall, so the next wall starts in
     HOLD").
 
-    So the expiry is made explicit here, off the read path, and called by the two hot readers
-    (the kanban dispatcher and the cron tick) before they trust a gate. Deleting the card is
+    So the expiry is made explicit here, off the read path, and called by all three hot readers
+    (the kanban dispatcher, the cron tick, and the api_server peer gate) before they trust a gate.
+    Deleting the card is
     the same thing ``hermes quota open`` does, so the state a sweep leaves behind is exactly
     the state an operator open leaves behind — there is no second code path to reason about.
 
