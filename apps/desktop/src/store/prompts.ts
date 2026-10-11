@@ -336,7 +336,9 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
         description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
         requestId: pending.request_id,
         sessionId,
-        smartDenied: pending.smart_denied === true
+        smartDenied: pending.smart_denied === true,
+        smartUnavailable:
+          typeof pending.smart_unavailable === 'string' ? pending.smart_unavailable : undefined
       })
     })
   )
