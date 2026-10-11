@@ -3630,12 +3630,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if is_dict else "")
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
-        return web.json_response(
-            {"object": "hermes.session.chat.completion",
-             "session_id": effective_session_id or session_id,
-             "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
-            headers=headers)
+        payload = {
+            "object": "hermes.session.chat.completion",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": final_response}, "usage": usage,
+            "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)}
+        # A failed turn still answers 200 with the failure text as the body — the request WAS served,
+        # matching the local and relayed lanes. But the typed verdict has to travel WITH it: without
+        # these keys a peer client cannot tell "answered" from "the peer's agent died", so the
+        # cross-machine `hermes peer dm` reported success for a turn that produced no reply.
+        # Additive only: consumers reading ``message.content`` are unaffected. The same signal the
+        # retry policy above already reads (tools/bot_failure_reasons.py).
+        if is_dict and result.get("failed"):
+            payload["failed"] = True
+            payload["error"] = str(result.get("error") or "")
+            payload["failure_reason"] = str(result.get("failure_reason") or "")
+        return web.json_response(payload, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":

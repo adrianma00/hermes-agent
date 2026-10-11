@@ -4,6 +4,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -98,6 +99,9 @@ class _FakePeer(BaseHTTPRequestHandler):
     run_idempotency_keys: list = []
     auth_seen: list = []
     chat_reply_content: str = "reply from the other machine"
+    # When set, the fake peer's /chat carries the failure keys the real api_server emits for a turn
+    # that failed (see test_dm_exits_nonzero_when_the_peer_turn_failed). None = an answered turn.
+    chat_failure: Optional[dict] = None
 
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
@@ -148,14 +152,18 @@ class _FakePeer(BaseHTTPRequestHandler):
         if self.path.startswith("/api/sessions/") and self.path.endswith("/chat"):
             type(self).chats.append(body.get("message"))
             type(self).chat_bodies.append(body)
-            return self._json({
+            payload = {
                 "object": "hermes.session.chat.completion",
                 "session_id": "bc_1",
                 "message": {
                     "role": "assistant",
                     "content": type(self).chat_reply_content,
                 },
-            })
+            }
+            failure = type(self).chat_failure
+            if isinstance(failure, dict):
+                payload.update(failure)
+            return self._json(payload)
 
         if self.path == "/v1/runs":
             type(self).runs.append(body)
@@ -185,6 +193,7 @@ def fake_peer_server():
     _FakePeer.run_idempotency_keys = []
     _FakePeer.auth_seen = []
     _FakePeer.chat_reply_content = "reply from the other machine"
+    _FakePeer.chat_failure = None
     server = HTTPServer(("127.0.0.1", 0), _FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -587,3 +596,60 @@ def test_request_strips_bearer_key_across_redirect_origin():
     assert all(header is None for header in _AttackerOrigin.auth_seen), (
         f"peer's Bearer key leaked to the redirect target: {_AttackerOrigin.auth_seen}"
     )
+
+
+# ── a peer turn that FAILED must not read as a delivered reply ───────────────
+
+
+def test_dm_exits_nonzero_when_the_peer_turn_failed(monkeypatch, capsys, fake_peer_server):
+    """The peer serves 200 but its agent died: that is the "peer error" the exit contract names.
+
+    Regression for a cross-machine DM through a provider 429: the failure text arrived as the
+    completion body, the client treated it as a reply and exited 0, so a caller checking ``$?``
+    could not tell "answered" from "the peer's agent never produced a reply".
+    """
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+    _FakePeer.chat_failure = {
+        "failed": True,
+        "error": "HTTP 429: You have exceeded the monthly usage quota.",
+        "failure_reason": "quota",
+    }
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(peer_action="dm", target="spark", message="ping", json=False)
+    )
+
+    assert rc == 1, "a failed peer turn must not exit 0"
+    err = capsys.readouterr().err
+    assert "failed to answer" in err
+    assert "429" in err, "the peer's own failure text must reach the operator"
+
+
+def test_dm_json_reports_the_peer_failure(monkeypatch, capsys, fake_peer_server):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+    _FakePeer.chat_failure = {"failed": True, "error": "boom", "failure_reason": "quota"}
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(peer_action="dm", target="spark", message="ping", json=True)
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["failed"] is True
+    assert payload["error"] == "boom"
+    assert payload["failure_reason"] == "quota"
+
+
+def test_dm_still_exits_zero_when_the_peer_answered(monkeypatch, capsys, fake_peer_server):
+    """Guard: the failure branch must not swallow a normal reply (chat_failure defaults to None)."""
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": fake_peer_server}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(peer_action="dm", target="spark", message="ping", json=False)
+    )
+
+    assert rc == 0
+    assert "reply from the other machine" in capsys.readouterr().out
