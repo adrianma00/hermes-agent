@@ -677,6 +677,9 @@ class CLIAgentSetupMixin:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config, service_tier=self.service_tier,
+                # True only when the user passed --reasoning; a config-resolved value must stay
+                # re-derivable when the model moves.
+                reasoning_config_explicit=getattr(self, "_explicit_reasoning_config", None) is not None,
                 request_overrides=request_overrides, providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore, providers_order=self._providers_order,
                 provider_sort=self._provider_sort,

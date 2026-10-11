@@ -2408,7 +2408,8 @@ def init_agent(
     notice_callback: callable = None, notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int = None,
-    reasoning_config: Dict[str, Any] = None, service_tier: str = None,
+    reasoning_config: Dict[str, Any] = None, reasoning_config_explicit: bool = False,
+    service_tier: str = None,
     request_overrides: Dict[str, Any] = None, prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None, user_id: str = None, user_id_alt: str = None, user_name: str = None,
     chat_id: str = None, chat_name: str = None, chat_type: str = None, thread_id: str = None,
@@ -2431,6 +2432,11 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     agent.session_cwd = cwd or None
+    # A user-pinned reasoning level (``--reasoning``, or the gateway's session pin) travels with the
+    # agent so a later route change can honour it. None = this run pinned nothing, which is what
+    # separates "the user asked for this level" from "the config default resolved to it".
+    agent._reasoning_config_explicit = (
+        dict(reasoning_config) if (reasoning_config_explicit and reasoning_config) else None)
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

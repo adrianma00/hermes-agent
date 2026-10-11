@@ -2441,6 +2441,7 @@ class _CronAgentSetup:
     prefill_messages: Any = None
     max_iterations: Any = None
     reasoning_config: Any = None
+    reasoning_config_explicit: bool = False
     fallback_model: Any = None
     credential_pool: Any = None
     fallback_notice: Optional[str] = None
@@ -2473,6 +2474,14 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
+    # True only when the job actually pinned a level: the helper falls through to config resolution
+    # otherwise, and that resolved value must stay re-derivable when the model moves. Without this a
+    # pinned job lost its level to the profile's on the first auth-fallback swap mid-run.
+    from hermes_constants import parse_reasoning_effort as _parse_pinned_effort
+    setup.reasoning_config_explicit = (
+        job.get("reasoning_effort") is not None
+        and _parse_pinned_effort(job.get("reasoning_effort")) is not None
+    )
     # Mid-run provider ladder: same rule as resolution above, so a pinned job cannot be swapped
     # onto the global chain by a 5xx/429 either.
     setup.fallback_model = _job_fallback_chain(job, _cfg)
@@ -2503,6 +2512,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
         reasoning_config=setup.reasoning_config,
+        reasoning_config_explicit=setup.reasoning_config_explicit,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
         credential_pool=setup.credential_pool,

@@ -543,12 +543,17 @@ def _run_agent(
     from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
     reasoning_config = resolve_reasoning_config(cfg, choice.model)
+    # True only when --reasoning pinned the level. Oneshot is the worker path (kanban dispatches
+    # `hermes chat -q … --reasoning <level>`), so an explicit pin must be marked to survive a
+    # fallback instead of being replaced by the profile's level.
+    reasoning_config_explicit = False
     if reasoning is not None and str(reasoning).strip():
         parsed_reasoning = parse_reasoning_effort(reasoning)
         if parsed_reasoning is None:
             logging.warning("Unknown --reasoning '%s', keeping the configured level", reasoning)
         else:
             reasoning_config = parsed_reasoning
+            reasoning_config_explicit = True
 
     # sorted() gives stable ordering for config-derived sets; explicit values preserve user order.
     toolsets_list = _normalize_toolsets(toolsets)
@@ -589,6 +594,7 @@ def _run_agent(
             request_overrides=runtime.get("request_overrides"),
             ephemeral_system_prompt=skills_prompt,
             reasoning_config=reasoning_config,
+            reasoning_config_explicit=reasoning_config_explicit,
             # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on
             # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
             # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.

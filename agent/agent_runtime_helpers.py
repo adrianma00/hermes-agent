@@ -2439,12 +2439,15 @@ def switch_model(
     )
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
-    # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
+    # Re-read the per-model reasoning_effort override so it applies immediately (per-model > explicit
+    # pin > global; YAML False = disabled). The pin is passed through so switching model does not
+    # silently discard a user's explicit --reasoning / session choice.
     try:
         from hermes_constants import resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        agent.reasoning_config = resolve_reasoning_config(
+            _sm_load_config() or {}, agent.model,
+            explicit=getattr(agent, "_reasoning_config_explicit", None))
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )

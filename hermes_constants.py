@@ -1106,8 +1106,13 @@ def resolve_per_model_provider_routing(model: str, models: dict | None) -> dict:
     return {}
 
 
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
-    """Effective reasoning config for *model*: per-model override, then global ``agent.reasoning_effort``.
+def resolve_reasoning_config(cfg: dict | None, model: str = "", explicit: dict | None = None) -> dict | None:
+    """Effective reasoning config for *model*: per-model override, then an explicit caller override,
+    then global ``agent.reasoning_effort``.
+
+    ``explicit`` is a level the caller already knows is user-pinned (``--reasoning``, the gateway's
+    session reasoning pin). Every caller that re-resolves after the model moves — fallback activation
+    and ``switch_model`` — must pass it, or the pin is silently replaced by the config default.
 
     Single chokepoint for every surface (CLI, gateway, TUI, cron, ``/model``, fallback activation).
     """
@@ -1122,6 +1127,11 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     per_model = resolve_per_model_reasoning_effort(model, agent_cfg.get("reasoning_overrides") or {})
     if per_model is not None:
         return per_model
+
+    # An explicit pin outranks the global default but yields to a per-model override declared for
+    # THIS model, which is the more specific statement about how that model should behave (#21256).
+    if explicit is not None:
+        return dict(explicit)
 
     # Keep the raw value: ``or ""`` would turn a YAML False into "" and silently re-enable thinking.
     effort = agent_cfg.get("reasoning_effort", "")
