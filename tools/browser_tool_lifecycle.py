@@ -98,6 +98,20 @@ def _emergency_cleanup_all_sessions():
                 _bt._session_owner_homes.clear()
                 _bt._cleanup_failures.clear()
                 _bt._recording_sessions.clear()
+    # browser_exec drives browser-harness's OWN detached daemon (spawned with
+    # ``start_new_session``: it deliberately outlives the call that started it). It records
+    # itself in ``browser_use_cli._driven_daemons`` and NEVER in ``_active_sessions``, so a
+    # process whose only browser use was browser_exec reached this cleanup with the
+    # ``cleanup_all_browsers()`` stop below skipped and the daemon outlived it. That is not
+    # just a stray process: the daemon stays inside the exiting process's systemd cgroup, so
+    # a transient ``hermes-worker-kanban-*`` scope never emptied and ``--collect`` never
+    # reaped it — four leaked scopes were exactly this (kanban t_85a12f98). Stop the daemons
+    # on every exit; the call is a no-op when this process never drove one and idempotent
+    # when ``cleanup_all_browsers()`` already stopped them (it clears the driver set).
+    def _stop_harness_daemons():
+        from tools.browser_use_cli import stop_harness_daemons
+        stop_harness_daemons()
+    _best_effort("Browser Use harness daemon stop on exit", _stop_harness_daemons)
     # Lightpanda servers we spawned that fell out of ``_active_sessions``.
     _best_effort("Lightpanda cleanup on exit", _stop_all_lightpanda)
     # Safe even if we never used the browser — owner_pid liveness protects daemons
