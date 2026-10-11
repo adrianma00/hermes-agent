@@ -462,7 +462,8 @@ function restorePendingApproval(response: SessionResumeResult, sessionId: string
     description: pending.description ?? 'dangerous command',
     requestId: typeof pending.request_id === 'string' ? pending.request_id : undefined,
     sessionId,
-    smartDenied: pending.smart_denied === true
+    smartDenied: pending.smart_denied === true,
+    smartUnavailable: typeof pending.smart_unavailable === 'string' ? pending.smart_unavailable : undefined
   })
   void replayPendingApproval($gateway.get(), sessionId).catch(() => undefined)
 

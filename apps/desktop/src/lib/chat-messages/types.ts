@@ -154,6 +154,8 @@ export type GatewayEventPayload = {
   // False when a tirith content-security warning forbids a permanent allow.
   allow_permanent?: boolean
   smart_denied?: boolean
+  // Set when the guardian LLM could not run; the reason the gate is asking a human instead.
+  smart_unavailable?: string
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string

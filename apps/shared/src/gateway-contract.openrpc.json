@@ -5109,6 +5109,18 @@
             "default": null,
             "title": "Smart Denied"
           },
+          "smart_unavailable": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Unavailable"
+          },
           "tool_name": {
             "anyOf": [
               {
@@ -20170,6 +20182,18 @@
             ],
             "default": null,
             "title": "Smart Denied"
+          },
+          "smart_unavailable": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Unavailable"
           },
           "choices": {
             "anyOf": [

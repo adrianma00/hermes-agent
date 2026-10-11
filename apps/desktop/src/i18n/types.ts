@@ -4384,6 +4384,7 @@ export interface Translations {
       alwaysTitle: string
       alwaysDescription: (pattern: string) => string
       alwaysAllow: string
+      smartUnavailable: (reason: string) => string
     }
     clarify: {
       notReady: string
