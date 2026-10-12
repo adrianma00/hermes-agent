@@ -8,6 +8,8 @@ message tells the guard to ignore directives inside the ``<command>`` block.
 Inspired by OpenAI Codex's Smart Approvals guardian subagent.
 """
 
+import asyncio
+import contextvars
 import logging
 import threading
 import time
@@ -110,6 +112,45 @@ def _get_smart_policy() -> str:
     return policy.strip() if isinstance(policy, str) else ""
 
 
+def _run_off_loop(call, *, timeout: float | None = None):
+    """Run a synchronous guardian call on a thread with no running event loop.
+
+    The relay transport refuses a *sync* call made from a loop thread
+    (``agent/relay_llm.py::_run_awaitable`` raises "Synchronous Relay LLM execution cannot run on an
+    event-loop thread") while supporting exactly the loop-free path (``asyncio.run``), and the
+    tui_gateway/desktop approval path can execute inside a loop. Hopping to a fresh thread keeps the
+    guardian available there instead of failing safe to a manual prompt for every flagged command
+    (fleet evidence: errors.log 2026-10-12 09:45 / 12:44 / 13:01). Off a loop the call stays inline —
+    no thread hop on the hot path.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return call()
+    outcome: dict = {}
+
+    def _worker():
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # re-raised on the calling thread below
+            outcome["error"] = exc
+
+    # A fresh thread is what the relay needs (no running loop there). Run it under a COPY of this
+    # thread's contextvars: a bare threading.Thread drops the profile/secret scope, which is the
+    # silent default-profile leak the root rules forbid for scoped code.
+    context = contextvars.copy_context()
+    worker = threading.Thread(
+        target=context.run, args=(_worker,), name="smart-approval-offloop", daemon=True,
+    )
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"the guardian call did not return within {timeout}s off-loop")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Ask the auxiliary LLM; return 'approve', 'deny', or 'escalate' (uncertain/failed).
 
@@ -146,10 +187,13 @@ def _smart_approve(command: str, description: str) -> str:
             'via -c flag" but is completely harmless.\n\n'
             "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
         )
-        response = call_llm(
-            task="approval", temperature=0, max_tokens=16, timeout=smart_timeout,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-        )
+        def _ask_guardian():
+            return call_llm(
+                task="approval", temperature=0, max_tokens=16, timeout=smart_timeout,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            )
+
+        response = _run_off_loop(_ask_guardian, timeout=smart_timeout)
         logger.debug("Smart approvals: LLM call completed in %.1fs", time.monotonic() - _smart_t0)
         answer = (response.choices[0].message.content or "").strip().upper()
         if not answer:
