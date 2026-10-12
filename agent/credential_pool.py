@@ -198,6 +198,25 @@ _CLEAR_STATUS: Dict[str, Any] = {
 }
 _MARK_OK: Dict[str, Any] = {**_CLEAR_STATUS, "last_status": STATUS_OK}
 
+# ``extra`` entries that only describe an *active* error state.
+#
+# ``failure_reason`` is the classifier's verdict about the last failure, kept in
+# ``extra`` so it survives serialization into auth.json. It is evidence of nothing on
+# its own, and it must not outlive the error state it describes: a leftover
+# ``billing`` sitting beside ``last_status=ok`` and empty ``last_error_*`` fields
+# reads as a walled route (a model name served by two providers lets the primary's
+# refusal be recorded against the *fallback's* entry, which then keeps the verdict
+# after a later success). Every path that clears an entry's error state drops these
+# (upstream #104678, #93841, #104738).
+_ERROR_STATE_EXTRA_KEYS = ("failure_reason",)
+
+
+def _without_error_state_extras(extra: dict[str, Any]) -> dict[str, Any]:
+    """*extra* with the error-state-only keys removed (returns *extra* when unchanged)."""
+    if not any(key in extra for key in _ERROR_STATE_EXTRA_KEYS):
+        return extra
+    return {key: value for key, value in extra.items() if key not in _ERROR_STATE_EXTRA_KEYS}
+
 
 def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     """Infer pool auth metadata for token formats with one unambiguous meaning."""
@@ -1248,7 +1267,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     self._replace_entry(entry, PooledCredential.from_dict(self.provider, row))
 
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
-        """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
+        """``replace(entry, **updates)``, swap it into the pool, optionally persist.
+
+        A transition that clears the error state (``_CLEAR_STATUS`` / ``_MARK_OK``)
+        also drops the error-state-only extras: they live in ``extra``, so the
+        status fields alone would leave a stale ``billing`` verdict on a recovered
+        entry. An explicit ``extra`` update wins — callers that write a verdict
+        alongside the status (``_mark_exhausted``) keep it.
+        """
+        if "extra" not in updates and "last_status" in updates and updates["last_status"] in (None, STATUS_OK):
+            updates["extra"] = _without_error_state_extras(entry.extra)
         updated = replace(entry, **updates)
         self._replace_entry(entry, updated)
         if persist:
@@ -1825,7 +1853,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
             return self._recover_failed_refresh(entry, exc)
 
-        updated = replace(updated, **_MARK_OK)
+        updated = replace(updated, **_MARK_OK, extra=_without_error_state_extras(updated.extra))
         self._replace_entry(entry, updated)
         # Declare the cleared id: a borrowed row carries no access_token on disk, so
         # the merge's token-change bypass cannot apply and a plain persist would copy
@@ -2576,12 +2604,20 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
                 field_updates[key] = value
         elif key in _EXTRA_KEYS and existing.extra.get(key) != value:
             extra_updates[key] = value
-    # A rotated token makes the old exhaustion/error state stale.
+    # A rotated token makes the old exhaustion/error state stale — including the
+    # classifier's verdict, which lives in ``extra``.
     if token_changed and existing.last_status is not None:
         field_updates.update(_CLEAR_STATUS)
+        extra_updates.update({key: None for key in _ERROR_STATE_EXTRA_KEYS})
     if field_updates or extra_updates:
         if extra_updates:
-            field_updates["extra"] = {**existing.extra, **extra_updates}
+            # ``None`` extras carry no information (from_dict drops them on load, to_dict
+            # skips them on write), so a ``None`` here reads as "drop this key".
+            field_updates["extra"] = {
+                key: value
+                for key, value in {**existing.extra, **extra_updates}.items()
+                if value is not None
+            }
         updated = replace(existing, **field_updates)
         entries[existing_idx] = updated
         # Runtime-only borrowed secret updates refresh the in-memory entry
