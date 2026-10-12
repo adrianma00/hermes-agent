@@ -231,8 +231,26 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
       } catch (secondError) {
         const described = probeFailureDescription(firstError, secondError)
         const failure = baseUrl ? tracker.recordFailure(baseUrl) : { failures: 1, shouldReset: true }
+        // A stalled-but-live bridge is worth bypassing; a transport that is GONE (reset,
+        // refused, pipe) is not - no amount of bypassing revives it, and deferring the retire
+        // is how an offline app stays offline. Observed 2026-10-13: the keep branch reconnected
+        // onto a remote dashboard that had died, the app's route stayed pointed at the dead end,
+        // and because no dispatch ever ran the streak never advanced, so nothing retired it.
+        const transportGone = [firstError, secondError].some(error => {
+          const code = (error as { code?: unknown } | undefined)?.code
+          const message = error instanceof Error ? error.message : String(error ?? '')
 
-        if (!failure.shouldReset) {
+          return (
+            code === 'ECONNRESET' ||
+            code === 'ECONNREFUSED' ||
+            code === 'EPIPE' ||
+            // Deliberately NOT "socket hang up": that is the transient shape the re-verify
+            // exists for (a bound forward that answers while one probe sees a hang-up).
+            /ECONNRESET|ECONNREFUSED|EPIPE|reset by peer/i.test(message)
+          )
+        })
+
+        if (!failure.shouldReset && !transportGone) {
           log?.(
             `Pooled remote backend dispatch probe failed twice (${described}); ` +
               `keeping descriptor for retry (${failure.failures}/${REMOTE_LIVENESS_FAILURE_LIMIT}).`

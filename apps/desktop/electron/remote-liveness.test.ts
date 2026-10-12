@@ -555,6 +555,36 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
   })
 
+  it('retires immediately when the transport is gone, instead of bypassing (#131765)', async () => {
+    // A reset far end is not a live-but-busy bridge. Deferring this retire left the app offline
+    // with its route pointed at a dead backend, because no dispatch ever advanced the streak.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const retire = vi.fn()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect: vi.fn(async () => stale),
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+    ).resolves.toBe(stale)
+
+    expect(retire).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('retiring descriptor'))
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry'))
+  })
+
   it('keeps the retry bounded relative to the power-resume holdoff', () => {
     expect(POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS).toBeGreaterThan(0)
     expect(POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS).toBeLessThan(5_000)
