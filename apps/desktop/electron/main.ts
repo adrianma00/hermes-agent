@@ -9966,6 +9966,29 @@ async function teardownSshConnection(profile) {
   )
 }
 
+// Prove the far-end dashboard behind a pooled SSH key is still running. A
+// pooled remote entry keeps no local child, so no 'exit' fires for it, and the
+// bound local forward makes a dead far end look like a STALL (timeout-class) —
+// the one shape the dispatch gate would bypass. `kill -0` on the pid the
+// bootstrap published is the only liveness fact the desktop can prove locally,
+// so it is what turns "busy bridge" into "gone dashboard". Only a proven-dead
+// pid answers false: an absent SSH scope (a remote/cloud URL entry), a Windows
+// remote (a different lifecycle with no POSIX kill -0) and an unsettled probe
+// all answer true, leaving the streak policy in charge.
+async function pooledRemoteDashboardAlive(key: string): Promise<boolean> {
+  const state = sshConnections.get(sshScopeKey(key))
+
+  if (!state || !state.ssh || !state.pid || state.remotePlatform === 'Windows') {
+    return true
+  }
+
+  try {
+    return await remoteLifecycle.remotePidAlive(state.ssh, state.pid)
+  } catch {
+    return true
+  }
+}
+
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
@@ -11332,6 +11355,12 @@ async function ensureRegistryBackend(
         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
         log: message => rememberLog(message),
         tracker: pooledRemoteLiveness,
+        // A pooled SSH entry has no child to report its far end dying, and the
+        // bound local forward turns that death into a probe stall — the shape
+        // the gate's streak policy bypasses. Prove the remote dashboard's pid
+        // first so a gone far end retires and this dial re-spawns instead of
+        // handing the dead descriptor back.
+        remoteDashboardAlive: () => pooledRemoteDashboardAlive(key),
         retire: async (error: any) => {
           // A late failure from an old descriptor must never tear down a newer
           // entry that another caller has already installed.
