@@ -1218,6 +1218,7 @@ class TurnRunner:
             "provider wall notice fan-out scheduling error",
         )
 
+
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the
         adapter's post-delivery hook releases them after the main response lands."""

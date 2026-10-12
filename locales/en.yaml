@@ -1002,6 +1002,7 @@ provider_wall:
   scope: "Scope: profile {profile}."
   remedy: "Remedy: top up the walled account, or run `{cmd}` to pick a usable route."
 
+
 platform:
   whatsapp:
     clarify_other_title: "✏️ Other"

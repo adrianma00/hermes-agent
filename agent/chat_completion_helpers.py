@@ -1963,7 +1963,7 @@ def _emit_provider_wall_notice(agent, *, reason, reset_at) -> None:
         logger.debug("provider wall notice skipped", exc_info=True)
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
+def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
     context across every provider again."""
@@ -2117,24 +2117,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
-    # Leaving the primary on a quota wall: close the shared gate so cron jobs and
-    # kanban dispatch on this provider hold until the window reopens, instead of
-    # each re-hitting the same 429. Fires only when still ON the primary (the
-    # cooldown helper already decided that) and only with a real reset instant.
     if not getattr(agent, "_fallback_activated", False):
-        _wall_ctx = getattr(agent, "_last_api_error_context", None) or {}
-        try:
-            from agent.quota_gate_trigger import maybe_close_gate
-
-            maybe_close_gate(
-                provider=getattr(agent, "provider", None),
-                reset_at=_wall_ctx.get("reset_at"),
-                reason=getattr(reason, "value", None) if reason is not None else None,
-                window=_wall_ctx.get("window"),
-            )
-        except Exception:
-            logger.debug("quota gate trigger skipped", exc_info=True)
-        _emit_provider_wall_notice(agent, reason=reason, reset_at=_wall_ctx.get("reset_at"))
+        # Leaving a walled primary: record the incident for the operator. The marker dedupes per
+        # incident, so a wall that persists for hours notifies once (agent/provider_wall_notice).
+        _emit_provider_wall_notice(agent, reason=reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
