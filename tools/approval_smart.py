@@ -188,15 +188,11 @@ def _smart_approve(command: str, description: str) -> str:
             "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
         )
         route_info: dict = {}
-
-        def _ask_guardian():
-            return call_llm(
-                task="approval", temperature=0, max_tokens=16, timeout=smart_timeout,
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                route_info=route_info,  # filled with the route actually used, after any fallback
-            )
-
-        response = _run_off_loop(_ask_guardian, timeout=smart_timeout)
+        response = call_llm(
+            task="approval", temperature=0, max_tokens=16, timeout=smart_timeout,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            route_info=route_info,  # filled with the route actually used, after any fallback
+        )
         logger.debug("Smart approvals: LLM call completed in %.1fs", time.monotonic() - _smart_t0)
         answer = (response.choices[0].message.content or "").strip().upper()
         if not answer:
