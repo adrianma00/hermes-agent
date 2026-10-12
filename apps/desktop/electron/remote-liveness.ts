@@ -134,6 +134,19 @@ export interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection 
   retire: (error: unknown) => Promise<void> | void
   /** Retire-time log; receives the final failure with its cause (see probeFailureDescription). */
   log?: (message: string) => void
+  /**
+   * Fresh liveness proof for the FAR-END dashboard behind the cached
+   * descriptor. A pooled SSH descriptor keeps no local child process, so
+   * nothing observes the remote serve exiting: the bound local forward keeps
+   * LISTENing and the next probe fails as a stall (the timeout shape), which
+   * the streak policy below reads as "busy" and bypasses. `false` - a PROVEN
+   * gone far end - retires instead of bypassing, because no amount of
+   * bypassing revives a process that no longer exists, and the bypass is what
+   * leaves the app's route pointed at the dead backend until relaunch
+   * (observed 2026-10-13). `true`, an omitted seam, or a rejection all mean
+   * "alive or unprovable" and leave the streak policy in charge.
+   */
+  remoteDashboardAlive?: () => Promise<boolean> | boolean
   /** Sleep between the first failed probe and the confirmation probe; default 750ms. */
   retryDelayMs?: number
   /**
@@ -182,11 +195,14 @@ async function probePooledRemoteBackend<TConnection extends RemoteConnectionDesc
  * One transient transport blip — undici's `socket hang up` against a bound,
  * answering forward is the observed shape (#131765) — must not retire a
  * healthy tunnel: after a failure the probe is re-verified once after a short
- * backoff, and a double failure only RETIRES when it completes the shared
- * tracker's streak; below the limit the descriptor is bypassed for this
- * dispatch (no teardown, so a running turn survives) and the streak decides.
- * The gate stays bounded (at most two probes plus the backoff per dispatch),
- * and a real outage still retires - a few failures later than before.
+ * backoff, and a double failure RETIRES when it completes the shared tracker's
+ * streak, when the transport is gone, or when the far-end dashboard is proven
+ * dead (`remoteDashboardAlive`); below the limit the descriptor is bypassed for
+ * this dispatch (no teardown, so a running turn survives) and the streak
+ * decides, because no bypass revives either a gone transport or a gone process.
+ * The gate stays bounded (at most two probes plus the backoff and, only on the
+ * retire decision, one dashboard-liveness proof per dispatch), and a real
+ * outage still retires - a few failures later than before.
  */
 export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection extends RemoteConnectionDescriptor>({
   connectionPromise,
@@ -195,6 +211,7 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
   reconnect,
   retire,
   log,
+  remoteDashboardAlive,
   retryDelayMs = POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS,
   tracker
 }: EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection>): Promise<TConnection> {
@@ -250,16 +267,41 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
           )
         })
 
-        if (!failure.shouldReset && !transportGone) {
+        // A far end whose dashboard process is PROVEN gone is not a busy
+        // bridge either. This path only sees the timeout shape (a reset or
+        // refused transport retired above), so without this proof the keep
+        // path hands the dead descriptor back and the route stays on it until
+        // relaunch. Ask only when the bypass is otherwise on the table, and
+        // treat an unsettled answer as "alive or unprovable".
+        let dashboardGone = false
+
+        if (!failure.shouldReset && !transportGone && remoteDashboardAlive) {
+          try {
+            dashboardGone = (await remoteDashboardAlive()) === false
+          } catch {
+            dashboardGone = false
+          }
+        }
+
+        if (!failure.shouldReset && !transportGone && !dashboardGone) {
           log?.(
-            `Pooled remote backend dispatch probe failed twice (${described}); ` +
+            `Pooled remote backend dispatch probe failed twice (${described}) ` +
+              `for ${baseUrl || 'unknown'}; ` +
               `keeping descriptor for retry (${failure.failures}/${REMOTE_LIVENESS_FAILURE_LIMIT}).`
           )
 
-          return reconnect()
+          // Bypass means "let THIS dispatch use the cached descriptor", never
+          // "dial again": a re-dial lands back on the same pool entry and,
+          // under the caller's revalidation coordinator, awaits the very run
+          // that is calling it (a self-await that never settles). The cached
+          // connection is what the bypass has always resolved to.
+          return connection
         }
 
-        log?.(`Pooled remote backend dispatch probe failed twice (${described}); retiring descriptor.`)
+        log?.(
+          `Pooled remote backend dispatch probe failed twice (${described}); ` +
+            `retiring descriptor${dashboardGone ? ' (remote dashboard is gone)' : ''}.`
+        )
         throw secondError
       }
 

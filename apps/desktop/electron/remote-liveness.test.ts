@@ -510,8 +510,13 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
 
     await expect(run()).resolves.toBe(stale)
     expect(retire).not.toHaveBeenCalled()
-    expect(reconnect).toHaveBeenCalledTimes(1)
+    // A bypass hands dispatch the cached descriptor; it never re-dials (a
+    // re-entrant dial would await the run calling it - see the self-await test).
+    expect(reconnect).not.toHaveBeenCalled()
     expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+    // Attribution: the line must name which connection stalled, so the next incident does not
+    // need ssh-argv forensics to identify the dead forward.
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('for http://127.0.0.1:49525'))
 
     await expect(run()).resolves.toBe(stale)
     expect(retire).not.toHaveBeenCalled()
@@ -519,7 +524,134 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
 
     await expect(run()).resolves.toBe(stale)
     expect(retire).toHaveBeenCalledOnce()
+    expect(reconnect).toHaveBeenCalledOnce()
     expect(log).toHaveBeenCalledWith(expect.stringContaining('retiring descriptor'))
+  })
+
+  it('retires a stalled descriptor whose remote dashboard has exited, instead of bypassing', async () => {
+    // A bound local forward keeps a dead far end looking like a stall, so the
+    // streak policy would read (1/3) and keep the descriptor - the route then
+    // stays on a dead backend until relaunch. A proven-gone pid is not a busy
+    // bridge.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    let currentPromise: Promise<typeof stale> | null = stalePromise
+    const log = vi.fn()
+    const retire = vi.fn(async () => {
+      currentPromise = null
+    })
+
+    const reconnect = vi.fn(async () => {
+      currentPromise = Promise.resolve(replacement)
+
+      return replacement
+    })
+
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+    const remoteDashboardAlive = vi.fn(async () => false)
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => currentPromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        remoteDashboardAlive,
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
+      })
+    ).resolves.toBe(replacement)
+
+    expect(remoteDashboardAlive).toHaveBeenCalledOnce()
+    expect(retire).toHaveBeenCalledOnce()
+    expect(reconnect).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('retiring descriptor (remote dashboard is gone)')
+    )
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry'))
+  })
+
+  it('keeps a stalled descriptor when the far end is alive or its proof cannot settle', async () => {
+    const shape = (
+      remoteDashboardAlive: () => Promise<boolean>
+    ) => {
+      const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+      const stalePromise = Promise.resolve(stale)
+      const log = vi.fn()
+      const retire = vi.fn()
+      const probe = vi
+        .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+        .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+      return {
+        log,
+        options: {
+          connectionPromise: stalePromise,
+          currentConnectionPromise: () => stalePromise,
+          probe,
+          reconnect: vi.fn(),
+          retire,
+          log,
+          remoteDashboardAlive,
+          retryDelayMs: 0,
+          tracker: new RemoteLivenessTracker()
+        },
+        retire,
+        stale
+      }
+    }
+
+    const alive = shape(async () => true)
+
+    await expect(ensureHealthyPooledRemoteBackendForDispatch(alive.options)).resolves.toBe(alive.stale)
+    expect(alive.retire).not.toHaveBeenCalled()
+    expect(alive.log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+
+    // An unsettled ownership probe must never be read as "gone".
+    const unsettled = shape(async () => {
+      throw new Error('Could not verify the SSH backend process.')
+    })
+
+    await expect(ensureHealthyPooledRemoteBackendForDispatch(unsettled.options)).resolves.toBe(
+      unsettled.stale
+    )
+    expect(unsettled.retire).not.toHaveBeenCalled()
+    expect(unsettled.log).toHaveBeenCalledWith(
+      expect.stringContaining('keeping descriptor for retry (1/3)')
+    )
+  })
+
+  it('never re-enters the dial from the bypass: a re-entrant dial self-awaits the in-flight run', async () => {
+    // The caller wraps this gate in RemoteRevalidationCoordinator keyed by the
+    // cached promise, so a keep path that called reconnect() -> the same ensure
+    // path would be handed its own in-flight run and await itself forever -
+    // the app stays offline with no failed dispatch to advance the streak.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const coordinator = new RemoteRevalidationCoordinator()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+    const dial = (): Promise<typeof stale> =>
+      coordinator.run(stalePromise, () =>
+        ensureHealthyPooledRemoteBackendForDispatch({
+          connectionPromise: stalePromise,
+          currentConnectionPromise: () => stalePromise,
+          probe,
+          reconnect: () => dial(),
+          retire: vi.fn(),
+          retryDelayMs: 0,
+          tracker: new RemoteLivenessTracker()
+        })
+      )
+
+    await expect(dial()).resolves.toBe(stale)
   })
 
   it('clears the dispatch streak after a successful probe', async () => {
