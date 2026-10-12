@@ -284,7 +284,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => connectionPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(healthy)
 
@@ -323,7 +324,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => currentPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker(1)
       })
     ).resolves.toBe(replacement)
 
@@ -353,7 +355,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => legacyPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(legacy)
 
@@ -389,7 +392,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         reconnect,
         retire,
         log,
-        retryDelayMs: 0
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(healthy)
 
@@ -431,11 +435,13 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         reconnect,
         retire,
         log,
-        retryDelayMs: 0
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker(1)
       })
     ).resolves.toBe(replacement)
 
-    // One failure re-verified before death: two probe rounds, then retire.
+    // One failure re-verified before death, and the streak limit reached on
+    // that second round: two probe rounds, then retire.
     expect(probe.mock.calls.filter(([connection]) => connection === stale)).toHaveLength(2)
     expect(retire).toHaveBeenCalledOnce()
     expect(reconnect).toHaveBeenCalledOnce()
@@ -466,13 +472,87 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         reconnect: () => Promise.resolve(replacement),
         retire,
         log,
-        retryDelayMs: 0
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(replacement)
 
     expect(probe).toHaveBeenCalledTimes(1)
     expect(retire).not.toHaveBeenCalled()
     expect(log).not.toHaveBeenCalled()
+  })
+
+  it('bypasses a busy descriptor below the streak limit, retiring only on the third round (#131765)', async () => {
+    // The observed shape: a live bridge starves past the probe budget twice, and the old gate
+    // retired it - tearing down the forward and killing the running turn. Retirement is now
+    // streak-gated on the same tracker the background revalidation uses.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const retire = vi.fn()
+    const reconnect = vi.fn(async () => stale)
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+    const run = () =>
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).not.toHaveBeenCalled()
+    expect(reconnect).toHaveBeenCalledTimes(1)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (2/3)'))
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('retiring descriptor'))
+  })
+
+  it('clears the dispatch streak after a successful probe', async () => {
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce({ ok: true })
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockRejectedValueOnce(new Error('socket hang up'))
+
+    const run = () =>
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect: vi.fn(async () => stale),
+        retire: vi.fn(),
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+
+    // Round 1: one blip, then the confirmation succeeds - the streak clears.
+    await run()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('recovered after one retry'))
+
+    // Round 2: a double failure must read 1/3, not 2/3.
+    await run()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
   })
 
   it('keeps the retry bounded relative to the power-resume holdoff', () => {

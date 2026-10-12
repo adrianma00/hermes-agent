@@ -7,7 +7,12 @@ export const REMOTE_LIVENESS_TIMEOUT_MS = 10_000
 // state.db session count) on a fresh SSH forward routinely runs seconds — and
 // reuse the background liveness budget so a quiet-box cold-start (~6-8s) can
 // finish instead of failing the probe and kicking off a reconnect storm.
-export const POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS = REMOTE_LIVENESS_TIMEOUT_MS
+// #131765 follow-up: a pooled bridge under load — a context compression, a
+// long model call and an LSP start were all in flight in the observed case —
+// can starve a HEALTHY forward past a 10s budget, so dispatch gets a little
+// more room. It must stay below POWER_RESUME_REVALIDATION_HOLDOFF_MS: the
+// post-resume sweep owns anything that outruns this.
+export const POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS = 12_000
 // Backoff between the first failed dispatch probe and the confirmation probe
 // (#131765). Long enough for a transient undici `socket hang up` against a
 // bound forward to clear; short enough that a genuinely dead descriptor still
@@ -131,6 +136,14 @@ export interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection 
   log?: (message: string) => void
   /** Sleep between the first failed probe and the confirmation probe; default 750ms. */
   retryDelayMs?: number
+  /**
+   * Shared failure tracker (in main.ts, the pooled-remote tracker). A double
+   * probe failure only RETIRES the descriptor when it completes this tracker's
+   * failure streak; below the limit the descriptor is bypassed for this
+   * dispatch instead of being torn down (#131765 — a torn-down bridge kills
+   * whatever turn is mid-flight on it).
+   */
+  tracker: RemoteLivenessTracker
 }
 
 /**
@@ -181,7 +194,8 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
   reconnect,
   retire,
   log,
-  retryDelayMs = POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS
+  retryDelayMs = POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS,
+  tracker
 }: EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection>): Promise<TConnection> {
   let connection: TConnection
 
@@ -192,12 +206,19 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
       return reconnect()
     }
 
+    const baseUrl = connection.baseUrl ?? ''
+
     try {
       await probePooledRemoteBackend(connection, probe)
+
+      if (baseUrl) {
+        tracker.recordSuccess(baseUrl)
+      }
     } catch (firstError) {
       // A single failure is not death. Give the transport one backoff to
-      // settle, then re-verify the SAME descriptor before retiring it; the
-      // identity check below still protects a replacement installed meanwhile.
+      // settle, then re-verify the SAME descriptor. Retirement below is
+      // streak-gated, so a busy-but-live bridge is bypassed rather than torn
+      // down; the identity checks keep protecting a replacement elsewhere.
       await new Promise(resolve => setTimeout(resolve, retryDelayMs))
 
       if (currentConnectionPromise() !== connectionPromise) {
@@ -208,8 +229,23 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
         await probePooledRemoteBackend(connection, probe)
       } catch (secondError) {
         const described = probeFailureDescription(firstError, secondError)
+        const failure = baseUrl ? tracker.recordFailure(baseUrl) : { failures: 1, shouldReset: true }
+
+        if (!failure.shouldReset) {
+          log?.(
+            `Pooled remote backend dispatch probe failed twice (${described}); ` +
+              `keeping descriptor for retry (${failure.failures}/${REMOTE_LIVENESS_FAILURE_LIMIT}).`
+          )
+
+          return reconnect()
+        }
+
         log?.(`Pooled remote backend dispatch probe failed twice (${described}); retiring descriptor.`)
         throw secondError
+      }
+
+      if (baseUrl) {
+        tracker.recordSuccess(baseUrl)
       }
 
       log?.(

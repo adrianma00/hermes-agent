@@ -11331,6 +11331,7 @@ async function ensureRegistryBackend(
         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
         log: message => rememberLog(message),
+        tracker: pooledRemoteLiveness,
         retire: async (error: any) => {
           // A late failure from an old descriptor must never tear down a newer
           // entry that another caller has already installed.
