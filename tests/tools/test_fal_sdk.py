@@ -2,9 +2,16 @@
 import json
 from types import SimpleNamespace
 
-import fal_client
 import httpx
 import pytest
+
+# The managed-media SDK is an opt-in extra ([project.optional-dependencies].fal),
+# which CI installs explicitly (`--extra fal`). Import-skip when it is absent so an
+# environment without the extra reports a SKIP for this module instead of a
+# collection ERROR that aborts every unrelated selection in tests/tools.
+fal_client = pytest.importorskip(
+    "fal_client", reason="requires the fal extra (fal-client); CI runs --extra fal"
+)
 
 from tools.fal_common import (
     _ManagedFalSyncClient, _extract_http_status, _managed_fal_billing_error,
