@@ -3,6 +3,11 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
+# The 'anthropic' extra is optional (only native-provider installs carry it); the Anthropic
+# Messages branch builds a real SDK client, so without the guard this test fails with
+# "the 'anthropic' package is required" on every install that did not install the extra.
+pytest.importorskip("anthropic")
 from openai import OpenAI
 
 from agent.client_lifecycle import _swap_fallback_clients
