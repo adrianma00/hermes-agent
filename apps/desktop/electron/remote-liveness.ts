@@ -182,10 +182,11 @@ async function probePooledRemoteBackend<TConnection extends RemoteConnectionDesc
  * One transient transport blip — undici's `socket hang up` against a bound,
  * answering forward is the observed shape (#131765) — must not retire a
  * healthy tunnel: after a failure the probe is re-verified once after a short
- * backoff, and only a SECOND consecutive failure retires the descriptor. The
- * gate stays bounded (at most two probes plus the backoff per dispatch) and
- * a real outage still retires on the second probe, one backoff later than
- * before.
+ * backoff, and a double failure only RETIRES when it completes the shared
+ * tracker's streak; below the limit the descriptor is bypassed for this
+ * dispatch (no teardown, so a running turn survives) and the streak decides.
+ * The gate stays bounded (at most two probes plus the backoff per dispatch),
+ * and a real outage still retires - a few failures later than before.
  */
 export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection extends RemoteConnectionDescriptor>({
   connectionPromise,
