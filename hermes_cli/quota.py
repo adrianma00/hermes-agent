@@ -80,6 +80,14 @@ def _cmd_close(args: argparse.Namespace) -> int:
         "opened_at": None,
     }
     kb.write_quota_gate_card(provider, body, board=kb.quota_gate_board())
+
+    # Phase 1A dual-write: also write to the local state DB.
+    try:
+        from hermes_cli.quota_state import write_wall as _write_wall_local
+        _write_wall_local(provider, window=window, reset_at=float(reset_at), source="manual-close")
+    except Exception:
+        pass
+
     print(f"Gate CLOSED for {provider} "
           f"until {time.strftime('%H:%M:%S', time.localtime(reset_at))} "
           f"(window: {window})")
@@ -93,7 +101,15 @@ def _cmd_open(args: argparse.Namespace) -> int:
         return _err("provider is required")
     kb = _kb()
     removed = kb.delete_quota_gate_card(provider, board=kb.quota_gate_board())
-    if removed:
+
+    # Phase 1A dual-write: also delete from the local state DB.
+    try:
+        from hermes_cli.quota_state import delete_wall as _delete_wall_local
+        local_removed = _delete_wall_local(provider)
+    except Exception:
+        local_removed = False
+
+    if removed or local_removed:
         print(f"Gate OPEN for {provider}")
     else:
         print(f"Gate was already open for {provider}")
@@ -183,6 +199,15 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
                 "nothing to release. The switch rides the wall: set it once a wall is closed."
             )
         return _err(f"Cannot reach the quota-gate board {result.get('board')!r}")
+
+    # Phase 1A dual-write: also set release_all in the local state DB.
+    walled = result.get("provider")
+    if walled:
+        try:
+            from hermes_cli.quota_state import set_release_all as _set_release_all_local
+            _set_release_all_local(walled, enabled)
+        except Exception:
+            pass
 
     walled = result.get("provider") or "the primary"
     reset_at = result.get("reset_at")

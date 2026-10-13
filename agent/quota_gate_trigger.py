@@ -50,6 +50,7 @@ def maybe_close_gate(
 
     try:
         from hermes_cli.kanban_db import read_quota_gate_state, write_quota_gate_card, _quota_gate_config
+        from hermes_cli.quota_state import write_wall as _write_wall_local
 
         enabled, board = _quota_gate_config()
         if not enabled:
@@ -69,6 +70,19 @@ def maybe_close_gate(
             "opened_at": None,
             "source": "first-429",
         }, board=board)
+
+        # Phase 1A dual-write: also write to the local state DB.
+        # Best-effort — the card is still the source of truth.
+        try:
+            _write_wall_local(
+                str(provider),
+                window=window or "5h",
+                reset_at=float(reset_at),
+                source="first-429",
+            )
+        except Exception:
+            logger.debug("Local quota state write failed (non-fatal in Phase 1A)", exc_info=True)
+
         logger.warning(
             "Provider-quota gate CLOSED for %s until %s (reason=%s) — kanban dispatch "
             "and cron jobs on this provider will hold until the window reopens.",
