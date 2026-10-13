@@ -123,6 +123,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     # gate printed "Hard pause: no fallback route" on every install that has one while the
     # dispatcher was happily routing ``quota_override`` cards to it.
     state = kb.read_quota_gate_state(kb.quota_gate_fallback_chain(), enabled=True)
+
+    # Phase 1A validation: --dual compares card vs local state DB
+    dual = getattr(args, "dual", False)
+    if dual:
+        _print_dual_status(state, kb)
+
     if state.is_closed:
         walled = state.walled_provider or "unknown"
         win = f" [{state.window} window]" if state.window else ""
@@ -168,6 +174,46 @@ def _cmd_status(args: argparse.Namespace) -> int:
     else:
         print("Gate OPEN — all providers available")
     return 0
+
+
+def _print_dual_status(card_state, kb) -> None:
+    """Compare the board card against the local state DB and report divergence."""
+    try:
+        from hermes_cli.quota_state import read_state as _read_local, list_walls as _list_local
+    except Exception as exc:
+        print(f"  [--dual] Local state DB unavailable: {exc}")
+        return
+
+    local_state = _read_local(kb.quota_gate_fallback_chain())
+    local_walls = _list_local()
+
+    print("─── Dual-read validation ───")
+    print(f"  Board card:  {'CLOSED' if card_state.is_closed else 'OPEN'}"
+          f"{' (release_all)' if card_state.release_all else ''}")
+    print(f"  Local DB:    {'CLOSED' if local_state.is_closed else 'OPEN'}"
+          f"{' (release_all)' if local_state.release_all else ''}")
+
+    if local_walls:
+        for w in local_walls:
+            r = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(w["reset_at"]))
+            print(f"    Provider={w['provider']}  window={w['window']}  "
+                  f"reset={r}  source={w['source']}  "
+                  f"release_all={'YES' if w['release_all'] else 'no'}")
+    else:
+        print("    (no walls in local DB)")
+
+    if card_state.is_closed != local_state.is_closed:
+        print("  ⚠ DIVERGENCE: gate open/closed disagrees between card and local DB")
+    if card_state.release_all != local_state.release_all:
+        print("  ⚠ DIVERGENCE: release_all disagrees between card and local DB")
+    if card_state.walled_provider != local_state.walled_provider:
+        print(f"  ⚠ DIVERGENCE: walled provider differs "
+              f"(card={card_state.walled_provider!r}, local={local_state.walled_provider!r})")
+    if not card_state.is_closed and not local_state.is_closed:
+        print("  ✓ OK — both report gate open")
+    elif card_state.is_closed and local_state.is_closed:
+        print("  ✓ OK — both report gate closed")
+    print("──────────────────────────")
 
 
 def _cmd_release_all(args: argparse.Namespace) -> int:
