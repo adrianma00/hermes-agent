@@ -323,36 +323,17 @@ def holiday_state(block: dict, moment: datetime) -> dict:
 def _bypass_until(now: Optional[float] = None) -> Optional[float]:
     """Epoch a fleet-wide bypass expires, or None when no bypass is active.
 
-    A bypass is a shared-board card (``cost-window:bypass``) carrying
-    ``{"bypass_until": <epoch>}`` so BOTH installs observe one decision. A past
-    instant is expired, which is what makes the bypass self-clearing: no process
-    has to un-set it, and a crashed "open" cannot strand the fleet.
+    Phase 2A: reads from the local state DB instead of a shared-board card.
+    The bypass is per-install (the cost-window config — peak hours, holiday
+    calendar, pricing — remains in config.yaml as policy).
 
     ``now`` is injectable so the whole reader can be evaluated at an arbitrary
     time; it defaults to the real clock.
     """
     moment = now if now is not None else time.time()
     try:
-        from hermes_cli.kanban_db import _quota_gate_db_path, _QUOTA_GATE_BOARD, _QUOTA_GATE_TITLE_PREFIX
-        import sqlite3
-
-        db_path = _quota_gate_db_path(_QUOTA_GATE_BOARD)
-        if db_path is None:
-            return None
-        if not Path(db_path).exists():
-            return None
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT body FROM tasks WHERE title = ? LIMIT 1", (_BYPASS_TITLE,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row or not row["body"]:
-            return None
-        until = float((json.loads(row["body"]) or {}).get("bypass_until") or 0)
-        return until if until > moment else None
+        from hermes_cli.quota_state import read_bypass as _read_bypass
+        return _read_bypass()
     except Exception:
         _log.debug("cost-window bypass read failed", exc_info=True)
         return None
@@ -522,46 +503,14 @@ def is_priced_provider(provider: Optional[str]) -> bool:
 
 
 def set_bypass(until_epoch: float) -> None:
-    """Write/extend the fleet-wide bypass card on the shared board."""
-    from hermes_cli.kanban_db import _quota_gate_db_path, _QUOTA_GATE_BOARD
-    import sqlite3
+    """Write/extend the cost-window bypass in the local state DB."""
+    from hermes_cli.quota_state import write_bypass as _write_bypass
 
-    db_path = _quota_gate_db_path(_QUOTA_GATE_BOARD)
-    if db_path is None or not Path(db_path).exists():
-        raise RuntimeError(
-            f"Cost-window board '{_QUOTA_GATE_BOARD}' not found — cannot write the bypass"
-        )
-    body = json.dumps({"v": 1, "bypass_until": float(until_epoch)})
-    conn = sqlite3.connect(str(db_path))
-    try:
-        now = time.time()
-        with conn:
-            row = conn.execute(
-                "SELECT id FROM tasks WHERE title = ? LIMIT 1", (_BYPASS_TITLE,)
-            ).fetchone()
-            if row:
-                conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, row[0]))
-            else:
-                conn.execute(
-                    "INSERT INTO tasks (id, title, body, status, assignee, created_by, created_at) "
-                    "VALUES (?, ?, ?, 'scheduled', NULL, 'cost-window', ?)",
-                    (f"cw-{int(now)}", _BYPASS_TITLE, body, now),
-                )
-    finally:
-        conn.close()
+    _write_bypass(float(until_epoch))
 
 
 def clear_bypass() -> None:
-    """Drop the bypass card (idempotent)."""
-    from hermes_cli.kanban_db import _quota_gate_db_path, _QUOTA_GATE_BOARD
-    import sqlite3
+    """Drop the cost-window bypass (idempotent)."""
+    from hermes_cli.quota_state import clear_bypass as _clear_bypass
 
-    db_path = _quota_gate_db_path(_QUOTA_GATE_BOARD)
-    if db_path is None or not Path(db_path).exists():
-        return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        with conn:
-            conn.execute("DELETE FROM tasks WHERE title = ?", (_BYPASS_TITLE,))
-    finally:
-        conn.close()
+    _clear_bypass()

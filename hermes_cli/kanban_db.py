@@ -5426,77 +5426,31 @@ def read_quota_gate_state(
     enabled: Optional[bool] = None,
     board: Optional[str] = None,
 ) -> QuotaGateState:
-    """Read the provider-quota gate card from the shared board.
+    """Read the provider-quota gate state from the local state DB.
+
+    Phase 2A: delegates to :func:`quota_state.read_state` instead of the board
+    card.  ``board`` is accepted but ignored (it was the board slug in the card
+    era) — kept for API compatibility.
 
     ``fallback_chain`` is the list of ``fallback_providers`` entries from the
     dispatcher's config (e.g. ``[{"provider": "deepseek", "model": …}]``).
     When provided, the first entry is used as the override route.
 
     Opt-in via ``kanban.quota_gate.enabled`` (default **false**): a dispatcher
-    that never opted in is never paused, so an install with no shared board
-    behaves exactly as before. Once enabled, the gate FAILS CLOSED — an
-    unreachable/absent board means "the mount is gone, we cannot operate", per
-    the fleet's stated preference. ``board`` / ``enabled`` override the config
-    (used by tests and the ``hermes quota`` CLI).
+    that never opted in is never paused.
     """
-    if enabled is None or board is None:
-        cfg_enabled, cfg_board = _quota_gate_config()
-        if enabled is None:
-            enabled = cfg_enabled
-        if board is None:
-            board = cfg_board
+    if enabled is None:
+        cfg_enabled, _cfg_board = _quota_gate_config()
+        enabled = cfg_enabled
     if not enabled:
         return QuotaGateState(is_closed=False)
 
-    db_path = _quota_gate_db_path(board)
-    if db_path is None or not db_path.exists():
-        # Enabled but the board is gone → the shared mount is unreachable.
-        return QuotaGateState(is_closed=True)
-
-    conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT body FROM tasks "
-            "WHERE title LIKE ? AND status = 'scheduled' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (f"{_QUOTA_GATE_TITLE_PREFIX}%",),
-        ).fetchone()
-        if not row or not row["body"]:
-            # No gate card: nothing is walled.
-            return QuotaGateState(is_closed=False)
-        gate = json.loads(row["body"])
-        now = time.time()
-        reset_at = gate.get("reset_at")
-        if reset_at is not None and isinstance(reset_at, (int, float)) and reset_at > now:
-            fb_model = None
-            fb_provider = None
-            if isinstance(fallback_chain, list) and fallback_chain:
-                fb_model = fallback_chain[0].get("model")
-                fb_provider = fallback_chain[0].get("provider")
-            return QuotaGateState(
-                is_closed=True,
-                reset_at=float(reset_at),
-                walled_provider=gate.get("provider"),
-                window=gate.get("window"),
-                fallback_model=fb_model,
-                fallback_provider=fb_provider,
-                release_all=bool(gate.get("release_all")),
-            )
-        # reset_at in the past (or absent) → gate is open
-        return QuotaGateState(is_closed=False)
+        from hermes_cli.quota_state import read_state as _read_state
+        return _read_state(fallback_chain=fallback_chain)
     except Exception as exc:
-        # Enabled and the board exists but cannot be read (corruption,
-        # permission, mount error) → fail closed.
-        _log.warning("Quota gate unreadable at %s — holding the fleet: %s", db_path, exc)
+        _log.warning("Quota state unreadable — holding the fleet: %s", exc)
         return QuotaGateState(is_closed=True)
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def _quota_gate_config() -> "tuple[bool, str]":

@@ -59,7 +59,7 @@ into the next wall by ``_carry_gate_policy``. A peer DM against the NEW wall wou
 to the fallback on the strength of a switch thrown against the OLD one (exactly what the switch's
 placement on the incident card exists to prevent). The two dispatched sources reap an expired card
 before trusting it; the peer reader must do the same, or it is the one reader through which the
-inheritance still reaches a turn. See :func:`reap_expired_gate_card` for the cadence chosen and why.
+inheritance still reaches a turn. 
 """
 
 from __future__ import annotations
@@ -147,40 +147,7 @@ def configured_primary_provider() -> str:
 #: interval rather than by turn volume gives it a cadence of its own — at most one sweep per
 #: minute, however many turns arrive — which is the "sweep on its own cadence" half of the
 #: separation ``a3961f42d4`` drew, instead of the "inline a sweep per turn" it warned against.
-#: A minute is far shorter than any quota window this card can describe (minutes to days), and a
-#: delay can only postpone a reap — the decision for the CURRENT turn never depends on it, because
-#: an expired card already reads as ``is_closed=False`` by clock.
-GATE_SWEEP_MIN_INTERVAL_SECONDS = 60.0
 
-#: Wall-clock instant of the last sweep attempt (module state, one api_server process).
-_last_gate_sweep_at = 0.0
-
-
-def reap_expired_gate_card() -> bool:
-    """Delete an expired gate card, at most once per :data:`GATE_SWEEP_MIN_INTERVAL_SECONDS`.
-
-    The peer reader's share of ``sweep_expired_quota_gate_card`` — the same reap the kanban
-    dispatcher and the cron tick perform before trusting the gate, so that a ``release_all``
-    switch thrown against a wall that has already ended cannot govern a later one. It is done
-    HERE rather than inside the shared reader because ``read_quota_gate_state`` is called on every
-    dispatch tick and must stay read-only; the sweep is deliberately off that path.
-
-    Never raises: a failed sweep must not cost a fleet its peer channel (the same best-effort
-    stance both other callers take). Returns True when the sweep actually ran.
-    """
-    global _last_gate_sweep_at
-    moment = time.time()
-    if moment - _last_gate_sweep_at < GATE_SWEEP_MIN_INTERVAL_SECONDS:
-        return False
-    _last_gate_sweep_at = moment
-    try:
-        from hermes_cli.kanban_db import sweep_expired_quota_gate_card
-
-        sweep_expired_quota_gate_card()
-        return True
-    except Exception:
-        logger.debug("api_server quota gate: expired-card sweep failed", exc_info=True)
-        return False
 
 
 def gate_state():
@@ -193,24 +160,15 @@ def gate_state():
     arguments as ``cron.scheduler_quota.gate_state`` and the kanban dispatcher, so the three
     surfaces cannot disagree about the wall or the route.
 
-    An EXPIRED card is reaped before the read (:func:`reap_expired_gate_card`), exactly as both
-    dispatched readers do it before they trust the gate: the gate opens by CLOCK rather than by
-    deleting the card, so without the reap a wall that ended on its own would leave its card —
-    and the operator's ``release_all`` on it — on the board for the NEXT wall to re-arm.
+    Phase 2A: reads from the local state DB; no reap is needed because expired
+    walls are automatically filtered by the reader (``reset_at > now``).
     """
     try:
         from hermes_cli.kanban_db import quota_gate_fallback_chain, read_quota_gate_state
     except Exception:
         logger.debug("api_server quota gate: kanban gate reader unavailable — not gating", exc_info=True)
         return None
-    try:
-        reap_expired_gate_card()
-    except Exception:
-        # reap_expired_gate_card is already total; this is belt-and-braces. Best-effort either
-        # way: a failed sweep must never stop the peer channel from reading (and honouring) the
-        # gate, exactly as in the cron tick and the dispatcher.
-        logger.debug("api_server quota gate: expired-card sweep failed", exc_info=True)
-    try:
+try:
         state = read_quota_gate_state(quota_gate_fallback_chain() or [])
     except Exception:
         # A read that RAISES is a broken reader, not a closed gate: an install whose gate

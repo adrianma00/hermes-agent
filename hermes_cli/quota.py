@@ -71,17 +71,7 @@ def _cmd_close(args: argparse.Namespace) -> int:
               f"(asked to close until {time.strftime('%H:%M:%S', time.localtime(reset_at))})")
         return 0
 
-    body = {
-        "v": 1,
-        "provider": provider,
-        "window": window,
-        "closed_at": int(time.time()),
-        "reset_at": int(reset_at),
-        "opened_at": None,
-    }
-    kb.write_quota_gate_card(provider, body, board=kb.quota_gate_board())
-
-    # Phase 1A dual-write: also write to the local state DB.
+    # Phase 2A: write to the local state DB only.
     try:
         from hermes_cli.quota_state import write_wall as _write_wall_local
         _write_wall_local(provider, window=window, reset_at=float(reset_at), source="manual-close")
@@ -100,16 +90,15 @@ def _cmd_open(args: argparse.Namespace) -> int:
     if not provider:
         return _err("provider is required")
     kb = _kb()
-    removed = kb.delete_quota_gate_card(provider, board=kb.quota_gate_board())
 
-    # Phase 1A dual-write: also delete from the local state DB.
+    # Phase 2A: delete from the local state DB only.
     try:
         from hermes_cli.quota_state import delete_wall as _delete_wall_local
         local_removed = _delete_wall_local(provider)
     except Exception:
         local_removed = False
 
-    if removed or local_removed:
+    if local_removed:
         print(f"Gate OPEN for {provider}")
     else:
         print(f"Gate was already open for {provider}")
@@ -237,26 +226,23 @@ def _cmd_release_all(args: argparse.Namespace) -> int:
     """
     enabled = args.state == "on"
     kb = _kb()
-    result = kb.set_quota_gate_release_all(enabled)
-    if not result.get("ok"):
-        if result.get("reason") == "no_gate_card":
-            return _err(
-                f"No gate card on {result.get('board')} — the gate is OPEN, so there is "
-                "nothing to release. The switch rides the wall: set it once a wall is closed."
-            )
-        return _err(f"Cannot reach the quota-gate board {result.get('board')!r}")
 
-    # Phase 1A dual-write: also set release_all in the local state DB.
-    walled = result.get("provider")
-    if walled:
-        try:
-            from hermes_cli.quota_state import set_release_all as _set_release_all_local
-            _set_release_all_local(walled, enabled)
-        except Exception:
-            pass
+    # Phase 2A: read gate state to find the walled provider, then set release_all locally.
+    state = kb.read_quota_gate_state(enabled=True)
+    if not state.is_closed:
+        return _err(
+            "The gate is OPEN — there is nothing to release. "
+            "The switch rides the wall: set it once a wall is closed."
+        )
 
-    walled = result.get("provider") or "the primary"
-    reset_at = result.get("reset_at")
+    walled = state.walled_provider or "the primary"
+    try:
+        from hermes_cli.quota_state import set_release_all as _set_release_all_local
+        _set_release_all_local(walled, enabled)
+    except Exception:
+        pass
+
+    reset_at = state.reset_at
     until = (
         f" until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_at))}"
         if isinstance(reset_at, (int, float)) else ""
@@ -338,7 +324,8 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     try:
         resp = urllib.request.urlopen(req, timeout=30)
         if resp.status == 200:
-            kb.delete_quota_gate_card(provider)
+            from hermes_cli.quota_state import delete_wall as _delete_wall_local
+            _delete_wall_local(provider)
             print(f"Gate OPEN for {provider} — window is available")
             return 0
         return _err(f"Unexpected HTTP {resp.status}")
@@ -348,10 +335,8 @@ def _cmd_probe(args: argparse.Namespace) -> int:
             # Re-close with the new reset time from the response body.
             new_reset = _extract_reset_from_429(resp_body)
             if new_reset:
-                kb.write_quota_gate_card(provider, {
-                    "v": 1, "provider": provider, "window": "5h",
-                    "closed_at": int(time.time()), "reset_at": new_reset, "opened_at": None,
-                }, board=kb.quota_gate_board())
+                from hermes_cli.quota_state import write_wall as _write_wall_local
+                _write_wall_local(provider, window="5h", reset_at=float(new_reset), source="probe-429")
                 print(f"Gate still CLOSED for {provider} — "
                       f"re-armed to {time.strftime('%H:%M:%S', time.localtime(new_reset))}")
             else:

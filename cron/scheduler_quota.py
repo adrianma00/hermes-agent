@@ -57,23 +57,14 @@ def gate_state():
     ``None`` means "do not gate": the caller skips every quota check, so a fleet
     that never enabled the gate behaves exactly as before.
 
-    Before trusting the card, an EXPIRED one is reaped (:func:`sweep_expired_quota_gate_card`).
-    The gate opens by clock, not by deleting the card, so without this a wall that ended on
-    its own would leave its card — and the operator's ``release_all`` policy on it — on the
-    board for the NEXT wall to re-arm, silently inheriting a decision made against a
-    different reset distance. The sweep is done here (the cron tick is the fleet's reliable
-    heartbeat) and again in the kanban dispatcher, because either can be the first to notice.
+    Phase 2A: reads from the local state DB; no sweep is needed because expired
+    walls are automatically filtered by the reader (``reset_at > now``).
     """
     try:
-        from hermes_cli.kanban_db import read_quota_gate_state, sweep_expired_quota_gate_card
+        from hermes_cli.kanban_db import read_quota_gate_state
     except Exception:
         return None
     cfg, chain = _config_and_chain()
-    try:
-        sweep_expired_quota_gate_card()
-    except Exception:
-        # Best-effort: a failed sweep must never stop the tick from reading the gate.
-        logger.debug("cron quota gate: expired-card sweep failed", exc_info=True)
     try:
         state = read_quota_gate_state(chain)
     except Exception:
