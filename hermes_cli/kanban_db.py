@@ -5083,22 +5083,6 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
 )
 
 
-# ── Quota gate card writer ──────────────────────────────────────────────────
-
-
-# Body keys on the gate card that carry OPERATOR POLICY rather than incident
-# state. Every writer (the first-429 trigger, `hermes quota close`, the probe's
-# re-close) rebuilds the body from scratch, so without this carry a routine
-# refresh of `reset_at`/`closed_at` mid-wall would silently revert the
-# release-all switch to HOLD — the operator would see the fleet start holding
-# again with nothing in the logs to explain it.
-_GATE_POLICY_KEYS = ("release_all",)
-
-            )
-        return affected > 0
-    finally:
-        conn.close()
-
 # ── Quota gate ──────────────────────────────────────────────────────────────
 
 
