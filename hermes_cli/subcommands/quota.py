@@ -33,9 +33,12 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
 
     status_p = sp.add_parser("status", help="Print the current gate state",
                              description="With --dual, also compares the card against the local state DB "
-                                         "(Phase 1A validation tool).")
+                                         "(Phase 1A validation tool). With --json, emits the gate state "
+                                         "as JSON for scripts.")
     status_p.add_argument("--dual", action="store_true",
                           help="Compare the board card against the local state DB and report divergence")
+    status_p.add_argument("--json", action="store_true",
+                          help="Emit the gate state as JSON (machine-readable)")
 
     probe = sp.add_parser("probe", help="Verify the window with ONE real call")
     probe.add_argument("--base-url", help="Override the primary API base URL")

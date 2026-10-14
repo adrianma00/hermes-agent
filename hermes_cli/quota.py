@@ -118,6 +118,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if dual:
         _print_dual_status(state, kb)
 
+    # Phase 2C: machine-readable output for scripts (e.g. provider_balance_watch's
+    # ownership check, which can no longer read the retired board card).
+    if getattr(args, "json", False):
+        try:
+            from hermes_cli.quota_state import list_walls as _list_walls
+            walls = _list_walls()
+        except Exception:
+            walls = []
+        print(json.dumps({
+            "is_closed": bool(state.is_closed),
+            "walled_provider": state.walled_provider,
+            "window": state.window,
+            "reset_at": state.reset_at,
+            "release_all": bool(state.release_all),
+            "fallback_provider": state.fallback_provider,
+            "fallback_model": state.fallback_model,
+            "walls": walls,
+        }))
+        return 0
+
     if state.is_closed:
         walled = state.walled_provider or "unknown"
         win = f" [{state.window} window]" if state.window else ""
