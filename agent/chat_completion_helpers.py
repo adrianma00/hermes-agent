@@ -2118,8 +2118,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     if not getattr(agent, "_fallback_activated", False):
-        # Leaving a walled primary: record the incident for the operator. The marker dedupes per
-        # incident, so a wall that persists for hours notifies once (agent/provider_wall_notice).
+        # Leaving a walled primary: close the fleet quota gate (first-429 trigger) AND record the
+        # incident for the operator. The gate close holds queued kanban/cron work off the walled
+        # provider; the marker dedupes per incident, so a wall that persists for hours notifies
+        # once (agent/provider_wall_notice). Both are best-effort — a failure here must never mask
+        # the provider error the user actually needs to see.
+        _wall_ctx = getattr(agent, "_last_api_error_context", None) or {}
+        try:
+            from agent.quota_gate_trigger import maybe_close_gate
+
+            maybe_close_gate(
+                provider=getattr(agent, "provider", None),
+                reset_at=_wall_ctx.get("reset_at") or reset_at,
+                reason=getattr(reason, "value", None) if reason is not None else None,
+                window=_wall_ctx.get("window"),
+            )
+        except Exception:
+            logger.debug("quota gate trigger skipped", exc_info=True)
         _emit_provider_wall_notice(agent, reason=reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
