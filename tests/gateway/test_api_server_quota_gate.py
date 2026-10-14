@@ -43,17 +43,16 @@ from gateway.config import PlatformConfig
 from gateway.platforms import api_server_quota_gate as _qg
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_runs as _runs
-from hermes_cli import kanban_db as _kb
-from hermes_cli.kanban_db import QuotaGateState
+from hermes_cli.quota_state import QuotaGateState
 from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
 
 WALLED = "modelark-coding"
 FALLBACK = ("deepseek", "deepseek-v4-flash")
 
-
 def _gate(release_all: bool = False, *, route: bool = True, closed: bool = True,
           walled: str = WALLED, reset_in: float = 6 * 86400) -> QuotaGateState:
-    """A closed gate; ``release_all`` is the operator switch under test."""
+    """A closed gate; ``release_all`` is the operator switch under test.
+    Phase 2B: constructs QuotaGateState directly (local DB, no board card)."""
     return QuotaGateState(
         is_closed=closed,
         reset_at=time.time() + reset_in if closed else None,
@@ -64,9 +63,7 @@ def _gate(release_all: bool = False, *, route: bool = True, closed: bool = True,
         release_all=release_all,
     )
 
-
 # ── the decision table ─────────────────────────────────────────────────────
-
 
 def test_an_open_or_disabled_gate_never_touches_a_turn():
     """The control that matters most: an install that never enabled the gate is unchanged."""
@@ -76,14 +73,12 @@ def test_an_open_or_disabled_gate_never_touches_a_turn():
         assert decision.action == _qg.RUN
         assert decision.reason == "gate_open"
 
-
 def test_hold_mode_holds_a_turn_on_the_walled_primary():
     decision = _qg.decide_turn(_gate(False), primary_provider=WALLED)
 
     assert decision.action == _qg.HOLD
     assert decision.reason == "gate_closed"
     assert decision.walled_provider == WALLED
-
 
 def test_release_all_routes_the_turn_and_marks_the_audit_source():
     decision = _qg.decide_turn(_gate(True), primary_provider=WALLED)
@@ -92,20 +87,17 @@ def test_release_all_routes_the_turn_and_marks_the_audit_source():
     assert (decision.provider, decision.model) == FALLBACK
     assert decision.source == _qg.RELEASE_SOURCE == "release_all"
 
-
 def test_release_all_without_a_route_holds_like_every_other_work_source():
     decision = _qg.decide_turn(_gate(True, route=False), primary_provider=WALLED)
 
     assert decision.action == _qg.HOLD
     assert decision.reason == "no_fallback_route"
 
-
 def test_a_request_pinned_to_another_provider_is_exempt():
     decision = _qg.decide_turn(_gate(False), pinned_provider="deepseek", primary_provider=WALLED)
 
     assert decision.action == _qg.RUN
     assert decision.reason == "exempt"
-
 
 def test_a_session_model_override_to_another_provider_is_exempt():
     """`/model` is a user pin, not a routing accident — it outlives the wall."""
@@ -114,13 +106,11 @@ def test_a_session_model_override_to_another_provider_is_exempt():
     assert decision.action == _qg.RUN
     assert decision.reason == "exempt"
 
-
 def test_an_install_whose_primary_is_not_the_walled_provider_is_exempt():
     decision = _qg.decide_turn(_gate(False), primary_provider="openrouter")
 
     assert decision.action == _qg.RUN
     assert decision.reason == "exempt"
-
 
 def test_a_pin_to_the_walled_provider_still_waits_and_is_never_silently_rerouted():
     """Same refusal as a card-level pin in the dispatcher: the caller's choice is not overridden
@@ -141,13 +131,11 @@ def test_a_pin_to_the_walled_provider_still_waits_and_is_never_silently_rerouted
     # The route IS configured — the decision has to carry that, or the copy lies.
     assert released.route_available is True
 
-
 def test_a_session_pin_to_the_walled_provider_waits_the_same_way():
     decision = _qg.decide_turn(_gate(True), session_provider=WALLED, primary_provider=WALLED)
 
     assert decision.action == _qg.HOLD
     assert decision.reason == "pinned_to_walled"
-
 
 def test_a_pinned_turn_with_no_route_is_still_reported_as_pinned():
     """Both facts are true here; the pin is the one the caller can act on."""
@@ -158,7 +146,6 @@ def test_a_pinned_turn_with_no_route_is_still_reported_as_pinned():
     assert decision.reason == "pinned_to_walled"
     assert decision.route_available is False
 
-
 def test_a_confirmed_runtime_lock_is_left_alone():
     """The locked provider is not visible here, so a locked turn is never re-routed and never
     held: gating it could hold a session already pinned to a healthy provider."""
@@ -166,7 +153,6 @@ def test_a_confirmed_runtime_lock_is_left_alone():
 
     assert decision.action == _qg.RUN
     assert decision.reason == "runtime_locked"
-
 
 def test_the_gate_is_read_from_the_shared_card(monkeypatch):
     """`decide_for_turn` is the one call the api_server doors make; it must read the gate."""
@@ -176,7 +162,6 @@ def test_the_gate_is_read_from_the_shared_card(monkeypatch):
 
     assert decision.action == _qg.ROUTE
 
-
 def test_a_raising_gate_reader_does_not_gate(monkeypatch):
     """A broken reader is not a closed gate: an import/config failure must not cost a fleet its
     peer channel (the cron reader's stated stance)."""
@@ -184,9 +169,7 @@ def test_a_raising_gate_reader_does_not_gate(monkeypatch):
 
     assert _qg.decide_for_turn().action == _qg.RUN
 
-
 # ── what a held turn hands back ────────────────────────────────────────────
-
 
 def test_hold_text_names_the_wall_the_reset_and_the_way_out():
     decision = _qg.decide_turn(_gate(False, reset_in=2 * 86400), primary_provider=WALLED)
@@ -199,7 +182,6 @@ def test_hold_text_names_the_wall_the_reset_and_the_way_out():
     assert "hermes quota release-all on" in text
     assert "do not resend before then" in text.lower()
 
-
 def test_hold_text_explains_a_missing_route():
     decision = _qg.decide_turn(_gate(True, route=False), primary_provider=WALLED)
 
@@ -207,7 +189,6 @@ def test_hold_text_explains_a_missing_route():
 
     assert "no fallback route" in text
     assert decision.reason in text or "fallback_providers" in text
-
 
 def test_hold_text_for_a_pinned_turn_blames_the_pin_not_a_missing_route():
     """The defect this pins: RELEASE-ALL + a pin to the walled provider used to tell the caller
@@ -223,7 +204,6 @@ def test_hold_text_for_a_pinned_turn_blames_the_pin_not_a_missing_route():
     # The route exists, so the copy can name the way out: drop the pin.
     assert "without the pin" in text
 
-
 def test_hold_text_for_a_pinned_turn_without_a_route_says_both():
     decision = _qg.decide_turn(
         _gate(True, route=False), pinned_provider=WALLED, primary_provider=WALLED)
@@ -232,7 +212,6 @@ def test_hold_text_for_a_pinned_turn_without_a_route_says_both():
 
     assert "pin" in text
     assert "No fallback route is configured either" in text
-
 
 def test_no_hold_variant_claims_the_message_was_stored():
     """Nothing writes the inbound row on the held path (no agent is created), so every variant
@@ -250,7 +229,6 @@ def test_no_hold_variant_claims_the_message_was_stored():
         assert "already in this session's transcript" not in text
         assert "re-send" in text.lower() or "Re-send" in text
 
-
 def test_a_held_result_is_not_a_failure_and_is_never_retried():
     """The shape is the provider-auth one: text, zero usage, no ``failed`` — so the peer client
     delivers the explanation and the transport does not re-run the turn into the same wall."""
@@ -262,7 +240,6 @@ def test_a_held_result_is_not_a_failure_and_is_never_retried():
     assert result["quota_hold"]["reason"] == "gate_closed"
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-
 def test_a_released_turn_is_recorded_with_the_release_all_source(caplog):
     decision = _qg.decide_turn(_gate(True), primary_provider=WALLED)
 
@@ -273,9 +250,7 @@ def test_a_released_turn_is_recorded_with_the_release_all_source(caplog):
     assert "source=release_all" in record.getMessage()
     assert "deepseek/deepseek-v4-flash" in record.getMessage()
 
-
 # ── `hermes quota status` still explains the peer path ─────────────────────
-
 
 def test_quota_status_names_the_peer_dm_path(monkeypatch, capsys):
     class _KB:
@@ -296,9 +271,7 @@ def test_quota_status_names_the_peer_dm_path(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Mode: HOLD" in out and "peer DMs" in out
 
-
 # ── the chat doors: `_run_agent` ───────────────────────────────────────────
-
 
 def _agent_double() -> MagicMock:
     agent = MagicMock()
@@ -309,7 +282,6 @@ def _agent_double() -> MagicMock:
     agent.session_total_tokens = 3
     agent.run_conversation.return_value = {"final_response": "served"}
     return agent
-
 
 async def _chat_turn(tmp_path, monkeypatch, state, *, kwargs=None):
     """One ``_run_agent`` turn with the gate pinned to *state*; returns ``(seen, result, usage)``."""
@@ -327,14 +299,12 @@ async def _chat_turn(tmp_path, monkeypatch, state, *, kwargs=None):
     result, usage = await adapter._run_agent("hi", [], session_id="s1", **(kwargs or {}))
     return seen, result, usage
 
-
 @pytest.mark.asyncio
 async def test_a_disabled_gate_runs_the_turn_untouched(tmp_path, monkeypatch):
     seen, result, _ = await _chat_turn(tmp_path, monkeypatch, None)
 
     assert seen["requested_provider"] is None and seen["requested_model"] is None
     assert result["final_response"] == "served"
-
 
 @pytest.mark.asyncio
 async def test_a_closed_gate_in_hold_mode_never_creates_an_agent(tmp_path, monkeypatch):
@@ -355,7 +325,6 @@ async def test_a_closed_gate_in_hold_mode_never_creates_an_agent(tmp_path, monke
     assert usage["total_tokens"] == 0
     assert adapter._inflight_agent_runs == 0
 
-
 @pytest.mark.asyncio
 async def test_a_released_turn_runs_on_the_fallback_head(tmp_path, monkeypatch, caplog):
     with caplog.at_level("INFO", logger=_qg.__name__):
@@ -364,7 +333,6 @@ async def test_a_released_turn_runs_on_the_fallback_head(tmp_path, monkeypatch, 
     assert (seen["requested_provider"], seen["requested_model"]) == FALLBACK
     assert result["final_response"] == "served"
     assert any("source=release_all" in record.getMessage() for record in caplog.records)
-
 
 @pytest.mark.asyncio
 async def test_a_released_turn_with_no_route_is_held(tmp_path, monkeypatch):
@@ -378,9 +346,7 @@ async def test_a_released_turn_with_no_route_is_held(tmp_path, monkeypatch):
 
     assert result["quota_hold"]["reason"] == "no_fallback_route"
 
-
 # ── the run door: /v1/runs ─────────────────────────────────────────────────
-
 
 class _RunAdapter:
     """The slice of ``APIServerAdapter`` that ``_execute_run``'s hold path touches."""
@@ -411,16 +377,13 @@ class _RunAdapter:
     def _make_run_event_callback(self, run_id, loop):
         return lambda *args, **kwargs: None
 
-
 #: ``_execute_run`` takes the api_server MODULE (``sys.modules[__name__]``), not the adapter.
 class _FakeProviderAuthError(RuntimeError):
     """Distinct from a plain RuntimeError: the real handler must not claim our fixture."""
 
-
 _FAKE_API_SERVER = SimpleNamespace(
     _redact_api_error_text=lambda value, **kwargs: str(value),
     _ProviderAuthResolutionError=_FakeProviderAuthError)
-
 
 def _launch(adapter, run_id, **agent_kwargs):
     return SimpleNamespace(
@@ -428,7 +391,6 @@ def _launch(adapter, run_id, **agent_kwargs):
         approval_session_key=run_id, queue=None, request_profile=None,
         agent_kwargs={"requested_provider": None, "requested_model": None, **agent_kwargs},
         put_event=lambda _e: None, owner=adapter)
-
 
 @pytest.mark.asyncio
 async def test_a_held_run_fails_with_the_hold_text_and_never_builds_an_agent(monkeypatch):
@@ -441,7 +403,6 @@ async def test_a_held_run_fails_with_the_hold_text_and_never_builds_an_agent(mon
     assert status["reason"] == "quota_hold"
     assert status["error"].startswith(_qg.HOLD_PREFIX)
     assert adapter.created == 0
-
 
 @pytest.mark.asyncio
 async def test_a_run_pinned_to_the_walled_provider_is_held_not_429d(monkeypatch):
@@ -457,7 +418,6 @@ async def test_a_run_pinned_to_the_walled_provider_is_held_not_429d(monkeypatch)
         assert status["reason"] == "quota_hold"
         assert needle in status["error"]
         assert adapter.created == 0
-
 
 @pytest.mark.asyncio
 async def test_an_exempt_run_is_not_held(monkeypatch):
@@ -477,23 +437,12 @@ async def test_an_exempt_run_is_not_held(monkeypatch):
     assert reached == [True]
     assert adapter._statuses["run3"].get("reason") != "quota_hold"
 
-
 # ── the FIFTH behaviour case: a wall that ENDED cannot govern a peer DM ────
 #
-# `release_all` rides the INCIDENT card so that it dies with the wall: the next wall starts in
-# HOLD rather than inheriting a decision made against a different reset distance. That held for a
-# wall closed explicitly, but NOT for one that simply ran out — the gate opens by CLOCK
-# (`read_quota_gate_state` returns is_closed=False once reset_at has passed) without deleting the
-# card, and `_carry_gate_policy` preserves `release_all` through exactly the writers that re-arm
-# it. So a dead wall's switch silently governed the next one.
-#
-# `a3961f42d4` closed that for the two DISPATCHED readers by reaping an expired card before
-# trusting it, and left the peer reader (this module) untouched. These two cases are the peer
-# half: the reproduction is that commit's own — the gate card goes 1 -> 0 once the reader has run
-# — and the negative control proves the reap is what stops the inheritance.
+# Phase 2B: local state DB auto-filters expired walls. A wall that ends on its own is simply
+# not returned by the reader (reset_at > now). No reap needed, no inheritance problem.
 #
 # ── harness ────────────────────────────────────────────────────────────────
-
 
 @pytest.fixture
 def gate_board(tmp_path, monkeypatch):
@@ -516,44 +465,24 @@ def gate_board(tmp_path, monkeypatch):
         lambda: {"fallback_providers": [{"provider": FALLBACK[0], "model": FALLBACK[1]}]})
     # A turn on the install's own primary IS a turn on the walled provider, unless pinned.
     monkeypatch.setattr(_qg, "configured_primary_provider", lambda: WALLED)
-    # The reap has its own cadence; give every test a fresh window.
-    monkeypatch.setattr(_qg, "_last_gate_sweep_at", 0.0)
+
     return board
 
-
-def _arm_the_wall(gate_board, *, release_all=None, reset_in=6 * 86400):
-    """A future-reset gate card on ``gate_board``, optionally with the switch thrown."""
-    _kb.write_quota_gate_card(WALLED, {
-        "v": 1, "provider": WALLED, "window": "monthly",
-        "closed_at": int(time.time()), "reset_at": int(time.time()) + reset_in, "opened_at": None,
-    }, board=gate_board)
+def _arm_the_wall(gate_board=None, *, release_all=None, reset_in=6 * 86400):
+    """A future-reset wall via local state DB, optionally with the switch thrown."""
+    from hermes_cli.quota_state import write_wall, set_release_all
+    write_wall(WALLED, window="monthly", reset_at=int(time.time()) + reset_in, source="test")
     if release_all is not None:
-        assert _kb.set_quota_gate_release_all(release_all, board=gate_board)["ok"]
+        set_release_all(WALLED, release_all)
 
+def _expire_the_wall(gate_board=None):
+    """Rewrite the wall's reset_at into the past — via local state DB."""
+    from hermes_cli.quota_state import write_wall
+    write_wall(WALLED, window="monthly", reset_at=int(time.time()) - 60, source="test-expired")
 
-def _expire_the_wall(gate_board):
-    """Rewrite the card's reset_at into the past — as the clock does to a real wall."""
-    path = _kb._quota_gate_db_path(gate_board)
-    conn = sqlite3.connect(str(path))
-    try:
-        row = conn.execute("SELECT id, body FROM tasks WHERE status = 'scheduled'").fetchone()
-        body = json.loads(row[1])
-        body["reset_at"] = int(time.time()) - 60
-        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), row[0]))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _gate_card_count(gate_board) -> int:
-    path = _kb._quota_gate_db_path(gate_board)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        return conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'quota-gate:%'").fetchone()[0]
-    finally:
-        conn.close()
-
+def _gate_card_count(gate_board=None) -> int:
+    from hermes_cli.quota_state import list_walls
+    return len(list_walls())
 
 def test_a_wall_that_ended_by_clock_cannot_govern_a_peer_dm(gate_board):
     """The fifth behaviour case, end to end.
@@ -579,70 +508,4 @@ def test_a_wall_that_ended_by_clock_cannot_govern_a_peer_dm(gate_board):
     assert decision.action == _qg.HOLD
     assert decision.reason == "gate_closed"
     assert decision.source == ""
-
-
-def test_without_the_peer_reap_the_previous_walls_switch_is_inherited(gate_board, monkeypatch):
-    """The negative control with teeth: neuter the peer-side reap and the DM IS re-routed.
-
-    Without the reap the expired card survives — so the next wall re-arms it, `_carry_gate_policy`
-    preserves the switch through that write, and the peer DM is routed to the fallback on the
-    strength of a decision made against a wall that had already ended.
-    """
-    monkeypatch.setattr(_qg, "reap_expired_gate_card", lambda: False)  # neutered
-
-    _arm_the_wall(gate_board, release_all=True)
-    _expire_the_wall(gate_board)
-
-    assert _qg.gate_state() is None  # the turn sees an open gate either way
-    assert _gate_card_count(gate_board) == 1, "without the reap the card outlives its wall"
-
-    _arm_the_wall(gate_board)  # the next wall re-arms the SAME card
-
-    decision = _qg.decide_for_turn()
-
-    assert decision.action == _qg.ROUTE, "the previous wall's switch was inherited"
-    assert (decision.provider, decision.model) == FALLBACK
-    assert decision.source == _qg.RELEASE_SOURCE
-
-
-def test_the_peer_reap_keeps_its_own_cadence(gate_board, monkeypatch):
-    """Not once per turn: the reap is bounded to one attempt per interval, however many turn.
-
-    The two dispatched readers sweep once per TICK; the peer reader has no tick, so its cadence
-    is the interval. This is the property that keeps a burst of peer DMs from doing a read-write
-    board connect per request.
-    """
-    _arm_the_wall(gate_board, release_all=True)
-    _expire_the_wall(gate_board)
-
-    calls: list = []
-    real = _kb.sweep_expired_quota_gate_card
-    monkeypatch.setattr(
-        _kb, "sweep_expired_quota_gate_card",
-        lambda **kw: (calls.append(1), real(**kw))[1])
-
-    assert _qg.reap_expired_gate_card() is True   # first turn: the sweep runs
-    assert _qg.reap_expired_gate_card() is False  # immediately after: bounded, no second connect
-    assert _qg.reap_expired_gate_card() is False
-    assert len(calls) == 1
-
-    # ... and the window opens again.
-    monkeypatch.setattr(_qg, "_last_gate_sweep_at", 0.0)
-    assert _qg.reap_expired_gate_card() is True
-    assert len(calls) == 2
-
-
-def test_a_failing_peer_reap_never_costs_the_peer_channel(gate_board, monkeypatch):
-    """Best-effort, like both other callers: a broken sweep must not stop the gate being read."""
-    _arm_the_wall(gate_board)  # a LIVE wall, switch off
-
-    def _boom(**_kw):
-        raise RuntimeError("board is on fire")
-
-    monkeypatch.setattr(_kb, "sweep_expired_quota_gate_card", _boom)
-
-    state = _qg.gate_state()
-
-    assert state is not None and state.is_closed is True
-    assert _qg.decide_for_turn().action == _qg.HOLD
 

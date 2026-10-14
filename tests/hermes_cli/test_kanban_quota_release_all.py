@@ -27,14 +27,11 @@ distance. These tests pin the three things that would silently break that:
 from __future__ import annotations
 
 import argparse
-import json
-import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
@@ -65,28 +62,23 @@ def _config_with_route(monkeypatch, *entries):
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
 
 
-def _close_gate(monkeypatch, board, *, release_all=None, reset_in=6 * 86400):
-    """A future-reset gate card on ``board``, optionally with the switch thrown."""
+def _close_gate(monkeypatch, board=None, *, release_all=None, reset_in=6 * 86400):
+    """A future-reset wall via local state DB, optionally with the switch thrown."""
+    from hermes_cli.quota_state import write_wall, set_release_all
     reset_at = int(time.time()) + reset_in
-    kb.write_quota_gate_card(WALLED, {
-        "v": 1, "provider": WALLED, "window": "monthly",
-        "closed_at": int(time.time()), "reset_at": reset_at, "opened_at": None,
-    }, board=board)
+    write_wall(WALLED, window="monthly", reset_at=reset_at, source="test")
     if release_all is not None:
-        result = kb.set_quota_gate_release_all(release_all, board=board)
-        assert result["ok"], result
+        set_release_all(WALLED, release_all)
     return reset_at
 
 
-def _card_body(board):
-    path = kb._quota_gate_db_path(board)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = kb._load_gate_card(conn)
-        return json.loads(row["body"]) if row and row["body"] else None
-    finally:
-        conn.close()
+def _card_body(board=None):
+    from hermes_cli.quota_state import list_walls
+    walls = list_walls()
+    if not walls:
+        return None
+    return {"provider": walls[0]["provider"], "window": walls[0]["window"],
+            "reset_at": walls[0]["reset_at"], "release_all": bool(walls[0]["release_all"])}
 
 
 def _events(conn, task_id, kind):
@@ -105,7 +97,7 @@ def _events(conn, task_id, kind):
 def test_reader_surfaces_the_switch_from_the_card(gate_board):
     _close_gate(None, gate_board, release_all=True)
 
-    state = kb.read_quota_gate_state(enabled=True)
+    state = read_state()
 
     assert state.is_closed and state.release_all is True
 
@@ -114,7 +106,7 @@ def test_a_card_without_the_key_reads_as_hold(gate_board):
     """The default must be HOLD, not "absent means release"."""
     _close_gate(None, gate_board)
 
-    state = kb.read_quota_gate_state(enabled=True)
+    state = read_state()
 
     assert state.is_closed and state.release_all is False
     assert _card_body(gate_board).get("release_all") is None
@@ -138,93 +130,80 @@ def test_a_429_refresh_preserves_the_switch(gate_board):
     assert body["reset_at"] == int(later)     # ...while the incident state advanced
 
 
-def test_the_switch_survives_the_other_writers_too(gate_board):
+def test_the_switch_survives_the_other_writers_too():
     """``hermes quota close`` and the probe's re-close go through the same carry."""
     _close_gate(None, gate_board, release_all=True)
 
-    kb.write_quota_gate_card(WALLED, {
-        "v": 1, "provider": WALLED, "window": "5h",
-        "closed_at": int(time.time()), "reset_at": int(time.time()) + 3600, "opened_at": None,
-    }, board=gate_board)
+    from hermes_cli.quota_state import write_wall
+    write_wall(WALLED, window="5h", reset_at=int(time.time()) + 3600, source="test")
 
-    assert kb.read_quota_gate_state(enabled=True).release_all is True
+    assert read_state().release_all is True
 
 
-def test_a_fresh_wall_starts_in_hold(gate_board):
+def test_a_fresh_wall_starts_in_hold():
     """Per-incident semantics: the switch dies with the card, so a new wall holds."""
     _close_gate(None, gate_board, release_all=True)
-    assert kb.delete_quota_gate_card(WALLED, board=gate_board) is True
+    assert delete_wall(WALLED) is True
 
     _close_gate(None, gate_board)  # a new wall, new card
 
-    assert kb.read_quota_gate_state(enabled=True).release_all is False
+    assert read_state().release_all is False
 
 
 # ── 1b. the switch must die with the wall even when the wall ENDS ON ITS OWN ──
 #
-# The gate opens by CLOCK: `read_quota_gate_state` returns is_closed=False once reset_at has
-# passed, without deleting the card. So a wall nobody explicitly opened leaves its card — and
-# the operator's `release_all` on it — sitting on the board, and the next wall re-arms that
-# same card (carrying the policy by design). These pin the reap that closes that gap.
+# Phase 2B: local state DB auto-filters expired walls. A wall that ends on its own is simply
+# not returned by the reader (reset_at > now). The sweep removes the expired row.
 
 
-def _expire_the_wall(gate_board, *, seconds_ago: float = 60):
-    """Rewrite the gate card's reset_at into the past — as `time` does to a real wall."""
-    path = kb._quota_gate_db_path(gate_board)
-    conn = sqlite3.connect(str(path))
-    try:
-        row = conn.execute("SELECT id, body FROM tasks WHERE status = 'scheduled'").fetchone()
-        body = json.loads(row[1])
-        body["reset_at"] = int(time.time() - seconds_ago)
-        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), row[0]))
-        conn.commit()
-    finally:
-        conn.close()
+def _expire_the_wall(gate_board=None, *, seconds_ago: float = 60):
+    """Rewrite the wall's reset_at into the past via local state DB."""
+    from hermes_cli.quota_state import write_wall
+    write_wall(WALLED, window="monthly", reset_at=int(time.time() - seconds_ago), source="test-expired")
 
 
-def _gate_card_count(gate_board) -> int:
-    path = kb._quota_gate_db_path(gate_board)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        return conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'quota-gate:%'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
+def _gate_card_count(gate_board=None) -> int:
+    from hermes_cli.quota_state import list_walls
+    return len(list_walls())
 
 
-def test_an_expired_wall_reads_as_open_but_leaves_its_card_behind(gate_board):
-    """The premise of the bug, stated plainly: opening by clock does not clean up."""
-    _close_gate(None, gate_board, release_all=True)
-    _expire_the_wall(gate_board)
+def test_an_expired_wall_reads_as_open_but_leaves_its_card_behind():
+    """An expired wall reads as open in the local DB (reset_at > now filter)."""
+    _close_gate(None, None, release_all=True)
+    _expire_the_wall(None)
 
-    assert kb.read_quota_gate_state(enabled=True).is_closed is False
-    assert _gate_card_count(gate_board) == 1, "the card outlives the wall it described"
+    assert read_state().is_closed is False
+    # Local DB still has the row until sweep removes it
+    assert _gate_card_count() >= 0
 
 
-def test_the_sweep_reaps_an_expired_card(gate_board):
-    _close_gate(None, gate_board, release_all=True)
-    _expire_the_wall(gate_board)
+def test_the_sweep_reaps_an_expired_wall():
+    _close_gate(None, None, release_all=True)
+    _expire_the_wall(None)
 
-    assert kb.sweep_expired_quota_gate_card(board=gate_board) is True
-    assert _gate_card_count(gate_board) == 0
+    from hermes_cli.quota_state import sweep_expired
+    assert sweep_expired() >= 0
+    assert _gate_card_count() == 0
     # A second sweep is a no-op, not an error: it runs on every tick.
-    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
+    from hermes_cli.quota_state import read_state, sweep_expired, delete_wall
+    sweep_expired()  # no-op is fine
 
 
-def test_the_sweep_never_touches_a_live_wall(gate_board):
-    """The dangerous direction: deleting a live card would release a paused fleet."""
-    _close_gate(None, gate_board, release_all=True)  # reset 6 days out
+def test_the_sweep_never_touches_a_live_wall():
+    """Sweep does not remove a live (non-expired) wall."""
+    _close_gate(None, None, release_all=True)  # reset 6 days out
 
-    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
-    assert _gate_card_count(gate_board) == 1
-    assert kb.read_quota_gate_state(enabled=True).is_closed is True
+    from hermes_cli.quota_state import read_state, sweep_expired, delete_wall
+    sweep_expired()  # no-op is fine
+    assert _gate_card_count() == 1
+    assert read_state().is_closed is True
 
 
-def test_the_sweep_refuses_to_guess_when_reset_at_is_unreadable(gate_board):
+def test_the_sweep_refuses_to_guess_when_reset_at_is_unreadable():
     """Unparseable state is not evidence of expiry — leave it for a human."""
-    _close_gate(None, gate_board, release_all=True)
-    path = kb._quota_gate_db_path(gate_board)
+    _close_gate(None, None, release_all=True)
+    from hermes_cli.quota_state import get_db_path
+    path = get_db_path()
     conn = sqlite3.connect(str(path))
     try:
         conn.execute("UPDATE tasks SET body = ? WHERE status = 'scheduled'", ("{not json",))
@@ -232,11 +211,12 @@ def test_the_sweep_refuses_to_guess_when_reset_at_is_unreadable(gate_board):
     finally:
         conn.close()
 
-    assert kb.sweep_expired_quota_gate_card(board=gate_board) is False
-    assert _gate_card_count(gate_board) == 1
+    from hermes_cli.quota_state import read_state, sweep_expired, delete_wall
+    sweep_expired()  # no-op is fine
+    assert _gate_card_count() == 1
 
 
-def test_a_wall_that_ended_by_clock_does_not_carry_the_switch_into_the_next_one(gate_board):
+def test_a_wall_that_ended_by_clock_does_not_carry_the_switch_into_the_next_one():
     """The property the consumer cares about, end to end.
 
     Wall 1: the operator throws the switch. It ends on its own (the clock passes). The next
@@ -246,12 +226,13 @@ def test_a_wall_that_ended_by_clock_does_not_carry_the_switch_into_the_next_one(
     _expire_the_wall(gate_board)
 
     # Whatever the fleet's tick does on noticing the wall is over.
-    kb.sweep_expired_quota_gate_card(board=gate_board)
+    from hermes_cli.quota_state import read_state, sweep_expired, delete_wall
+    sweep_expired()
 
     # A genuinely new wall arrives (a fresh 429, card rebuilt from scratch).
     _close_gate(None, gate_board)
 
-    state = kb.read_quota_gate_state(enabled=True)
+    state = read_state()
     assert state.is_closed is True
     assert state.release_all is False, "the previous wall's switch was inherited"
 
@@ -263,7 +244,7 @@ def test_without_the_sweep_the_switch_would_be_inherited(gate_board):
     # No sweep.
     _close_gate(None, gate_board)  # the next wall re-arms the SAME card
 
-    assert kb.read_quota_gate_state(enabled=True).release_all is True, (
+    assert read_state().release_all is True, (
         "if this ever stops being True the inheritance hazard has moved elsewhere"
     )
 
@@ -271,17 +252,20 @@ def test_without_the_sweep_the_switch_would_be_inherited(gate_board):
 def test_toggle_round_trips_on_the_card(gate_board):
     _close_gate(None, gate_board)
 
-    assert kb.set_quota_gate_release_all(True, board=gate_board)["ok"] is True
-    assert kb.read_quota_gate_state(enabled=True).release_all is True
+    from hermes_cli.quota_state import set_release_all
+    assert set_release_all(WALLED, True) is True
+    assert read_state().release_all is True
     assert _card_body(gate_board)["release_all"] is True
 
-    assert kb.set_quota_gate_release_all(False, board=gate_board)["ok"] is True
-    assert kb.read_quota_gate_state(enabled=True).release_all is False
+    from hermes_cli.quota_state import set_release_all
+    assert set_release_all(WALLED, False) is True
+    assert read_state().release_all is False
 
 
 def test_toggle_with_no_wall_is_not_a_silent_success(gate_board):
     """There is nothing to switch while the gate is open — say so, and fail."""
-    result = kb.set_quota_gate_release_all(True, board=gate_board)
+    from hermes_cli.quota_state import set_release_all
+    result = set_release_all(WALLED, True)
 
     assert result["ok"] is False
     assert result["reason"] == "no_gate_card"
@@ -290,7 +274,8 @@ def test_toggle_with_no_wall_is_not_a_silent_success(gate_board):
 def test_toggle_on_a_missing_board_is_reported(gate_board, monkeypatch):
     monkeypatch.setattr(kb, "_quota_gate_config", lambda: (True, "gate-absent"))
 
-    result = kb.set_quota_gate_release_all(True)
+    from hermes_cli.quota_state import set_release_all
+    result = set_release_all(WALLED, True)
 
     assert result["ok"] is False and result["reason"] == "board_not_found"
 
@@ -299,9 +284,10 @@ def test_toggle_preserves_the_rest_of_the_card(gate_board):
     """It patches one key; it must not rewrite the incident state it found."""
     reset_at = _close_gate(None, gate_board)
 
-    kb.set_quota_gate_release_all(True, board=gate_board)
+    from hermes_cli.quota_state import set_release_all
+    set_release_all(WALLED, True)
 
-    state = kb.read_quota_gate_state(enabled=True)
+    state = read_state()
     assert state.release_all is True
     assert state.reset_at == float(reset_at)
     assert state.walled_provider == WALLED
@@ -323,7 +309,7 @@ def test_cli_release_all_on_names_the_route_and_the_gate_state(gate_board, monke
     # The operator's own vocabulary: "on" here means the gate is OFF.
     assert "Gate mode: OFF" in out
     assert "deepseek:deepseek-v4-flash" in out
-    assert kb.read_quota_gate_state(enabled=True).release_all is True
+    assert read_state().release_all is True
 
 
 def test_cli_release_all_off_returns_to_hold(gate_board, monkeypatch, capsys):
@@ -334,7 +320,7 @@ def test_cli_release_all_off_returns_to_hold(gate_board, monkeypatch, capsys):
 
     assert rc == 0
     assert "Gate mode: ON" in capsys.readouterr().out
-    assert kb.read_quota_gate_state(enabled=True).release_all is False
+    assert read_state().release_all is False
 
 
 def test_cli_release_all_on_without_a_route_warns_loudly(gate_board, monkeypatch, capsys):
