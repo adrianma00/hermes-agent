@@ -59,7 +59,12 @@ into the next wall by ``_carry_gate_policy``. A peer DM against the NEW wall wou
 to the fallback on the strength of a switch thrown against the OLD one (exactly what the switch's
 placement on the incident card exists to prevent). The two dispatched sources reap an expired card
 before trusting it; the peer reader must do the same, or it is the one reader through which the
-inheritance still reaches a turn. 
+inheritance still reaches a turn.
+
+Phase 2A/B: all readers now use the local state DB (quota_state.db).  Expired walls are
+automatically filtered by the reader (``reset_at > now``), so no reap is needed and the
+``release_all`` inheritance problem is gone by construction.  The board card machinery and
+all sweep/reap functions have been removed from the codebase.
 """
 
 from __future__ import annotations
@@ -168,7 +173,7 @@ def gate_state():
     except Exception:
         logger.debug("api_server quota gate: kanban gate reader unavailable — not gating", exc_info=True)
         return None
-try:
+    try:
         state = read_quota_gate_state(quota_gate_fallback_chain() or [])
     except Exception:
         # A read that RAISES is a broken reader, not a closed gate: an install whose gate

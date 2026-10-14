@@ -14,9 +14,8 @@ def build_quota_parser(subparsers, *, cmd_quota: Callable) -> None:
             "The provider-quota gate holds queued kanban work, due cron jobs and inbound "
             "peer DMs while the "
             "primary model's subscription window is exhausted, instead of spawning "
-            "workers that bounce off the same 429. State lives in one "
-            "'quota-gate:<provider>' card on the shared board, so every profile in the "
-            "fleet reads the same gate. `release-all on` is the operator's switch to stop "
+            "workers that bounce off the same 429. State lives in a local SQLite DB "
+            "(quota_state.db) per install. `release-all on` is the operator's switch to stop "
             "holding them and route each to the fallback instead."
         ),
     )
