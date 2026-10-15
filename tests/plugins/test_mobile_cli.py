@@ -95,6 +95,33 @@ class TestCollectState:
         assert state.label == "Em"
         assert state.field("label").source == "--label"
 
+    def test_label_prefers_kanban_namespace_over_shared_tailscale_hostname(self):
+        """Co-located installs share a tailscale hostname, so the namespace must win."""
+        tailnet = {"Self": {"HostName": "antigravity", "DNSName": "antigravity.ts.net.",
+                            "TailscaleIPs": ["100.64.0.5"]},
+                   "CurrentTailnet": {"MagicDNSEnabled": True}}
+        state = pairing.collect_state(config=_config(kanban={"namespace": "yummi"}),
+                                      tailnet=tailnet, use_tailscale=True)
+        assert state.label == "yummi"
+        assert state.field("label").source == "config.yaml (kanban.namespace)"
+
+        # --label still outranks the namespace
+        state = pairing.collect_state(config=_config(kanban={"namespace": "yummi"}),
+                                      tailnet=tailnet, label_override="Em", use_tailscale=True)
+        assert state.label == "Em"
+        assert state.field("label").source == "--label"
+
+        # absent or blank namespace falls through to the hostname
+        state = pairing.collect_state(config=_config(), tailnet=tailnet, use_tailscale=True)
+        assert state.label == "antigravity"
+        state = pairing.collect_state(config=_config(kanban={"namespace": "   "}),
+                                      tailnet=tailnet, use_tailscale=True)
+        assert state.label == "antigravity"
+        # non-string namespace must not crash or name the connection "None"
+        state = pairing.collect_state(config=_config(kanban={"namespace": None}),
+                                      tailnet=tailnet, use_tailscale=True)
+        assert state.label == "antigravity"
+
     def test_magicdns_alternative_offered_only_when_enabled(self):
         enabled = {"Self": {"HostName": "h", "DNSName": "h.ts.net.", "TailscaleIPs": ["100.64.0.5"]},
                    "CurrentTailnet": {"MagicDNSEnabled": True}}

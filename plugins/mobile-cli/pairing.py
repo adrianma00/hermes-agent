@@ -441,8 +441,18 @@ def collect_state(
             "the app will ask for it once, or use --dash-pass-stdin")
 
     # --- label -----------------------------------------------------------
+    # Precedence: --label > kanban.namespace > tailscale hostname > local username.
+    # ``kanban.namespace`` names the HOME, which is the granularity the client connects
+    # to (one listener fronts every profile in a home), and it is already distinct per
+    # install. The tailscale hostname is SHARED by co-located installs, so preferring it
+    # would give two connections on one host the same name.
     resolved_label = label_override
     label_source = "--label"
+    if not resolved_label:
+        namespace = _dig(cfg, "kanban", "namespace")
+        if isinstance(namespace, str) and namespace.strip():
+            resolved_label = namespace.strip()
+            label_source = "config.yaml (kanban.namespace)"
     if not resolved_label:
         hostname = _dig(tailnet, "Self", "HostName")
         resolved_label = hostname or (Path.home().name if Path.home().name else None)
