@@ -99,26 +99,65 @@ def hermes_home() -> Path:
     return Path(env) if env else Path.home() / ".hermes"
 
 
-def load_config_yaml(path: Optional[Path] = None) -> Dict[str, Any]:
-    """Read ``config.yaml`` as a plain dict; never raise on a broken/absent file."""
-    target = path or (hermes_home() / "config.yaml")
+def _yaml_safe_load():
+    """Return a ``safe_load(text)`` callable from whatever YAML this install ships, or ``None``.
+
+    The Hermes runtime python does NOT necessarily carry PyYAML: the install vendors its own
+    ``hermes_yaml`` and ``hermes_cli.config`` imports it under that alias. Resolving PyYAML
+    alone therefore makes the config read environment-dependent, and the failure is silent —
+    which is how a payload gets a dashboard URL inferred from an unrelated serve handler.
+    """
     try:
         import yaml  # type: ignore
-    except Exception:  # pragma: no cover - environment without PyYAML
-        try:
-            from hermes_cli import config as _cfg  # type: ignore
 
-            loader = getattr(_cfg, "_load_yaml", None)
-            if loader is None:
-                return {}
-            return loader(target.read_text(encoding="utf-8")) or {}
-        except Exception:
-            return {}
-    try:
-        data = yaml.safe_load(target.read_text(encoding="utf-8"))
+        return yaml.safe_load
     except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        pass
+    try:
+        import hermes_yaml  # type: ignore  # the install's vendored YAML
+
+        return hermes_yaml.safe_load
+    except Exception:
+        pass
+    try:
+        from hermes_cli import config as _cfg  # type: ignore
+
+        module = getattr(_cfg, "yaml", None)
+        if module is not None and hasattr(module, "safe_load"):
+            return module.safe_load
+        legacy = getattr(_cfg, "_load_yaml", None)
+        if legacy is not None:
+            return lambda text: legacy(text) or {}
+    except Exception:
+        pass
+    return None
+
+
+def load_config_yaml_with_reason(path: Optional[Path] = None) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Read ``config.yaml`` as ``(data, error)``; never raise.
+
+    The reason is returned explicitly rather than folded into an empty dict: an unreadable
+    config must be REPORTED, not rendered as "the config does not set these keys". Those two
+    states call for different operator action and only one of them is safe to scan.
+    """
+    target = path or (hermes_home() / "config.yaml")
+    if not target.exists():
+        return {}, f"config.yaml not found at {target}"
+    loader = _yaml_safe_load()
+    if loader is None:
+        return {}, "no YAML loader available (neither PyYAML nor the install's hermes_yaml)"
+    try:
+        data = loader(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {}, f"config.yaml did not parse ({type(exc).__name__})"
+    if not isinstance(data, dict):
+        return {}, "config.yaml did not contain a mapping"
+    return data, None
+
+
+def load_config_yaml(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read ``config.yaml`` as a plain dict; never raise on a broken/absent file."""
+    return load_config_yaml_with_reason(path)[0]
 
 
 def _dig(data: Any, *keys: str) -> Any:
@@ -345,7 +384,16 @@ def collect_state(
 ) -> MobileState:
     """Gather the pairing fields, recording the source (or the reason) for each."""
     state = MobileState()
-    cfg = config if config is not None else load_config_yaml()
+    if config is not None:
+        cfg, cfg_error = config, None
+    else:
+        cfg, cfg_error = load_config_yaml_with_reason()
+    if cfg_error:
+        # Loud on purpose: an unreadable config silently yields "the config does not set
+        # these", which is a DIFFERENT claim and produces a payload built from guesses.
+        state.warnings.append(
+            f"could not read config.yaml ({cfg_error}) — config-derived values below are "
+            "inferred from other sources and may be WRONG; verify before scanning")
 
     if use_tailscale:
         tailnet = tailnet if tailnet is not None else _tailscale_json()

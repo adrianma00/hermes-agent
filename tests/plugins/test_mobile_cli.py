@@ -228,3 +228,46 @@ class TestReportSafety:
             "dash_user": state.dashboard_user, "token": "present",
         })
         assert "dash_pass" not in blob
+
+
+class TestConfigReadReporting:
+    """An unreadable config must be LOUD: it is not the same claim as "not set here"."""
+
+    def test_missing_config_reports_a_reason(self, tmp_path):
+        data, reason = pairing.load_config_yaml_with_reason(tmp_path / "absent.yaml")
+        assert data == {}
+        assert reason and "not found" in reason
+
+    def test_no_loader_is_a_reason_not_an_empty_dict(self, tmp_path, monkeypatch):
+        target = tmp_path / "config.yaml"
+        target.write_text("platforms: {}\n", encoding="utf-8")
+        monkeypatch.setattr(pairing, "_yaml_safe_load", lambda: None)
+        data, reason = pairing.load_config_yaml_with_reason(target)
+        assert data == {}
+        assert reason and "no YAML loader" in reason
+
+    def test_unreadable_config_surfaces_as_a_warning_with_guesses_flagged(
+            self, tmp_path, monkeypatch):
+        """The Heimdall case: config present and readable, but no loader resolved."""
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n  api_server:\n    extra:\n      port: 8642\n", encoding="utf-8")
+        monkeypatch.setattr(pairing, "hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(pairing, "_yaml_safe_load", lambda: None)
+        state = pairing.collect_state(use_tailscale=False)
+        assert any("could not read config.yaml" in w for w in state.warnings)
+        assert any("may be WRONG" in w for w in state.warnings)
+        # and the config-derived fields really are missing, which is what makes it a guess
+        assert state.dashboard_user is None
+
+    def test_a_readable_config_reports_no_such_warning(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n  api_server:\n    extra:\n      host: 100.64.0.5\n      port: 8642\n"
+            "dashboard:\n  basic_auth:\n    username: ama\n", encoding="utf-8")
+        monkeypatch.setattr(pairing, "hermes_home", lambda: tmp_path)
+        state = pairing.collect_state(use_tailscale=False)
+        assert not any("could not read config.yaml" in w for w in state.warnings)
+        assert state.dashboard_user == "ama"
+        assert state.chat_port == 8642
+
+    def test_loader_resolves_in_this_environment(self):
+        assert pairing._yaml_safe_load() is not None
