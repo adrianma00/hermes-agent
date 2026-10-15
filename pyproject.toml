@@ -596,9 +596,9 @@ opt-in-extras = ["kittentts", "matrix-e2ee"]
 # single-authority for WHICH extra is supported WHERE.
 
 [tool.hermes.extras-platforms]
-# [matrix] stays Linux-only: platform policy is unchanged by moving the E2EE
-# closure out (the archived-libolm reason now sits on [matrix-e2ee] below).
-# Relaxing the [matrix] gate to win/darwin is a separate decision.
+# [matrix] is Linux + macOS: every non-E2EE pin resolves on both, so this gate
+# follows the engine markers above. [matrix-e2ee] stays Linux-only and carries
+# the archived-libolm reason on its own line below.
 matrix = "sys_platform == 'linux' or sys_platform == 'darwin'"
 # mautrix[encryption] → python-olm: linux-only wheels, no win/darwin build.
 matrix-e2ee = "sys_platform == 'linux'"
