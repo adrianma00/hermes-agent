@@ -1,8 +1,9 @@
 """Render a QR code to the terminal without any Python QR dependency.
 
-The module matrix comes from ``qrencode`` (CLI) when installed, else from
-``libqrencode`` through ctypes — the library alone is enough, which matters on
-boxes that ship the .so without the binary.
+The module matrix comes from ``libqrencode`` through ctypes. There is NO CLI path, so
+the shared library — not the ``qrencode`` binary — is what has to be present, and on a
+Homebrew install it lands in a prefix the dynamic loader does not search by default, so
+it is resolved by explicit path as well as by name.
 
 Drawing rules that keep it scannable:
 
@@ -19,10 +20,28 @@ Drawing rules that keep it scannable:
 from __future__ import annotations
 
 import ctypes
+import os
 import shutil
 from typing import List, Optional, Sequence
 
 _LIB_NAMES = ("libqrencode.so.4", "libqrencode.so", "libqrencode.dylib", "libqrencode.4.dylib")
+
+# Directories a package manager installs into but that the dynamic loader does NOT search for a
+# plain process. macOS is the case that bites: Homebrew's prefix (/opt/homebrew on arm64) is not on
+# dyld's fallback path, so a bare-name load fails on a box where `brew install qrencode` succeeded
+# and the library is sitting right there. The .so is the real file on Debian-family systems while
+# `libqrencode.so` is usually the -dev symlink, so the versioned name is tried first.
+_LIB_DIRS = (
+    "/opt/homebrew/lib",                 # Homebrew (Apple Silicon)
+    "/usr/local/lib",                    # Homebrew (Intel), other local prefixes
+    "/opt/local/lib",                    # MacPorts
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib/arm-linux-gnueabihf",
+    "/lib",
+)
 _ECL = {"L": 0, "M": 1, "Q": 2, "H": 3}
 # QR_MODE_8 == 2. (4 is QR_MODE_STRUCTURE, which makes libqrencode return NULL.)
 _MODE_8BIT = 2
@@ -37,10 +56,46 @@ class QRError(RuntimeError):
     """No renderer could produce a matrix."""
 
 
+def _candidate_paths() -> List[str]:
+    """Explicit paths to try, in order: known lib dirs, then whatever the env advertises."""
+    dirs = list(_LIB_DIRS)
+    for var in ("DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+        dirs += [p for p in (os.environ.get(var) or "").split(os.pathsep) if p]
+    return [os.path.join(d, n) for d in dirs for n in _LIB_NAMES]
+
+
+def _find_library_by_convention() -> Optional[str]:
+    """What the platform's own lookup finds (dyld/ldconfig conventions). May be unavailable."""
+    try:
+        from ctypes.util import find_library
+
+        return find_library("qrencode")
+    except Exception:
+        return None
+
+
 def _load_library() -> Optional[ctypes.CDLL]:
+    """Load libqrencode — by name first, then by explicit path.
+
+    By name is right when the library is on the loader's search path; the explicit paths are what
+    make it work when it is NOT, which is the normal state on macOS with Homebrew.
+    """
     for name in _LIB_NAMES:
         try:
             return ctypes.CDLL(name)
+        except OSError:
+            continue
+    found = _find_library_by_convention()
+    if found:
+        try:
+            return ctypes.CDLL(found)
+        except OSError:
+            pass
+    for path in _candidate_paths():
+        if not os.path.exists(path):
+            continue
+        try:
+            return ctypes.CDLL(path)
         except OSError:
             continue
     return None

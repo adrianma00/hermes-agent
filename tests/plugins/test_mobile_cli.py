@@ -212,6 +212,65 @@ class TestQrRendering:
             qrterm.render(SAMPLE_URI)
 
 
+class TestLibrarySearchPath:
+    """libqrencode installed by a package manager must be found even when the dynamic loader
+    would not search its directory — which is the normal state on macOS with Homebrew."""
+
+    def test_homebrew_prefixes_are_searched(self):
+        paths = qrterm._candidate_paths()
+        # /opt/homebrew is Apple-Silicon Homebrew; dyld does not search it for a plain process.
+        assert "/opt/homebrew/lib/libqrencode.4.dylib" in paths
+        assert "/opt/homebrew/lib/libqrencode.dylib" in paths
+        assert "/usr/local/lib/libqrencode.dylib" in paths  # Intel Homebrew
+        assert "/opt/local/lib/libqrencode.dylib" in paths  # MacPorts
+
+    def test_debian_multiarch_dirs_are_searched(self):
+        paths = qrterm._candidate_paths()
+        assert "/usr/lib/x86_64-linux-gnu/libqrencode.so.4" in paths
+        assert "/usr/lib/aarch64-linux-gnu/libqrencode.so.4" in paths
+
+    def test_env_advertised_dirs_are_searched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path))
+        assert str(tmp_path / "libqrencode.so.4") in qrterm._candidate_paths()
+        monkeypatch.delenv("LD_LIBRARY_PATH")
+        monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", str(tmp_path))
+        assert str(tmp_path / "libqrencode.dylib") in qrterm._candidate_paths()
+
+    def test_macos_naming_resolves_from_a_non_searchable_dir(self, tmp_path, monkeypatch):
+        """Witnesses the macOS path without a Mac: same code, `libqrencode.4.dylib` naming, in a
+        directory the loader would never search, with name-loading and the platform convention
+        both disabled. This is the shape the Mac was failing in."""
+        source = next((Path(p) for p in qrterm._candidate_paths() if Path(p).exists()), None)
+        if source is None:
+            pytest.skip("no libqrencode on this box to point at")
+            return
+        target = tmp_path / "libqrencode.4.dylib"
+        target.write_bytes(source.read_bytes())
+
+        monkeypatch.setattr(qrterm, "_LIB_NAMES", ("libqrencode.4.dylib",))
+        monkeypatch.setattr(qrterm, "_LIB_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(qrterm, "_find_library_by_convention", lambda: None)
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+        monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+
+        assert qrterm._load_library() is not None
+        # usable, not merely loaded: the fallback must produce a real matrix
+        matrix = qrterm._matrix_via_libqrencode(SAMPLE_URI)
+        assert matrix and matrix[0][0] is True
+
+    def test_returns_none_instead_of_raising_when_nothing_matches(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(qrterm, "_LIB_NAMES", ("libqrencode-does-not-exist.so",))
+        monkeypatch.setattr(qrterm, "_LIB_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(qrterm, "_find_library_by_convention", lambda: None)
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+        monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+        assert qrterm._load_library() is None
+
+    def test_this_environment_still_resolves_a_library(self):
+        assert qrterm._load_library() is not None, "no libqrencode available in this environment"
+
+
 class TestReportSafety:
     def test_report_never_contains_the_key(self):
         state = pairing.collect_state(config=_config(), use_tailscale=False)
