@@ -157,6 +157,24 @@ class TestConfigYamlRouting:
         )
         assert "not a recognized config key" not in capsys.readouterr().out
 
+    def test_kanban_namespace_is_recognized(self, _isolated_hermes_home, capsys):
+        """``kanban.namespace`` is read by ``kanban_db_dispatch.install_namespaces``, so it must
+        be a registered config key — the dispatcher's own remedy for ``install_namespace_unresolved``
+        tells the operator to set it, and the CLI answered that instruction with "not a recognized
+        config key ... Hermes may not read it". That is false, and it reads as evidence the key is
+        inert, which is how a correct fix gets skipped.
+        """
+        set_config_value("kanban.namespace", "heimdall")
+
+        captured = capsys.readouterr()
+        assert "not a recognized config key" not in captured.out
+        assert "not a recognized config key" not in captured.err
+
+        import hermes_yaml as yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["kanban"]["namespace"] == "heimdall"
+
 
 
 # ---------------------------------------------------------------------------

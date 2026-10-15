@@ -1910,6 +1910,17 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # This install's kanban namespace: the identity a bare assignee resolves within, and what
+        # the dispatcher needs to prove a task belongs to THIS install
+        # (kanban_db_dispatch.install_namespaces: HERMES_KANBAN_NAMESPACE -> this key -> the OS
+        # user). Comma-separated = accepted aliases, first token canonical. "" keeps the OS-user
+        # fallback, which is the identity the install is already implicit under — deliberately NOT
+        # the hostname, since two installs can share one host. FORK-LOCAL: upstream has no
+        # namespace concept in kanban. Registering it here is what makes the CLI agree that the
+        # dispatcher really does read it; unregistered, `hermes config set kanban.namespace`
+        # warns "not a recognized config key ... Hermes may not read it", which is false and
+        # reads as evidence the key is inert (it is not — see bot_rules/core.md R34).
+        "namespace": "",
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,

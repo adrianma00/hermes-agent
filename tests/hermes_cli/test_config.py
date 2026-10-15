@@ -1884,6 +1884,10 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     # From the second block:
     assert "dispatch_in_gateway" in kanban
     assert "auto_decompose" in kanban
+    # Fork-local: read by kanban_db_dispatch.install_namespaces for assignee resolution, so it
+    # must stay a registered key. Unregistered, `config set kanban.namespace` warned that Hermes
+    # "may not read it", which is false and made the key look inert.
+    assert kanban["namespace"] == ""
 
 
 def test_default_config_has_no_duplicate_top_level_keys():
