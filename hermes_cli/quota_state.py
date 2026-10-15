@@ -117,10 +117,32 @@ def _connect() -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     _ensure_schema(conn)
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection, attempts: int = 50, delay: float = 0.01) -> None:
+    """Switch the connection's database to WAL, tolerating a benign race.
+
+    WAL is a persistent DB property, so this is only a real mode change on the
+    first creation — but a bare ``PRAGMA journal_mode=WAL`` needs a brief
+    exclusive lock and returns ``SQLITE_BUSY`` *immediately* (it does not honour
+    the busy handler) when another connection holds the database.  That happens
+    whenever the gateway, a worker and the CLI open the DB together, and it made
+    ``write_wall`` raise ``OperationalError('database is locked')`` out of
+    ``_connect``.  Retry a bounded number of times before giving up.
+    """
+    for attempt in range(attempts):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
