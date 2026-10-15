@@ -404,6 +404,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/model/options", adapter._handle_model_options)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
+    app.router.add_get("/v1/plugins", adapter._handle_plugins)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -998,6 +999,39 @@ class TestSkillsEndpoint:
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
+
+
+class TestPluginsEndpoint:
+    @pytest.mark.asyncio
+    async def test_plugins_returns_list_envelope(self, adapter):
+        fake_plugins = [
+            {"name": "kanban", "key": "tools/kanban", "kind": "tool", "version": "1.0.0",
+             "description": "Kanban board", "source": "bundled", "enabled": True,
+             "tools": 3, "hooks": 1, "middleware": 0, "commands": 2, "error": None},
+        ]
+        with patch(
+            "hermes_cli.plugins.get_plugin_manager",
+        ) as manager:
+            manager.return_value.list_plugins.return_value = list(fake_plugins)
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/plugins")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "list"
+                assert data["platform"] == "api_server"
+                assert [entry["key"] for entry in data["data"]] == ["tools/kanban"]
+
+    @pytest.mark.asyncio
+    async def test_plugins_enumeration_failure_is_a_500(self, adapter):
+        with patch(
+            "hermes_cli.plugins.get_plugin_manager",
+            side_effect=RuntimeError("registry unavailable"),
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/plugins")
+                assert resp.status == 500
 
 
 class TestToolsetsEndpoint:

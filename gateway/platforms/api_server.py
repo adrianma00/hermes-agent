@@ -86,6 +86,7 @@ _CAPABILITY_ENDPOINTS = (
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
+    ("plugins", ("GET", "/v1/plugins")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
     ("session", ("GET", "/api/sessions/{session_id}")),
@@ -1760,6 +1761,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
+            ("GET", "/v1/plugins", self._handle_plugins),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
@@ -2957,13 +2959,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             from tools.skills_tool import _find_all_skills, _sort_skills
             skills = _sort_skills(
                 _find_all_skills(
-                    skip_disabled=False, include_editorial=True
+                    skip_disabled=False
                 )
             )
         except Exception:
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
+
+    @_require_auth
+    async def _handle_plugins(self, request: "web.Request") -> "web.Response":
+        """GET /v1/plugins — deterministic listing of the plugins Hermes has discovered
+        (name, key, kind, version, source, enabled state and registered surface counts),
+        read straight from the plugin manager's own registry."""
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            plugins = get_plugin_manager().list_plugins()
+        except Exception:
+            logger.exception("GET /v1/plugins failed")
+            return _error_response("Failed to enumerate plugins", 500, err_type="server_error")
+        return web.json_response({"object": "list", "platform": "api_server", "data": plugins})
 
     @_require_auth
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
