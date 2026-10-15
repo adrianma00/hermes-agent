@@ -222,18 +222,40 @@ def write_wall(
     reset_at: float,
     closed_at: Optional[float] = None,
     source: str = "first-429",
-    release_all: bool = False,
+    release_all: Optional[bool] = None,
 ) -> None:
     """Record or update a wall for *provider*.
 
     Uses ``INSERT OR REPLACE`` so a new wall for the same provider overwrites
     the previous one.  Only the latest ``reset_at`` matters.
+
+    ``release_all`` defaults to ``None``, which means *carry the operator's
+    switch through a refresh*: when a still-live wall is rewritten (a 429
+    re-close, ``hermes quota close``, a probe), the flag already on file for the
+    provider is preserved, so the operator's decision survives the writers that
+    rebuild the wall.  A genuinely NEW wall — no row on file, or an
+    already-expired one — always starts in HOLD, which is the property the
+    switch's placement on the wall exists to guarantee: it dies with the wall
+    rather than governing a later one against a different reset distance.  Pass
+    an explicit ``True``/``False`` to force the flag.
     """
     conn = None
     try:
         conn = _connect()
         with conn:
             conn.execute("BEGIN IMMEDIATE")
+            if release_all is None:
+                existing = conn.execute(
+                    "SELECT reset_at, release_all FROM wall_state WHERE provider = ?",
+                    (provider,),
+                ).fetchone()
+                # Carry only off a wall that is still in force.  Once the reset
+                # has passed the row describes a wall that ENDED; a subsequent
+                # write is a new incident and must not inherit its switch.
+                if existing is not None and float(existing["reset_at"]) > time.time():
+                    release_all = bool(existing["release_all"])
+                else:
+                    release_all = False
             conn.execute(
                 """INSERT OR REPLACE INTO wall_state
                    (provider, window, reset_at, closed_at, source, release_all)

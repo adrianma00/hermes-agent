@@ -239,6 +239,64 @@ def test_release_all_is_false_without_any_wall(enabled: bool) -> None:
     assert read_state().release_all is False
 
 
+# ── release_all survives a refresh, dies with the wall ──────────────────
+
+
+def test_write_wall_carries_release_all_through_a_live_refresh() -> None:
+    """A 429 re-close / ``quota close`` rewrites the wall, not the operator's switch.
+
+    The writer rebuilds no body: a still-live wall refreshes its ``reset_at`` while the
+    ``release_all`` on file is preserved, so the operator's decision survives the writers
+    that re-close the gate.
+    """
+    now = time.time()
+    write_wall("p", reset_at=now + 3600)
+    set_release_all("p", True)
+
+    write_wall("p", reset_at=now + 7200, window="monthly")  # a refresh
+
+    assert read_state().release_all is True
+    assert read_state().reset_at == pytest.approx(now + 7200)
+
+
+def test_write_wall_resets_release_all_for_a_new_wall() -> None:
+    """A wall that ENDED does not carry its switch into the next one.
+
+    The expired row is still on file (nothing sweeps it on a tick), so the writer must
+    treat the rewrite as a new incident and start it in HOLD.
+    """
+    now = time.time()
+    write_wall("p", reset_at=now - 10)  # already expired
+    set_release_all("p", True)
+    assert read_state().release_all is False  # the expired wall governs nothing
+
+    write_wall("p", reset_at=now + 3600)  # a genuinely new wall
+
+    assert read_state().release_all is False
+
+
+def test_write_wall_explicit_flag_overrides_the_carry() -> None:
+    write_wall("p", reset_at=time.time() + 3600)
+    set_release_all("p", True)
+
+    write_wall("p", reset_at=time.time() + 7200, release_all=False)
+
+    assert read_state().release_all is False
+
+
+def test_write_wall_carry_is_per_provider() -> None:
+    now = time.time()
+    write_wall("p", reset_at=now + 3600)
+    write_wall("q", reset_at=now + 3600)
+    set_release_all("p", True)
+
+    write_wall("q", reset_at=now + 7200)  # refresh q only
+
+    assert read_state().release_all is True  # p still released
+    walls = {w["provider"]: w for w in list_walls()}
+    assert walls["q"]["release_all"] == 0
+
+
 # ── Fallback chain ──────────────────────────────────────────────────────
 
 
