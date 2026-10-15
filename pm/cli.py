@@ -22,9 +22,48 @@ from pm.update import Resolved, resolve_package, reuse_index_responses
 
 def cmd_lock(args) -> int:
     """No arguments: relock uv.lock from pyproject.toml. --bump: pin a tool in pm/lock.json."""
-    if args.name is None:
-        return _relock_project(repo_root())
-    return _pin_tool(args)
+    if args.name is not None:
+        return _pin_tool(args)
+    root = _lock_subject(args)
+    if root is None:
+        return 1
+    return _relock_project(root)
+
+
+def _lock_subject(args) -> Path | None:
+    """The tree `pm lock` inspects: `--source`, else the tree this code runs from.
+
+    The subject has to be nameable. `repo_root()` is the tree the RUNNING code
+    was loaded from, so an install's `hermes pm lock` inspects the install even
+    when the caller stands in a dev worktree. The verdict is then true, but
+    about a tree the caller never named — and it reads exactly like a verdict
+    about theirs. `--source` is the same argument `pm.build_env` takes.
+    """
+    source = getattr(args, "source", None)
+    if source is None:
+        return repo_root()
+    root = Path(source).expanduser()
+    if not (root / "pyproject.toml").is_file():
+        print(f"✗ --source {root} is not a project tree: no pyproject.toml there", flush=True)
+        return None
+    return root
+
+
+def _note_other_project_tree(root: Path) -> None:
+    """Say so when the caller stands in a DIFFERENT project tree.
+
+    Silence is the rest of the trap: the verdict that follows is about `root`,
+    and a caller sitting in another checkout has nothing to tell them that.
+    """
+    try:
+        cwd = Path.cwd()
+    except OSError:  # cwd deleted out from under us
+        return
+    if cwd.resolve() == root.resolve():
+        return
+    if not (cwd / "pyproject.toml").is_file():
+        return
+    print(f"note: {cwd} is a different project tree; --source . targets it", flush=True)
 
 
 def _relock_project(root: Path) -> int:
@@ -35,19 +74,23 @@ def _relock_project(root: Path) -> int:
     cannot drift between the two entry points. No environment changes here:
     activation owns syncing, and a relock that also installed would hide
     which of the two failed.
+
+    Every verdict names `root`: a verdict about a tree the caller did not name
+    is unreadable, since it looks like a verdict about the tree they are in.
     """
     import pm
 
-    print("→ Checking uv.lock…", flush=True)
+    print(f"→ Checking uv.lock… ({root})", flush=True)
+    _note_other_project_tree(root)
     try:
         # Quiet: stale is the expected case here, so uv's failure tail would
         # read like an error. An unreachable index fails the relock below too,
         # and that error names the index knobs.
         pm.check_project_lock(root, explicit=True, quiet=True)
     except InstallError:
-        print("uv.lock is out of date with pyproject.toml; relocking", flush=True)
+        print(f"uv.lock is out of date with pyproject.toml; relocking {root}", flush=True)
     else:
-        print("✓ uv.lock is already current with pyproject.toml; nothing written")
+        print(f"✓ uv.lock is already current with pyproject.toml (checked {root}); nothing written")
         return 0
     before = _locked_extras(root)
     try:
@@ -785,11 +828,16 @@ def main(argv=None) -> int:
     lock_parser = p = sub.add_parser(
         "lock", help="relock uv.lock from pyproject.toml (or --bump a tool pin in pm/lock.json)",
         description="With no arguments: re-resolve uv.lock from pyproject.toml; changes no "
-                    "environment and writes nothing when the lock is current. With --bump NAME "
+                    "environment and writes nothing when the lock is current. The tree it "
+                    "inspects is the one this hermes was loaded from unless --source names "
+                    "another, and every verdict names the tree it inspected. With --bump NAME "
                     "VERSION: pin a pm tool's artifacts in pm/lock.json; uv.lock is untouched.")
     p.add_argument("--bump", dest="name", metavar="NAME",
                    help="pin tool NAME at VERSION in pm/lock.json instead of relocking uv.lock")
     p.add_argument("version", nargs="?", metavar="VERSION", help="the tool version (only with --bump)")
+    p.add_argument("--source", metavar="PATH", default=None,
+                   help="the project tree to relock (default: the tree this hermes runs from); the "
+                        "same argument `python -m pm.build_env --source` takes")
     p.set_defaults(func=cmd_lock)
 
     p = sub.add_parser("install", help="install packages (default: all required + optional defaults)")

@@ -445,6 +445,12 @@ before starting another Python process.
    environment. When the lock is already current, it says so and writes
    nothing. (`hermes pm lock --bump NAME VERSION` is a different operation: it
    pins a managed tool in `pm/lock.json` and does not touch `uv.lock`.)
+
+   It relocks the tree **this `hermes` was loaded from**, and every verdict
+   names that tree. In a separate checkout — a git worktree, where the `hermes`
+   on your `PATH` belongs to the main install — name the tree yourself:
+   `hermes pm lock --source .`. A verdict about a tree you did not name is
+   otherwise indistinguishable from one about the tree you are standing in.
 3. Source the activation script again (`source ./activate`, or
    `. .\activate.ps1` in PowerShell) to sync the application venv and the test
    interpreter to the new lock. Activation covers `[all]`. If you added an
@@ -549,7 +555,7 @@ not substitutes for an installed application's update mechanism.
 
 | Command | Effect |
 |---|---|
-| `pm lock` | Relock `uv.lock` from `pyproject.toml`. Changes no environment; writes nothing when the lock is current. |
+| `pm lock` | Relock `uv.lock` from `pyproject.toml` in the tree this `hermes` was loaded from; `--source PATH` names another. Changes no environment; writes nothing when the lock is current. |
 | `pm lock --bump NAME VERSION` | Resolve and hash supported target artifacts, then write the tool pin to `pm/lock.json`. |
 | `pm update [names...]` | Query upstream versions, change tool pins, and install changed tools. |
 | `pm update --check` | Query without writing. Exit 1 can mean updates exist; inspect output to distinguish an error. |
