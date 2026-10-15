@@ -1881,6 +1881,56 @@ def route_classified_error(
                 return _verdict("break")
         # Compression exhausted or didn't help: fall through to normal error handling.
 
+    # Content policy block with compression hint: compress and retry on the same
+    # provider. The filter may be a false positive on an innocent string in the
+    # accumulated context — compressing rephrases and strips the transcript.
+    if (
+        classified.reason == FailoverReason.content_policy_blocked
+        and classified.should_compress
+        and not getattr(_retry, "content_policy_compression_attempted", False)
+    ):
+        _retry.content_policy_compression_attempted = True
+        compression_attempts += 1
+        if compression_attempts <= max_compression_attempts:
+            original_len = len(messages)
+            messages, active_system_prompt = agent._compress_context(
+                messages, system_message,
+                approx_tokens=estimate_request_tokens_rough(
+                    api_messages, tools=agent.tools or None
+                ),
+                task_id=effective_task_id, trigger="content_policy",
+            )
+            conversation_history = conversation_history_after_compression(
+                agent, messages, conversation_history
+            )
+            if len(messages) < original_len:
+                agent._buffer_diagnostic_status(
+                    "⚠️  Content policy block on ModelArk — compressing context to clear false positive..."
+                )
+                time.sleep(2)
+                _provider_overflow_recovery_pending = True
+                _retry.restart_with_compressed_messages = True
+                return _verdict("break")
+        # Compression exhausted or didn't help: fall back immediately instead of
+        # burning retries on a request the filter will reject again.
+        if agent._has_pending_fallback():
+            agent._buffer_diagnostic_status(
+                "⚠️  Content policy block — compression didn't help, trying fallback..."
+            )
+            reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+                return _fallback_break()
+        # No fallback available — terminal. The retry loop would re-send the
+        # same request and hit the same filter; settle it here.
+        _delivered = settle_delivered_partial(agent, messages, None)
+        return _verdict("return", nonretryable_client_error_result(
+            agent, api_error, classified, status_code=status_code,
+            api_kwargs=api_kwargs, api_messages=api_messages, messages=messages,
+            conversation_history=conversation_history, api_call_count=api_call_count,
+            approx_tokens=approx_tokens, provider=agent.provider,
+            base_url=agent.base_url, model=agent.model, delivered=_delivered,
+        ))
+
     # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
     # the retry window); transport errors get 1 retry first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
