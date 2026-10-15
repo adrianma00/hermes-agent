@@ -841,7 +841,7 @@ requirements can still fail that resolution. The table lists common groups;
 | Group | What it enables |
 |-------|-----------------|
 | `messaging` | Discord, Telegram, Slack |
-| `matrix` | Matrix/Element (mautrix with encryption; Linux only) |
+| `matrix` | Matrix/Element (Linux + macOS; encryption is a separate `matrix-e2ee` extra, Linux only) |
 | `dingtalk` | DingTalk |
 | `feishu` | Feishu/Lark |
 | `voice` | Local speech-to-text (faster-whisper) |

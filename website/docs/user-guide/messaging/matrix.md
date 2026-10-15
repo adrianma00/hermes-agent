@@ -747,10 +747,12 @@ history, so other clients trust it immediately.
 
 ## Proxy Mode (E2EE on macOS)
 
-The `matrix` extra is gated to Linux. On macOS or Windows, run the Matrix
-adapter and encryption dependencies in a Linux container and forward requests
-to the native agent. The example below uses a macOS host; the same separation
-applies to Windows with the corresponding host address and authentication.
+The `matrix` extra installs on Linux and macOS; only its E2EE closure
+(`[matrix-e2ee]` → `python-olm`, which publishes no macOS wheels) does not.
+On Windows, or on macOS when you need encrypted rooms, run the Matrix adapter
+and encryption dependencies in a Linux container and forward requests to the
+native agent. The example below uses a macOS host; the same separation applies
+to Windows with the corresponding host address and authentication.
 
 ### How It Works
 

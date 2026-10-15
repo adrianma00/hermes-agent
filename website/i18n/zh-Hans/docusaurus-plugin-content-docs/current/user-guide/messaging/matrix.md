@@ -515,7 +515,7 @@ cd ~/.hermes/hermes-agent && python -c "import pm; pm.sync_venv(['matrix'], expl
 
 ## 代理模式（macOS 上的 E2EE）
 
-Matrix E2EE 需要 `libolm`，而该库无法在 macOS ARM64（Apple Silicon）上编译。`hermes-agent[matrix]` extra 仅限 Linux。如果你在 macOS 上，代理模式允许你在 Linux 虚拟机的 Docker 容器中运行 E2EE，而实际的 agent 在 macOS 上原生运行，可完整访问你的本地文件、记忆和技能。
+`hermes-agent[matrix]` extra 可在 Linux 和 macOS 上安装，只有它的 E2EE 依赖闭包（`[matrix-e2ee]` → `python-olm`）不行：`python-olm` 未发布 macOS 轮子（wheel）。Matrix E2EE 需要 `libolm`，而该库无法在 macOS ARM64（Apple Silicon）上编译。在 Windows 上，或在 macOS 上需要加密房间时，代理模式允许你在 Linux 虚拟机的 Docker 容器中运行 E2EE，而实际的 agent 在 macOS 上原生运行，可完整访问你的本地文件、记忆和技能。
 
 ### 工作原理
 
