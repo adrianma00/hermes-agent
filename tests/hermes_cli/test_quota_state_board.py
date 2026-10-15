@@ -6,6 +6,7 @@ tests.  ``quota_state`` is the source of truth for all quota gate operations.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import pytest
@@ -20,6 +21,15 @@ from hermes_cli.quota_state import (
     list_walls,
     get_db_path,
 )
+
+
+def _raw_wall_count() -> int:
+    """Rows physically on file, expired or not (``list_walls`` hides expired)."""
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM wall_state").fetchone()[0]
+    finally:
+        conn.close()
 
 
 @pytest.fixture(autouse=True)
@@ -72,13 +82,16 @@ def test_delete_wall():
 
 
 def test_sweep_expired():
-    """Sweep removes expired walls."""
+    """Sweep removes expired walls (the reader already hides them)."""
     write_wall("a", reset_at=time.time() - 100)
     write_wall("b", reset_at=time.time() + 3600)
-    assert len(list_walls()) == 2
-    swept = sweep_expired()
-    assert swept >= 1
+    # ``list_walls`` hides the expired row, but both are still on file.
     assert len(list_walls()) == 1
+    assert _raw_wall_count() == 2
+    swept = sweep_expired()
+    assert swept == 1
+    assert len(list_walls()) == 1
+    assert _raw_wall_count() == 1
     delete_wall("b")
 
 

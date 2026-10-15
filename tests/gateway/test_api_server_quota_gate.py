@@ -43,6 +43,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms import api_server_quota_gate as _qg
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_runs as _runs
+from hermes_cli import kanban_db as _kb
 from hermes_cli.quota_state import QuotaGateState
 from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
 
@@ -446,18 +447,16 @@ async def test_an_exempt_run_is_not_held(monkeypatch):
 
 @pytest.fixture
 def gate_board(tmp_path, monkeypatch):
-    """An isolated home whose gate card is the one the real reader resolves.
+    """An isolated home whose gate the real reader resolves.
 
     Mirrors ``tests/hermes_cli/test_kanban_quota_release_all.py``'s fixture, so the peer reader is
-    exercised against a REAL board rather than a stubbed ``QuotaGateState``.
+    exercised against the REAL local state DB rather than a stubbed ``QuotaGateState``.
     """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    _kb.init_db()
     board = "gate-board"
-    _kb.create_board(board)
     monkeypatch.setattr(_kb, "_quota_gate_config", lambda: (True, board))
     # The fallback route the gate would send a released turn to.
     monkeypatch.setattr(
@@ -467,6 +466,15 @@ def gate_board(tmp_path, monkeypatch):
     monkeypatch.setattr(_qg, "configured_primary_provider", lambda: WALLED)
 
     return board
+
+def _raw_wall_count() -> int:
+    """Rows physically on file, expired or not (``list_walls`` hides expired)."""
+    from hermes_cli.quota_state import get_db_path
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM wall_state").fetchone()[0]
+    finally:
+        conn.close()
 
 def _arm_the_wall(gate_board=None, *, release_all=None, reset_in=6 * 86400):
     """A future-reset wall via local state DB, optionally with the switch thrown."""
@@ -493,14 +501,14 @@ def test_a_wall_that_ended_by_clock_cannot_govern_a_peer_dm(gate_board):
     """
     _arm_the_wall(gate_board, release_all=True)
     _expire_the_wall(gate_board)
-    # The premise, stated plainly: the clock says OPEN while the card is still on the board.
-    assert _gate_card_count(gate_board) == 1, "the card outlives the wall it described"
+    # The premise, stated plainly: the reader hides the ended wall, but its row lingers.
+    assert _gate_card_count(gate_board) == 0, "an ended wall is not returned by the reader"
+    assert _raw_wall_count() == 1, "its row stays on file until a write or a sweep clears it"
 
-    # One peer turn is enough to notice — the reader reaps before it trusts the gate.
+    # One peer turn is enough to notice — an ended wall reads as an OPEN gate.
     assert _qg.gate_state() is None, "an ended wall reads as an OPEN gate"
-    assert _gate_card_count(gate_board) == 0, "card 1 -> 0 after the reader ran"
 
-    # A genuinely new wall arrives (a fresh 429, card rebuilt from scratch, nothing to inherit).
+    # A genuinely new wall arrives (a fresh 429); it must start in HOLD, inheriting nothing.
     _arm_the_wall(gate_board)
 
     decision = _qg.decide_for_turn()
