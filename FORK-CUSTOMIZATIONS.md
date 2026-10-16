@@ -179,9 +179,12 @@ prune interval instead of the full 24h idle window. Added 2026-10-01, and it had
 - **Adding a feature**: add a section in the same style, and add every new fork-only path to the block
   below. The probe reports anything unlisted on its next run -- that report IS the reminder.
 - **Retiring a feature** (upstream built it, or we dropped it): delete the section AND the paths from the
-  block. A path left in the block that no longer exists is reported as `missing` by the same check.
+  block. A path left in the block that no longer exists is reported as `gone` by the same check.
 - **Do not put a fork-only path in the block that upstream also has.** The check compares against
   upstream directly, so an over-broad block just trades one finding for another.
+- **The ledger lists ITSELF.** `FORK-CUSTOMIZATIONS.md` is fork-only too (added by us, absent
+  upstream), so the probe would otherwise report it as unlisted on every single run. It is the first
+  entry in the block for that reason -- not a mistake.
 - **Fork-only = added on our line and absent upstream.** If a file exists in both, it belongs in the
   "Edits to shared" field of its cluster, not in the block.
 
@@ -191,6 +194,7 @@ The probe reads the paths between the two markers, one repo-relative path per li
 drift; this block is what is verified. Keep it sorted.
 
 <!-- fork-only:start -->
+FORK-CUSTOMIZATIONS.md
 agent/provider_wall_notice.py
 agent/quota_gate_trigger.py
 cron/scheduler_quota.py
