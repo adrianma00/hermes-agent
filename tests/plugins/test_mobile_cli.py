@@ -236,6 +236,46 @@ class TestLibrarySearchPath:
         monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", str(tmp_path))
         assert str(tmp_path / "libqrencode.dylib") in qrterm._candidate_paths()
 
+    def test_windows_dll_names_are_attempted(self):
+        """Windows ships ``libqrencode.dll``. With only the Unix names in the list the loader is
+        never even asked for the file that exists."""
+        assert "libqrencode.dll" in qrterm._LIB_NAMES
+
+    def test_windows_install_lib_and_path_dirs_are_probed(self, tmp_path, monkeypatch):
+        """CPython's loader does not search ``PATH`` for a bare name, so a DLL that IS on
+        ``PATH`` is only reachable as an explicit path. The install's own ``lib`` directory
+        (``%LOCALAPPDATA%\\hermes\\lib``) comes first, then every ``PATH`` entry."""
+        install_lib = tmp_path / "hermes" / "lib"
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+        dirs = qrterm._windows_lib_dirs()
+        assert str(install_lib) in dirs
+        assert str(tmp_path / "bin") in dirs
+        assert dirs.index(str(install_lib)) < dirs.index(str(tmp_path / "bin"))
+
+    def test_hermes_home_profile_suffix_resolves_to_install_scope(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "default"))
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        assert str(tmp_path / "lib") in qrterm._windows_lib_dirs()
+
+    def test_windows_dirs_reach_the_candidate_list(self, tmp_path, monkeypatch):
+        """Patch the module's own seam, never ``os.name``.
+
+        ``qrterm.os`` is the shared ``os`` module, and on Python < 3.13 pathlib picks
+        WindowsPath/PosixPath from ``os.name`` at CALL time — so a test that sets it
+        process-wide makes ``pathlib.Path`` raise NotImplementedError, which aborts pytest's own
+        failure reporter (INTERNALERROR) instead of failing a test. The suite runs on 3.11.
+        ``raising=False`` keeps this a clean red against code that has no seam yet.
+        """
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        windows_path = str(tmp_path / "hermes" / "lib" / "libqrencode.dll")
+        monkeypatch.setattr(qrterm, "_IS_WINDOWS", True, raising=False)
+        assert windows_path in qrterm._candidate_paths()
+        monkeypatch.setattr(qrterm, "_IS_WINDOWS", False, raising=False)
+        assert windows_path not in qrterm._candidate_paths()
+
     def test_macos_naming_resolves_from_a_non_searchable_dir(self, tmp_path, monkeypatch):
         """Witnesses the macOS path without a Mac: same code, `libqrencode.4.dylib` naming, in a
         directory the loader would never search, with name-loading and the platform convention

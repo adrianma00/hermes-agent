@@ -5,6 +5,15 @@ the shared library — not the ``qrencode`` binary — is what has to be present
 Homebrew install it lands in a prefix the dynamic loader does not search by default, so
 it is resolved by explicit path as well as by name.
 
+Windows needs both halves of that treatment and gets neither from the Unix defaults: the
+library is ``libqrencode.dll``, a name this module never asked for, and a bare-name load does
+not reach it. Observed on a Windows install: a directory holding the DLL *and* all three of
+its dependency DLLs, present on ``PATH``, still fails a bare-name ``ctypes.CDLL`` load, while
+the same file by absolute path loads. That observation is the whole basis for the Windows
+branch below — the explicit path works regardless of which part of the search order is
+actually being skipped, so no claim is made here about ``LoadLibraryEx`` versus Python's
+default DLL search mode.
+
 Drawing rules that keep it scannable:
 
 * Modules are drawn as glyph *pairs*, so a 2-module-wide cell fits a normal
@@ -24,7 +33,16 @@ import os
 import shutil
 from typing import List, Optional, Sequence
 
-_LIB_NAMES = ("libqrencode.so.4", "libqrencode.so", "libqrencode.dylib", "libqrencode.4.dylib")
+_LIB_NAMES = (
+    "libqrencode.so.4", "libqrencode.so", "libqrencode.dylib", "libqrencode.4.dylib",
+    "libqrencode.dll", "libqrencode-4.dll", "qrencode.dll",   # Windows (mingw64 / MSVC)
+)
+
+# Resolved once, at import, so the Windows branch can be tested by patching THIS name. Tests must
+# not reach for ``os.name``: that is the shared ``os`` module, and on Python < 3.13 pathlib picks
+# WindowsPath/PosixPath from it at CALL time, so setting it process-wide makes ``pathlib.Path``
+# raise NotImplementedError — which kills pytest's own failure reporter instead of failing a test.
+_IS_WINDOWS = os.name == "nt"
 
 # Directories a package manager installs into but that the dynamic loader does NOT search for a
 # plain process. macOS is the case that bites: Homebrew's prefix (/opt/homebrew on arm64) is not on
@@ -56,9 +74,35 @@ class QRError(RuntimeError):
     """No renderer could produce a matrix."""
 
 
+def _windows_lib_dirs() -> List[str]:
+    """Windows directories worth probing by explicit path, most specific first.
+
+    A bare-name load does not reach a DLL that is on ``PATH`` (see the module docstring for the
+    observation), so the explicit-path fallback below is what finds it. The install's own ``lib``
+    directory comes first (that is where the installer puts the DLLs), then every ``PATH`` entry,
+    so a Windows box that already has the library somewhere sensible works without also setting
+    an environment variable.
+    """
+    dirs: List[str] = []
+    home = (os.environ.get("HERMES_HOME") or "").strip()
+    if not home:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            home = os.path.join(local, "hermes")
+    if home:
+        parts = os.path.normpath(home).split(os.sep)
+        if "profiles" in parts:            # HERMES_HOME may carry /profiles/<name>
+            home = os.sep.join(parts[:parts.index("profiles")])
+        dirs.append(os.path.join(home, "lib"))
+    dirs += [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p]
+    return dirs
+
+
 def _candidate_paths() -> List[str]:
     """Explicit paths to try, in order: known lib dirs, then whatever the env advertises."""
     dirs = list(_LIB_DIRS)
+    if _IS_WINDOWS:
+        dirs += _windows_lib_dirs()
     for var in ("DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH"):
         dirs += [p for p in (os.environ.get(var) or "").split(os.pathsep) if p]
     return [os.path.join(d, n) for d in dirs for n in _LIB_NAMES]
