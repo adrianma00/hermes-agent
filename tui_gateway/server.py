@@ -1707,89 +1707,12 @@ class _RuntimeFallbackResolution(NamedTuple):
     used_fallback: bool
 
 
-def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _RuntimeFallbackResolution:
-    """Resolve the primary runtime or one complete provider/model fallback. Provider-only fallback entries
-    are skipped so the unavailable primary model can never leak into a different runtime."""
-    from hermes_cli.auth import AuthError
-    from hermes_cli.runtime_provider import resolve_runtime_provider
-    try:
-        return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
-    except AuthError as primary_exc:
-        for entry in _load_fallback_model() or []:
-            fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
-            fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
-            if not fb_provider or not fb_model:
-                continue
-            try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-                fb_kwargs: dict = {"requested": fb_provider, "target_model": fb_model,
-                                   **({"explicit_base_url": entry["base_url"]} if entry.get("base_url") else {})}
-                if fb_api_key := resolve_entry_api_key(entry):
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
-                # Named custom entries resolve to the bare "custom" billing class; keep the configured
-                # identity so the session/UI shows the provider name, matching the manual-switch path (#98739).
-                runtime["provider"] = effective_runtime_provider(entry, runtime)
-                from hermes_cli.auth import primary_failure_wording
-                logging.getLogger(__name__).warning(
-                    "Primary %s (%s), falling back to %s model %s",
-                    primary_failure_wording(primary_exc)[0], primary_exc, fb_provider, fb_model)
-                return _RuntimeFallbackResolution(runtime, fb_model, True)
-            except Exception:
-                continue
-        raise
-
-
-def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str, dict]:
-    """(model, runtime) for a new agent; a per-session override (/model switch or a resumed row's persisted
-    runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
-    matches) — recover the identity from the persisted base_url or the rebuild fails "No LLM provider
-    configured". Persisted base_url/api_key/api_mode are honored only for the original runtime, never a fallback."""
-    if isinstance(model_override, dict) and model_override.get("model"):
-        model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
-        override_base_url = model_override.get("base_url")
-        resolve_kwargs = {}
-        if str(requested_provider or "").strip().lower() == "custom":
-            from hermes_cli.runtime_provider import canonical_custom_identity
-            if recovered := canonical_custom_identity(base_url=override_base_url or None, model=model or None):
-                requested_provider = recovered
-            if override_base_url:
-                # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
-                resolve_kwargs["explicit_base_url"] = override_base_url
-        resolve_kwargs.update(requested=requested_provider, target_model=model or None)
-        overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode")}
-    else:
-        model, requested_provider = _resolve_startup_runtime()
-        if isinstance(model_override, str) and model_override:
-            model = model_override
-        if provider_override:
-            requested_provider = provider_override
-        resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
-        overrides = {}
-    resolution = _resolve_runtime_with_fallback(resolve_kwargs)
-    if resolution.used_fallback:
-        if not resolution.selected_model:
-            raise RuntimeError("Auth fallback resolved without a model")
-        # Same pre-agent switch the messaging gateway surfaces (#74349); _make_agent pops it onto the
-        # agent's one-shot notice so the TUI/Desktop user sees which provider actually answered.
-        from hermes_cli.fallback_config import pre_agent_fallback_notice
-        # requested_provider=None means resolve_runtime_provider read the persisted config provider;
-        # ``model: <id>`` (string shorthand) names no provider.
-        cfg_model = _load_cfg().get("model")
-        primary_provider = requested_provider or (cfg_model.get("provider") if isinstance(cfg_model, dict) else None)
-        resolution.runtime["_fallback_notice"] = pre_agent_fallback_notice(
-            primary_provider, model, resolution.runtime.get("provider"), resolution.selected_model)
-        return resolution.selected_model, resolution.runtime
-    if resolution.runtime.get("source") == "local-runtime":
-        # Live supervisor beat any persisted loopback URL for this identity.
-        overrides.pop("base_url", None)
-    resolution.runtime.update({k: v for k, v in overrides.items() if v})
-    if any(overrides.values()):
-        _rederive_per_model_route(model, resolution.runtime)
-    return model, resolution.runtime
-
-
+# _resolve_runtime_with_fallback() lives in tui_gateway/agent_factory.py and is published onto this namespace at
+# registration (method_ctx.bind_module binds agent_factory's globals over these) — a local copy
+# here is dead, shadowed code. Cut by the 2026-10-16 dedup; see FORK-CUSTOMIZATIONS.md.
+# _resolve_agent_model_runtime() lives in tui_gateway/agent_factory.py and is published onto this namespace at
+# registration (method_ctx.bind_module binds agent_factory's globals over these) — a local copy
+# here is dead, shadowed code. Cut by the 2026-10-16 dedup; see FORK-CUSTOMIZATIONS.md.
 def _rederive_per_model_route(model: str, runtime: dict) -> None:
     """A row's persisted api_mode/base_url were written for whichever model the session last ran. Providers
     that pick the wire per model (OpenCode Zen/Go, Copilot, Nous) must re-derive both from the target model,
@@ -1826,26 +1749,12 @@ def _startup_system_prompt(cfg: dict, task_id: str) -> str:
     return system_prompt
 
 
-def _transport_auth_user_id(transport) -> str | None:
-    """``<provider>:<user id>`` the WS-upgrade credential authenticated for ``transport``, or None for the legacy
-    token, stdio and the PTY child's server-internal credential. The prefix keeps a basic-auth ``alice`` and an
-    OIDC ``alice`` apart."""
-    identity = getattr(transport, "auth_identity", None)
-    if _methods_browser_control._is_authenticated_identity(identity):
-        return f"{str(identity['provider']).strip()}:{str(identity['user_id']).strip()}"
-    return None
-
-
-def _session_auth_user_id(session: dict | None) -> str | None:
-    """The login ``session`` was created under, stamped on the record as ``auth_user_id``. A second window turns
-    the transport slot into a FanoutTransport, which names no login, so only a record without the slot reads
-    its transport."""
-    session = session or {}
-    if "auth_user_id" in session:
-        return session["auth_user_id"]
-    return _transport_auth_user_id(session.get("transport"))
-
-
+# _transport_auth_user_id() is defined in tui_gateway/session_transports.py and published here at
+# registration (method_ctx.bind_module) — the local copy was dead, shadowed code.
+# Cut by the 2026-10-16 dedup; see FORK-CUSTOMIZATIONS.md.
+# _session_auth_user_id() is defined in tui_gateway/session_transports.py and published here at
+# registration (method_ctx.bind_module) — the local copy was dead, shadowed code.
+# Cut by the 2026-10-16 dedup; see FORK-CUSTOMIZATIONS.md.
 def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
