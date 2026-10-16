@@ -390,6 +390,10 @@ def _launch(adapter, run_id, **agent_kwargs):
     return SimpleNamespace(
         run_id=run_id, session_id=f"s-{run_id}", gateway_session_key=f"s-{run_id}",
         approval_session_key=run_id, queue=None, request_profile=None,
+        # Upstream's _execute_run now branches on the run's admission (its own dataclass
+        # defaults the field to None), so this duck-typed stand-in must carry it too or the
+        # branch raises AttributeError before the quota gate is ever consulted.
+        admission=None,
         agent_kwargs={"requested_provider": None, "requested_model": None, **agent_kwargs},
         put_event=lambda _e: None, owner=adapter)
 
