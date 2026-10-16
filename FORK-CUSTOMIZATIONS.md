@@ -82,6 +82,14 @@ zero hits.
   `hermes_cli/config_defaults.py`, `hermes_cli/kanban.py`, `hermes_cli/kanban_db.py`,
   `hermes_cli/kanban_db_connect.py`, `hermes_cli/kanban_db_dispatch.py`, `tests/conftest.py`,
   `website/docs/user-guide/features/kanban.md`
+- **Edit site MOVED by the 2026-10-16 upstream merge**: the board-metadata cluster now lives in
+  `hermes_cli/kanban_db_boards.py`, and `kanban_db.py` **re-exports** it. Our `namespace` parameter
+  and `_caller_effective_db_path` were ported into the canonical module (`write_board_metadata`,
+  `create_board`, `read_board_metadata`, plus the caller-effective `db_path` the board-pin tests
+  depend on); the in-place copies the merge had kept in `kanban_db.py` were 197 lines of dead
+  duplicate and are deleted. **Edit the canonical module, never `kanban_db.py` — a copy left there is
+  shadowed by the re-export and silently dead code** (that exact trap produced 19 test errors on the
+  merge: `create_board() got an unexpected keyword argument 'namespace'`).
 - **Upstream-watch**: `namespace`, `tenant`, upstream PR 130854 (reserved/unspawnable assignee refusal)
 
 ## 4. Mobile pairing CLI
