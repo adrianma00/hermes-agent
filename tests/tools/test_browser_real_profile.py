@@ -347,10 +347,107 @@ class TestRealProfileCdpLaunch:
             snapshot.assert_called_once()
         self._reset()
 
+    def test_stale_session_is_closed_even_when_get_cdp_returns_none(self, tmp_path):
+        """_agent_browser_get_cdp() returns None for exactly the stale sessions that must be
+        cleared (a session left pointing at a dead Chrome), so the close cannot be conditional
+        on it: agent-browser caches the CDP endpoint INSIDE the named session and ignores a new
+        ``--cdp`` while that session exists, wedging every later attach."""
+        import tools.browser_tool as bt
+        self._reset()
+        closed = {"n": 0}
+        proc = Mock(return_value=None, returncode=0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(argv, **kw):
+            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            return FakeChrome()
+
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value=None), \
+             patch.object(bt_real_profile, "_agent_browser_close_session",
+                          side_effect=lambda s: closed.__setitem__("n", closed["n"] + 1)), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt_real_profile, "_capture_agent_browser_cli", return_value=proc), \
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            bt_real_profile._real_profile_cdp()
+        assert closed["n"] == 1, "a stale session with an unresolvable cdp-url was not cleared"
+        self._reset()
+
+    def test_chrome_stderr_is_captured_on_launch_failure(self, tmp_path):
+        """A genuine Chrome launch failure must surface Chrome's own stderr: on a host that
+        restricts unprivileged user namespaces the real cause is ``No usable sandbox!``, and
+        discarding stderr leaves only agent-browser's generic ``--no-sandbox`` hint. The cause is
+        emitted BEFORE the crash handler's stack dump, so it must survive a long stack trace."""
+        import tools.browser_tool as bt
+        copy_dir = tmp_path / "copy"
+        copy_dir.mkdir()
+        stderr_path = tmp_path / "chrome_stderr"
+        stack = "\n".join(f"#1{i} 0x{0x1000 + i:x} (/usr/bin/chrome+0x{i:x})" for i in range(400))
+
+        class DeadChrome:
+            def poll(self):
+                return 1
+
+        def fake_popen(argv, **kw):
+            kw["stderr"].write(
+                (b"[1:1:0101/000000.000000:FATAL:zygote_host_impl_linux.cc(128)] No usable sandbox!\n"
+                 b"[end of stack trace]\n" + stack.encode() + b"\n"))
+            kw["stderr"].flush()
+            return DeadChrome()
+
+        with patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(bt_real_profile, "_chrome_stderr_path", return_value=str(stderr_path)), \
+             patch.object(bt_real_profile, "_terminate_real_profile_chrome",
+                          side_effect=lambda: bt._real_profile_chrome_procs.clear()):
+            port, err = bt_real_profile._launch_real_profile_chrome("/usr/bin/chrome", str(copy_dir))
+        assert port is None
+        assert err and "No usable sandbox!" in err
+        assert "Chrome exited during startup" in err
+        assert "#1399" not in err  # the stack dump is not what the user needs
+
+    def test_chrome_stderr_falls_back_to_tail_when_no_cause_line(self, tmp_path):
+        stderr_path = tmp_path / "chrome_stderr"
+        stderr_path.write_bytes((b"chatter\n" * 100) + b"the last thing chrome said\n")
+        assert bt_real_profile._chrome_stderr_digest(str(stderr_path)).endswith("the last thing chrome said")
+
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
         (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n", encoding="utf-8")
         assert bt_real_profile._cdp_on_data_dir("http://127.0.0.1:41000", str(tmp_path))
         assert not bt_real_profile._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
+
+
+class TestRealProfileDaemonEnvSandboxBypass:
+    """The real-profile daemon env must carry the same Chromium sandbox bypass the main lane
+    applies (``_apply_chromium_sandbox_args``). agent-browser launches its OWN bundled Chromium
+    before it can attach to the CDP endpoint Hermes launched, and on a host that restricts
+    unprivileged user namespaces that launch dies with ``No usable sandbox!``."""
+
+    def test_bypass_applied_when_needed(self):
+        with patch.object(bt_session, "_agent_browser_command_env", return_value={"PATH": "/bin"}), \
+             patch.object(bt_session, "_needs_chromium_sandbox_bypass", return_value=True):
+            env, _ = bt_real_profile._real_profile_daemon_env()
+        assert env["AGENT_BROWSER_ARGS"] == "--no-sandbox,--disable-dev-shm-usage"
+
+    def test_operator_args_are_not_overridden(self):
+        with patch.object(bt_session, "_agent_browser_command_env",
+                          return_value={"PATH": "/bin", "AGENT_BROWSER_ARGS": "--my-flag"}), \
+             patch.object(bt_session, "_needs_chromium_sandbox_bypass", return_value=True):
+            env, _ = bt_real_profile._real_profile_daemon_env()
+        assert env["AGENT_BROWSER_ARGS"] == "--my-flag"
+
+    def test_no_bypass_when_not_needed(self):
+        with patch.object(bt_session, "_agent_browser_command_env", return_value={"PATH": "/bin"}), \
+             patch.object(bt_session, "_needs_chromium_sandbox_bypass", return_value=False):
+            env, _ = bt_real_profile._real_profile_daemon_env()
+        assert "AGENT_BROWSER_ARGS" not in env
 
 
 class TestAgentBrowserCliCapture:

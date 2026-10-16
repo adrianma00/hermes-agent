@@ -46,6 +46,11 @@ def _real_profile_daemon_env() -> tuple:
     socket_dir = _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
     env = _session._agent_browser_command_env(socket_dir)
     env.pop("AGENT_BROWSER_IDLE_TIMEOUT_MS", None)
+    # Same sandbox bypass the main lane applies: agent-browser launches its OWN bundled Chromium
+    # before it can attach to the CDP endpoint Hermes launched, and on hosts that restrict
+    # unprivileged user namespaces (Ubuntu 23.10+ AppArmor, containers, root) that launch dies with
+    # "No usable sandbox!" — surfacing only as agent-browser's generic ``--no-sandbox`` hint.
+    _session._apply_chromium_sandbox_args(env)
     return env, socket_dir
 
 
@@ -107,6 +112,63 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
             return fh.readline().strip()
     except OSError:
         return None
+
+
+_CHROME_STDERR_HEAD_BYTES = 20000   # one launch's stderr (the file is truncated on every launch)
+_CHROME_STDERR_TAIL_CHARS = 600
+# Chrome emits its cause as a FATAL/ERROR log line BEFORE the crash handler dumps a stack trace, so
+# prefer those lines and only fall back to a plain tail: a tail read of a crashing Chrome is mostly
+# stack frames and can miss the one line that says why.
+_CHROME_STDERR_CAUSE_RE = re.compile(
+    r"(No usable sandbox|FATAL|ERROR|Failed to|cannot open|No such file|Permission denied)", re.I)
+
+
+def _read_text_head(path: str, limit: int) -> str:
+    """First ``limit`` bytes of a text file ('' when unreadable)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _read_text_tail(path: str, limit: int) -> str:
+    """Last ``limit`` characters of a text file (tail-bounded, '' when unreadable)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+            return fh.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def _chrome_stderr_digest(stderr_path: str) -> str:
+    """The part of Chrome's stderr worth showing a user: its cause lines, else the last lines."""
+    raw = _read_text_head(stderr_path, _CHROME_STDERR_HEAD_BYTES)
+    cause = [ln.strip() for ln in raw.splitlines()
+             if _CHROME_STDERR_CAUSE_RE.search(ln) and "stack trace" not in ln]
+    detail = " | ".join(cause[:3]) if cause else _read_text_tail(stderr_path, _CHROME_STDERR_TAIL_CHARS)
+    return detail[:_CHROME_STDERR_TAIL_CHARS].strip()
+
+
+def _chrome_stderr_path() -> str:
+    """Path Chrome's stderr is captured to for this session (truncated on every launch)."""
+    _bt = _origin()
+    return os.path.join(_session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION), "_chrome_stderr")
+
+
+def _chrome_failure_error(reason: str, stderr_path: str) -> str:
+    """Launch-failure message carrying the captured Chrome stderr, so a restricted-userns host
+    reports ``No usable sandbox!`` instead of only agent-browser's generic ``--no-sandbox`` hint."""
+    _bt = _origin()
+    detail = _chrome_stderr_digest(stderr_path)
+    msg = _RP + reason
+    if detail:
+        _bt.logger.warning("real-profile Chrome stderr (%s): %s", stderr_path, detail)
+        msg += f" Chrome stderr: {detail}"
+    return msg
 
 
 def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
@@ -207,11 +269,24 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> tuple[Option
     _has_display = bool(browser_env.get("DISPLAY") or browser_env.get("WAYLAND_DISPLAY"))
     if not (_cloud._is_headed_mode() and (_has_display or not sys.platform.startswith("linux"))):
         chrome_argv.append("--headless=new")
+    # Capture stderr (truncated on each launch) so a dead startup reports WHY. Discarded stderr would
+    # leave only agent-browser's generic ``--no-sandbox`` hint: a restricted-userns host's real cause
+    # ("No usable sandbox!") never reaches the user, which is what made this bug expensive to find.
+    stderr_path = _chrome_stderr_path()
     try:
-        chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stderr_file = open(stderr_path, "wb")
+    except OSError:
+        stderr_file = None
+    try:
+        chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL,
+                                       stderr=stderr_file or subprocess.DEVNULL,
                                        stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
     except (subprocess.SubprocessError, OSError) as e:
+        if stderr_file:
+            stderr_file.close()
         return None, f"{_RP}the launch failed: {e}"
+    if stderr_file:
+        stderr_file.close()  # the child holds its own fd; ours was only needed for the spawn
     _bt._real_profile_chrome_procs.append(chrome_proc)
 
     deadline = time.monotonic() + 30.0
@@ -221,10 +296,13 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> tuple[Option
             return int(line), None
         if chrome_proc.poll() is not None:
             _terminate_real_profile_chrome()
-            return None, _RP + "Chrome exited during startup (another instance may hold the profile copy)."
+            return None, _chrome_failure_error(
+                "Chrome exited during startup (another instance may hold the profile copy).", stderr_path)
         time.sleep(0.25)
     _terminate_real_profile_chrome()
-    return None, _RP + "the real-profile browser did not expose a debug port in time. Retry, or turn the toggle off."
+    return None, _chrome_failure_error(
+        "the real-profile browser did not expose a debug port in time. Retry, or turn the toggle off.",
+        stderr_path)
 
 
 def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> tuple[Optional[str], Optional[str]]:
@@ -320,8 +398,12 @@ def _real_profile_cdp() -> tuple:
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
             _bt._real_profile_cdp_cache["cdp"] = existing
             return existing, None
-        if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
-            _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
+        # ALWAYS clear the session before launching. agent-browser caches the CDP endpoint INSIDE
+        # the named session and IGNORES a new ``--cdp`` while that session exists, so a session left
+        # by a previous run (pointing at a dead Chrome) makes every attach fail. The close cannot be
+        # conditional on ``existing``: _agent_browser_get_cdp() returns None for exactly the stale
+        # sessions that need clearing, so the session would never be closed.
+        _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
         # A Chrome from an earlier hermes process can still hold the copy dir after its attach
         # daemon was reaped (that owner died). Re-attach to it rather than overlay a live profile;
         # if the daemon cannot attach, fail closed — never snapshot over an open profile. Not ours
