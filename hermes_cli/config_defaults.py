@@ -1986,8 +1986,14 @@ DEFAULT_CONFIG = {
         # unreadable, the fleet holds (the shared mount is how the gate is coordinated).
         "quota_gate": {
             "enabled": False,
-            # Board that carries the gate card (one `quota-gate:<provider>` card in `scheduled`).
-            # Shared across the fleet/tenants so every profile reads the same state.
+            # Board carrying the LEGACY gate card (`quota-gate:<provider>` in `scheduled`).
+            # Phase 2A moved the authoritative wall state into each install's local
+            # `quota_state.db`, so this is no longer shared state: every install now holds
+            # and releases independently, and `hermes quota release-all` writes the local row.
+            # The card survives as an observability/coordination artifact — `hermes quota
+            # status` reads both and warns when `release_all` disagrees. When the config is
+            # absent the code still falls back to `yummi-board`, so an install enabling the
+            # gate without setting its own board will read someone else's card.
             "board": "yummi-board",
         },
         # Provider COST-window deferral: hold dispatch out of a provider's peak-price

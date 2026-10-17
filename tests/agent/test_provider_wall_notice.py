@@ -402,3 +402,80 @@ def test_routes_affected_fails_open_when_the_route_info_is_missing():
     assert wall.routes_affected({("xai", "grok-4")}, None) is True
     assert wall.routes_affected(set(), [{"provider": "custom", "model": "m"}]) is True
 
+
+
+# ── the per-install gate line ─────────────────────────────────────────────────────────
+# A closed provider-quota gate does more than fail turns: it HOLD kanban dispatch, due
+# cron jobs and inbound peer DMs, and releasing it is a separate operator switch in this
+# install's own quota_state.db. An install sat closed 26h with only per-card
+# `quota_paused` events, so the wall notice must say which side of that switch it is on.
+
+def _stub_gate(monkeypatch, *, enabled, is_closed, release_all=False, reset_at=None,
+               provider="modelark-coding", fallback_model="deepseek-v4-flash"):
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.quota_state as qs
+
+    class _State:
+        pass
+
+    state = _State()
+    state.is_closed = is_closed
+    state.reset_at = reset_at
+    state.walled_provider = provider
+    state.release_all = release_all
+    state.fallback_model = fallback_model
+
+    monkeypatch.setattr(kb, "_quota_gate_config", lambda: (enabled, "yummi-board"))
+    monkeypatch.setattr(qs, "read_state", lambda *a, **k: state)
+    return state
+
+
+def _rows():
+    return [wall.RouteRow(provider="modelark-coding", model="deepseek-v4-flash", status=wall.WALLED,
+                          detail="weekly usage quota exceeded", reset_at=time.time() + 3600)]
+
+
+def test_gate_disabled_adds_no_gate_line(monkeypatch):
+    _stub_gate(monkeypatch, enabled=False, is_closed=True, reset_at=time.time() + 3600)
+    text = wall.build_message(_rows(), profile="default")
+    assert "quota gate" not in text.lower()
+
+
+def test_gate_open_adds_no_gate_line(monkeypatch):
+    _stub_gate(monkeypatch, enabled=True, is_closed=False)
+    text = wall.build_message(_rows(), profile="default")
+    assert "quota gate" not in text.lower()
+
+
+def test_closed_gate_reports_that_work_is_holding(monkeypatch):
+    reset_at = 1792339200.0
+    _stub_gate(monkeypatch, enabled=True, is_closed=True, reset_at=reset_at)
+    text = wall.build_message(_rows(), profile="default")
+    assert "HOLDING" in text
+    assert "modelark-coding" in text
+    assert "release-all on" in text
+    # absolute instant, never a countdown: the message doubles as the incident identity
+    assert "in ~" not in text
+
+
+def test_released_gate_says_work_is_running_on_the_fallback(monkeypatch):
+    _stub_gate(monkeypatch, enabled=True, is_closed=True, release_all=True,
+               reset_at=1792339200.0, fallback_model="deepseek-v4-flash")
+    text = wall.build_message(_rows(), profile="default")
+    assert "RELEASED" in text
+    assert "deepseek-v4-flash" in text
+    assert "HOLDING" not in text
+
+
+def test_gate_line_never_raises_when_the_state_read_fails(monkeypatch):
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.quota_state as qs
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("quota_state.db is unreadable")
+
+    monkeypatch.setattr(kb, "_quota_gate_config", lambda: (True, "yummi-board"))
+    monkeypatch.setattr(qs, "read_state", _boom)
+    text = wall.build_message(_rows(), profile="default")
+    assert "provider wall" in text.lower()   # the notice itself still renders
+    assert "quota gate" not in text.lower()

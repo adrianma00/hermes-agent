@@ -1000,6 +1000,8 @@ provider_wall:
   until_reset: " · resets {when}"
   until_cooling: " · available again in ~{wait}"
   until_cooling_stable: " · available again ~{when}"
+  gate_holding: "⛔ Provider-quota gate: this install is HOLDING kanban dispatch, due cron jobs and inbound peer DMs on {provider} until {reset} — the wall is not just failing turns, it is stalling queued work. Release to the fallback route: `hermes quota release-all on` (check with `hermes quota status`)."
+  gate_released: "🔓 Provider-quota gate: {provider} is walled until {reset}, and this install is RELEASED — queued work is running on {route}, not on the walled provider."
   scope: "Scope: profile {profile}."
   remedy: "Remedy: top up the walled account, or run `{cmd}` to pick a usable route."
 

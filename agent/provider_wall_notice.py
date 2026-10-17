@@ -343,7 +343,44 @@ def build_message(rows: list[RouteRow], *, profile: str = "default", now: Option
     cmd = "hermes model" if profile in {"", "default"} else f"hermes -p {profile} model"
     lines.append(_t("provider_wall.scope", profile=profile or "default"))
     lines.append(_t("provider_wall.remedy", cmd=cmd))
+    gate_line = _gate_hold_line()
+    if gate_line:
+        lines.append(gate_line)
     return "\n".join(lines)
+
+
+def _gate_hold_line() -> str:
+    """One line when THIS install's provider-quota gate is holding work.
+
+    The wall notice says which route is down. It never said that the install is also
+    HOLDING kanban dispatch, due cron jobs and inbound peer DMs — a separate,
+    per-install switch (``release_all``) that an operator has to flip by hand. That
+    distinction is not academic: a tenant install sat closed for 26 hours with nothing
+    but a per-card ``quota_paused`` event nobody reads, and the person holding the
+    switch had no way to learn there was one.
+
+    Deliberately quiet when the gate is disabled (the default), and it renders the
+    ABSOLUTE reset instant rather than a countdown, because ``build_message``'s text is
+    also the incident identity that dedupes re-notification.
+    """
+    try:
+        from hermes_cli.kanban_db import _quota_gate_config
+        from hermes_cli.quota_state import read_state
+
+        enabled, _board = _quota_gate_config()
+        if not enabled:
+            return ""
+        state = read_state()
+        if not state.is_closed:
+            return ""
+        provider = state.walled_provider or "the primary provider"
+        reset = _fmt_reset(state.reset_at) if state.reset_at else ""
+        if getattr(state, "release_all", False):
+            return _t("provider_wall.gate_released", provider=provider, reset=reset,
+                      route=state.fallback_model or "the fallback route")
+        return _t("provider_wall.gate_holding", provider=provider, reset=reset)
+    except Exception:  # a notice must never mask the provider error the operator needs
+        return ""
 
 
 def _row_line(row: RouteRow, now: float, *, relative: bool = True) -> str:
