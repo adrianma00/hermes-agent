@@ -73,11 +73,14 @@ Upstream's kanban has a per-card `tenant` (a FILTER, "a soft namespace within a 
 assignees, and pins the DB path per install. Upstream has no `namespace` concept -- verified 2026-10-07,
 zero hits.
 
-- **Fork-only**: 9 test files (`tests/hermes_cli/test_kanban_assignee_namespaces.py`,
+- **Fork-only**: 11 test files (`tests/hermes_cli/test_kanban_assignee_namespaces.py`,
   `test_kanban_board_pin_scope.py`, `test_kanban_cross_fleet_assignee_gate.py`, `test_kanban_gate_holds.py`,
-  `test_kanban_namespace_cache.py`, `test_kanban_per_profile_cap_namespaced.py`,
+  `test_kanban_namespace_cache.py`, `test_kanban_namespace_profile_lookup_guard.py`,
+  `test_kanban_per_profile_cap_namespaced.py`,
   `test_kanban_phantom_refs.py`, `test_kanban_shared_dir_mode.py`,
-  `test_kanban_write_guard_purge_survival.py`). The implementation itself lives in shared files.
+  `test_kanban_write_guard_purge_survival.py`,
+  `tests/gateway/test_session_kanban_namespaced_assignee.py`). The implementation itself lives in
+  shared files.
 - **Edits to shared**: `cli-config.yaml.example`, `gateway/kanban_watchers.py`,
   `hermes_cli/config_defaults.py`, `hermes_cli/kanban.py`, `hermes_cli/kanban_db.py`,
   `hermes_cli/kanban_db_connect.py`, `hermes_cli/kanban_db_dispatch.py`, `tests/conftest.py`,
@@ -221,6 +224,8 @@ drift; this block is what is verified. Keep it sorted.
 FORK-CUSTOMIZATIONS.md
 agent/provider_wall_notice.py
 agent/quota_gate_trigger.py
+apps/desktop/scripts/assert-no-shadowed-imports.mjs
+apps/desktop/scripts/assert-no-shadowed-imports.test.mjs
 cron/scheduler_quota.py
 gateway/platforms/api_server_quota_gate.py
 hermes_cli/cost_window.py
@@ -243,12 +248,15 @@ tests/cron/test_cron_cost_window_release.py
 tests/cron/test_cron_quota_release_all.py
 tests/gateway/test_api_server_quota_gate.py
 tests/gateway/test_provider_wall_notice_delivery.py
+tests/gateway/test_session_kanban_namespaced_assignee.py
+tests/gateway/test_session_kanban_refusal_codes.py
 tests/hermes_cli/test_cost_window_holidays.py
 tests/hermes_cli/test_kanban_assignee_namespaces.py
 tests/hermes_cli/test_kanban_board_pin_scope.py
 tests/hermes_cli/test_kanban_cross_fleet_assignee_gate.py
 tests/hermes_cli/test_kanban_gate_holds.py
 tests/hermes_cli/test_kanban_namespace_cache.py
+tests/hermes_cli/test_kanban_namespace_profile_lookup_guard.py
 tests/hermes_cli/test_kanban_per_profile_cap_namespaced.py
 tests/hermes_cli/test_kanban_phantom_refs.py
 tests/hermes_cli/test_kanban_quota_release_all.py
