@@ -199,6 +199,26 @@ prune interval instead of the full 24h idle window. Added 2026-10-01, and it had
   idempotence, every header pattern, prefix-not-substring near misses, unreadable/binary siblings)
 - **Upstream-watch**: `credential`, `_CREDENTIAL_HEADERS`, `prune_idle_entries`
 
+## 11. Kanban handoff-summary previews
+
+Card handoff summaries are cut **silently**: the preview helpers truncate with no ellipsis and keep only
+line 1, so a cut preview reads as a complete sentence and a multi-line handoff loses everything after
+its first line. The full text is not lost -- it is preserved on `task_runs.summary` (verified: a 1079-char
+handoff survived intact) -- but nothing on the card says the preview is partial. Sites: `_first_line(x,
+400)` at `hermes_cli/kanban_db.py:3146/3583/3843`, `_first_line(x, 200)` at `3060/3098/3099`, and
+`r.summary.splitlines()[0][:160]` / `[:100]` at `hermes_cli/kanban.py:588/1317`.
+
+**Local decision (2026-10-16): NOT upstream.** This is an upstream bug (`_first_line` is byte-identical
+upstream with the same call sites), but the PR queue is backed up and the fix is minor. Kept as a local
+customization -- a deliberate, recorded divergence, not an oversight.
+
+- **Fork-only**: `tests/hermes_cli/test_kanban_summary_preview.py` -- **pending**, added by card
+  `t_bd624d24`. Add it to the machine-readable block when the file exists; a path listed before it
+  exists is reported as `gone` by the probe.
+- **Edits to shared**: `hermes_cli/kanban_db.py`, `hermes_cli/kanban.py`
+- **Guarded by**: pending with `t_bd624d24` (unit test: preview <= limit, ends in `…`, no mid-word cut)
+- **Upstream-watch**: `_first_line`, `_preview`, `summary` preview, `summary_chars`
+
 ---
 
 ## Maintenance
