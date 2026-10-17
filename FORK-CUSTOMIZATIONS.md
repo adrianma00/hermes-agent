@@ -101,6 +101,12 @@ zero hits.
   test_kanban_namespace_profile_lookup_guard.py` is the standing detector: it fails on any new
   `resolve_profile_env(<raw assignee>)` and on any blessed site that loses its `assignee_profile()`
   call, so a merge cannot silently drop the strip again. Extend its `_BLESSED` map when adding a site.
+- **Admission re-checks the qualifier, it does not merely strip it** (`gateway/session_kanban.py`):
+  a card qualified with another install's namespace is refused `namespace_mismatch`, because both
+  installs have a `default` and only the qualifier says which one the card is for. The dispatcher's
+  namespace gate normally refuses such a card first; admission re-checks so a path that never passed
+  that gate (manual claim, stale lock, the other install's dispatcher writing into the shared DB)
+  cannot run another install's card as this install's `default`.
 
 ## 4. Mobile pairing CLI
 

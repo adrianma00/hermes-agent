@@ -50,6 +50,8 @@ def fleet_home(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
     monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    # This install's namespace, so a card qualified with it is admitted and a foreign one refused.
+    monkeypatch.setenv('HERMES_KANBAN_NAMESPACE', 'em')
     # Bare names map into the fixture home; a colon-containing name would raise here, which is
     # exactly the failure this suite pins.
     monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env',
@@ -70,6 +72,30 @@ def test_qualified_assignee_is_admitted(fleet_home, assignee):
     assert context['profile'] == assignee.lower()
     assert context['task_id'] == task.id
     assert policy.source == 'kanban'
+
+
+def test_a_foreign_namespace_qualifier_is_refused(fleet_home):
+    """Two installs both have a ``default``; the qualifier decides which one the card is for.
+
+    Admission re-checks it instead of stripping blindly, so a claim that never passed the
+    dispatcher's namespace gate (manual claim, stale lock, another install's dispatcher writing
+    into the shared DB) cannot run another install's card as this install's ``default``.
+    """
+    from gateway.session_kanban import build_kanban_policy
+    from hermes_state_runtime import RuntimeStoreError
+
+    connection, params, config, _task = _claimed_card(fleet_home, assignee='yummi:default')
+    with pytest.raises(RuntimeStoreError, match='namespace_mismatch'):
+        build_kanban_policy(connection, params, config)
+
+
+def test_a_bare_assignee_is_still_admitted(fleet_home):
+    """The common case: an unqualified assignee on this install's own board needs no qualifier."""
+    from gateway.session_kanban import build_kanban_policy
+
+    connection, params, config, _task = _claimed_card(fleet_home, assignee='default')
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    assert json.loads(policy.kanban_json)['profile'] == 'default'
 
 
 def test_pr_acceptance_resolves_a_qualified_assignee(fleet_home):

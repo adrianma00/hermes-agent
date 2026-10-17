@@ -6,7 +6,6 @@ and the surrounding ``except (ValueError, OSError, sqlite3.Error)`` used to rewr
 them into a generic ``invalid_kanban_claim`` — hiding a live dispatch failure behind a code that
 names neither the claim nor the profile. These tests pin the honest codes and the carried cause.
 """
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,6 +49,8 @@ def fleet_home(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
     monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    # This install's namespace: a card qualified with another one is refused.
+    monkeypatch.setenv('HERMES_KANBAN_NAMESPACE', 'em')
     monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env',
                         lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
     return tmp_path
@@ -74,18 +75,20 @@ def test_assignee_of_another_profile_reports_profile_mismatch(fleet_home):
         build_kanban_policy(connection, params, config)
 
 
-def test_a_qualified_assignee_is_stripped_like_the_dispatcher_strips_it(fleet_home):
-    """Namespace parity: admission resolves the profile half, exactly as the spawn path does.
+def test_a_foreign_namespace_qualifier_is_refused_before_the_strip(fleet_home):
+    """The qualifier selects the install, so admission refuses another namespace's card.
 
-    Cross-install cards never reach this point — the dispatcher refuses them first with
-    ``namespace_mismatch`` — so admission mirrors the dispatcher's resolution rather than
-    re-implementing the namespace gate.
+    Stripping alone would resolve ``yummi:default`` to THIS install's ``default`` — two installs
+    share the profile name, and only the qualifier tells them apart. The dispatcher's namespace
+    gate refuses such a card first; admission re-checks so any other path that reaches it refuses
+    too.
     """
     from gateway.session_kanban import build_kanban_policy
+    from hermes_state_runtime import RuntimeStoreError
 
     connection, params, config, _task = _claimed_card(fleet_home, assignee='yummi:default')
-    policy, _secrets = build_kanban_policy(connection, params, config)
-    assert json.loads(policy.kanban_json)['profile'] == 'yummi:default'
+    with pytest.raises(RuntimeStoreError, match='namespace_mismatch'):
+        build_kanban_policy(connection, params, config)
 
 
 def test_an_unreadable_board_carries_its_cause_in_the_message(fleet_home):
