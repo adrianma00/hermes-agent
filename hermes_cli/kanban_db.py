@@ -2176,10 +2176,33 @@ def _end_run(
     return run_id
 
 
-def _first_line(text: Optional[str], limit: int) -> str:
-    """First non-blank-stripped line of ``text`` capped at ``limit`` chars; "" when empty."""
-    lines = (text or "").strip().splitlines()
-    return lines[0][:limit] if lines else ""
+def _preview(text: Optional[str], limit: int) -> str:
+    """Word-safe single-line preview of ``text`` of at most ``limit`` chars.
+
+    Fork customization (``FORK-CUSTOMIZATIONS.md`` §11) replacing upstream's
+    ``_first_line``, which kept ONLY line 1 and hard-cut at ``limit`` with no
+    marker -- a 1079-char handoff surfaced as a 400-char fragment that read
+    like a complete sentence.
+
+    * newlines and whitespace runs collapse to single spaces, so a multi-line
+      handoff keeps its content past line 1 (nothing is silently dropped);
+    * a truncated preview always ends with ``…`` and is cut at the last word
+      boundary inside the window -- a hard cut is used only when no boundary
+      sits in the window at all -- so it never ends mid-word;
+    * the result never exceeds ``limit`` chars (``""`` for empty input).
+    """
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    if limit <= 0:
+        return ""
+    if len(flat) <= limit:
+        return flat
+    window = flat[: max(0, limit - 1)]  # one char reserved for the ellipsis
+    boundary = window.rfind(" ")
+    if boundary > 0:
+        window = window[:boundary]
+    return window.rstrip() + "…"
 
 
 def _opt_int(value: Any) -> Optional[int]:
@@ -3057,7 +3080,7 @@ def _gate_created_cards(
                 {
                     "phantom_cards": phantom_cards,
                     "verified_cards": verified_cards,
-                    "summary_preview": _first_line(preview_text, 200) or None,
+                    "summary_preview": _preview(preview_text, 200) or None,
                 },
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
@@ -3095,8 +3118,8 @@ def _gate_empty_completion(
         _append_event(
             conn, task_id, "completion_blocked_empty_result",
             {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
+                "result_preview": _preview(result, 200) or None,
+                "summary_preview": _preview(summary, 200) or None,
             },
         )
     raise EmptyCompletionError(task_id)
@@ -3143,7 +3166,10 @@ def _completed_event_payload(
     # ignored the config (#18994).
     payload: dict = {
         "result_len": len(result) if result else 0,
-        "summary": _first_line(event_summary, 400) or None,
+        "summary": _preview(event_summary, 400) or None,
+        # Full length BEFORE capping: a consumer can tell a truncated preview
+        # (len(summary) < summary_chars) from a genuinely short handoff.
+        "summary_chars": len(event_summary) if event_summary else 0,
     }
     if verified_cards:
         payload["verified_cards"] = verified_cards
@@ -3580,7 +3606,8 @@ def edit_task(
                 {
                     "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
                     "result_len": len(result) if result else 0,
-                    "summary": _first_line(handoff_summary, 400) or None,
+                    "summary": _preview(handoff_summary, 400) or None,
+                    "summary_chars": len(handoff_summary) if handoff_summary else 0,
                 },
                 run_id=run_id,
             )
@@ -3840,7 +3867,8 @@ def request_review(
                 profile=implementer,
             )
             payload: dict = {
-                "summary": _first_line(summary, 400) or None,
+                "summary": _preview(summary, 400) or None,
+                "summary_chars": len(summary) if summary else 0,
                 "implementer": implementer,
                 "reviewer": reviewer,
             }

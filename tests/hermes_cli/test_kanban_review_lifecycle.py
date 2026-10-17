@@ -113,8 +113,11 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         payload = rr[0][1]
         assert payload["implementer"] == "worker"
         assert payload["reviewer"] == "reviewer"
-        # First line of the summary rides the event payload.
-        assert payload["summary"] == "Implementation complete"
+        # The preview rides the event payload with its lines JOINED, so a
+        # multi-line handoff no longer loses everything after line 1
+        # (FORK-CUSTOMIZATIONS.md §11). ``task_runs.summary`` keeps it verbatim.
+        assert payload["summary"] == "Implementation complete full details below"
+        assert payload["summary_chars"] == len("Implementation complete\nfull details below")
         # No block / triage events were emitted.
         assert _events(conn, tid, kind="blocked") == []
         assert _events(conn, tid, kind="block_loop_detected") == []

@@ -212,11 +212,11 @@ handoff survived intact) -- but nothing on the card says the preview is partial.
 upstream with the same call sites), but the PR queue is backed up and the fix is minor. Kept as a local
 customization -- a deliberate, recorded divergence, not an oversight.
 
-- **Fork-only**: `tests/hermes_cli/test_kanban_summary_preview.py` -- **pending**, added by card
-  `t_bd624d24`. Add it to the machine-readable block when the file exists; a path listed before it
-  exists is reported as `gone` by the probe.
-- **Edits to shared**: `hermes_cli/kanban_db.py`, `hermes_cli/kanban.py`
-- **Guarded by**: pending with `t_bd624d24` (unit test: preview <= limit, ends in `…`, no mid-word cut)
+- **Fork-only**: `tests/hermes_cli/test_kanban_summary_preview.py`
+- **Edits to shared**: `hermes_cli/kanban_db.py`, `hermes_cli/kanban.py`,
+  `hermes_cli/kanban_db_context.py`
+- **Guarded by**: `tests/hermes_cli/test_kanban_summary_preview.py` (preview <= limit, ends in
+  `…`, no mid-word cut, lines joined, `summary_chars` on the payload, CLI prints the full text)
 - **Upstream-watch**: `_first_line`, `_preview`, `summary` preview, `summary_chars`
 
 ---
@@ -281,6 +281,7 @@ tests/hermes_cli/test_kanban_per_profile_cap_namespaced.py
 tests/hermes_cli/test_kanban_phantom_refs.py
 tests/hermes_cli/test_kanban_quota_release_all.py
 tests/hermes_cli/test_kanban_shared_dir_mode.py
+tests/hermes_cli/test_kanban_summary_preview.py
 tests/hermes_cli/test_kanban_write_guard_purge_survival.py
 tests/hermes_cli/test_quota_state.py
 tests/hermes_cli/test_quota_state_board.py

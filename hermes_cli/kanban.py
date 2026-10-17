@@ -585,10 +585,25 @@ def _cmd_show(args: argparse.Namespace) -> int:
             outcome = r.outcome or r.status or "active"
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
             if r.summary:
-                print(f"        → {r.summary.splitlines()[0][:160]}")
+                _print_run_summary(r.summary)
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0
+
+
+def _print_run_summary(summary: str, prefix: str = "        → ") -> None:
+    """Print a stored handoff VERBATIM, continuation lines aligned.
+
+    ``task_runs.summary`` keeps the full text; the CLI used to print only
+    ``splitlines()[0][:160]``, so a long handoff looked complete while most of
+    it was invisible (FORK-CUSTOMIZATIONS.md §11). Terminal wrapping handles
+    the width, so nothing is cut here.
+    """
+    lines = summary.strip().splitlines() or [""]
+    print(f"{prefix}{lines[0]}".rstrip())
+    pad = " " * len(prefix)
+    for line in lines[1:]:
+        print(f"{pad}{line}".rstrip())
 
 
 def _cmd_assign(args: argparse.Namespace) -> int:
@@ -1314,9 +1329,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
         print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
         if r.summary:
-            print(f"     → {r.summary.splitlines()[0][:100]}")
+            _print_run_summary(r.summary, "     → ")
         if r.error:
-            print(f"     ✖ {r.error[:100]}")
+            print(f"     ✖ {r.error.splitlines()[0][:160]}")
     return 0
 
 

@@ -190,7 +190,7 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
         return
     lines.append(f"## Recent work by @{task.assignee}")
     for row in role_rows:
-        first = _kb._first_line(row["summary"], 200) or "(no summary)"
+        first = _kb._preview(row["summary"], 200) or "(no summary)"
         lines.append(
             f"- {row['id']} — {row['title']} ({_ctx_stamp(_kb._to_epoch(row['ended_at']) or 0, now)}): {first}"
         )
