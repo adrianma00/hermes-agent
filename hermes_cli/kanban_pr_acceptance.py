@@ -98,8 +98,11 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
     if not assignee:
         return None
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_cli.kanban_db_dispatch import assignee_profile
     try:
-        return resolve_profile_env(normalize_profile_name(assignee))
+        # Strip an install-namespace qualifier ("em:default") first: the assignee is stored with it
+        # on cross-fleet boards, and resolve_profile_env rejects a colon outright (R33).
+        return resolve_profile_env(normalize_profile_name(assignee_profile(assignee)))
     except (FileNotFoundError, ValueError):
         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
 

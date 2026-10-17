@@ -91,6 +91,16 @@ zero hits.
   shadowed by the re-export and silently dead code** (that exact trap produced 19 test errors on the
   merge: `create_board() got an unexpected keyword argument 'namespace'`).
 - **Upstream-watch**: `namespace`, `tenant`, upstream PR 130854 (reserved/unspawnable assignee refusal)
+- **Every site that turns an `assignee` into a profile home must strip the qualifier first**
+  (`assignee_profile()` in `kanban_db_dispatch.py`) -- `resolve_profile_env()` rejects a colon
+  outright, so a raw `"em:default"` raises `ValueError` there. Ported sites: `kanban_db_dispatch.py`
+  (spawn), `gateway/session_kanban.py` (claim admission), `hermes_cli/kanban_pr_acceptance.py`
+  (completion-contract gate). This class landed **twice** before it was caught -- the 2026-10-16
+  board-metadata move, then the 2026-10-17 gateway claim-admission path, which refused every
+  namespaced card as an opaque `invalid_kanban_claim`. `tests/hermes_cli/
+  test_kanban_namespace_profile_lookup_guard.py` is the standing detector: it fails on any new
+  `resolve_profile_env(<raw assignee>)` and on any blessed site that loses its `assignee_profile()`
+  call, so a merge cannot silently drop the strip again. Extend its `_BLESSED` map when adding a site.
 
 ## 4. Mobile pairing CLI
 

@@ -13,6 +13,7 @@ from hermes_state_runtime import RuntimeStoreError
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
+    from hermes_cli.kanban_db_dispatch import assignee_profile
     from gateway.session_policy import build_policy
     authority, actor = connection.authority, connection.actor
     if not connection.native_owner or 'session:create' not in actor.capabilities:
@@ -34,7 +35,13 @@ def build_kanban_policy(connection, params, config):
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
                     or task.claim_lock != params['claim_lock'] or run['claim_lock'] != task.claim_lock):
                 raise RuntimeStoreError('stale_kanban_claim')
-            if Path(resolve_profile_env(task.assignee)).resolve() != Path(authority.profile_id).resolve():
+            # The assignee may carry an install-namespace qualifier ("em:default"), which is how
+            # a cross-fleet board names a profile (R33). resolve_profile_env only accepts a bare
+            # profile id, so strip the qualifier exactly as the dispatcher does before spawning
+            # (kanban_db_dispatch._default_spawn) — otherwise the ValueError is swallowed below
+            # and every namespaced card is refused as an opaque invalid_kanban_claim.
+            if (Path(resolve_profile_env(assignee_profile(task.assignee))).resolve()
+                    != Path(authority.profile_id).resolve()):
                 raise RuntimeStoreError('profile_mismatch')
             bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
                                  (task.id, task.current_run_id)).fetchone()
