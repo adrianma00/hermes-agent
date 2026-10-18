@@ -1823,10 +1823,30 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
         )
 
+    def _mark_planned_teardown(self) -> None:
+        """Stamp the lifecycle sentinel ``stopping`` so an interrupted teardown is not read as a
+        kill of a live gateway.  Best-effort: forensics never affect shutdown."""
+        try:
+            from gateway.lifecycle_ledger import mark_stopping
+
+            if getattr(self, "_restart_requested", False):
+                reason = "planned_restart"
+            elif getattr(self, "_signal_initiated_shutdown", False):
+                reason = "signal_stop"
+            else:
+                reason = "planned_stop"
+            mark_stopping(reason)
+        except Exception:
+            logger.debug("Failed to mark the planned teardown in the lifecycle ledger", exc_info=True)
+
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
+        # BEFORE the drain: a life killed inside teardown (a stop CLI's bounded grace, a
+        # supervisor TimeoutStopSec) otherwise leaves a ``running`` sentinel and the next
+        # boot misreports a planned stop as "no exit path ran" — see mark_stopping.
+        GatewayShutdownMixin._mark_planned_teardown(self)
         self._running = False
         self._clear_plugin_message_injector()
         self._draining = True

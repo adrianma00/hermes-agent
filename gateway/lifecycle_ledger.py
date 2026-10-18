@@ -7,6 +7,15 @@ death (SIGKILL, kernel OOM, VM death) runs no handler.  A sentinel at
 unclean death, appended to the exit-diag log as ``gateway.previous_unclean_exit``
 and logged at WARNING; :func:`mark_exited` rewrites ``phase=exited`` on every
 clean exit path.  Best-effort: forensics must never affect the lifecycle.
+
+A third phase closes the gap between "accepted a graceful stop" and "wrote the
+clean-exit receipt": :func:`mark_stopping` records ``phase == "stopping"`` when
+teardown begins.  A life killed INSIDE teardown (a stop CLI's bounded grace
+elapsing, a supervisor's ``TimeoutStopSec``, an OOM at the wrong moment) is then
+reported as an interrupted planned stop, not as "no exit path ran" — the verdict
+that made a fully drained Windows ``hermes gateway stop`` look like a SIGKILL.
+The distinction stays sharp in both directions: a kill of a RUNNING gateway runs
+no teardown at all, so its sentinel is still ``running`` and still unclean.
 """
 
 from __future__ import annotations
@@ -154,9 +163,18 @@ def _suspected_oom(mem: dict[str, Any]) -> bool:
 
 
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    """Evidence dict when the previous life died uncleanly, else ``None``. Read-only."""
+    """Evidence dict when the previous life did not exit cleanly, else ``None``. Read-only.
+
+    Two un-clean verdicts, kept apart because they mean different things:
+
+    * ``phase == "running"`` → nothing ran: SIGKILL / OOM / VM death / a kill of a
+      live gateway.  ``evidence["planned_stop"]`` is absent.
+    * ``phase == "stopping"`` → the gateway ACCEPTED a graceful stop and was killed
+      (or crashed) inside teardown, before :func:`mark_exited` could run.
+      ``evidence["planned_stop"]`` is True and carries the stop reason.
+    """
     sentinel = _read_json(get_lifecycle_sentinel_path(home))
-    if not sentinel or sentinel.get("phase") != "running":
+    if not sentinel or sentinel.get("phase") not in ("running", "stopping"):
         return None
     if _pid_is_sentinel_owner(sentinel.get("pid"), sentinel.get("start_time"), sentinel.get("create_time")):
         return None  # live owner — planned takeover in flight, not a death
@@ -164,6 +182,10 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
         "prior_pid": sentinel.get("pid"), "prior_started_at": sentinel.get("started_at"),
         "prior_start_time": sentinel.get("start_time"),
     }
+    if sentinel.get("phase") == "stopping":
+        evidence["planned_stop"] = True
+        evidence["stop_reason"] = sentinel.get("stop_reason")
+        evidence["stop_requested_at"] = sentinel.get("stop_requested_at")
     # Enrich with the last heartbeat: last proven liveness and memory at that moment.
     try:
         from gateway.shutdown_watchdog import get_loop_heartbeat_path
@@ -298,6 +320,20 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
                 "missing until it is repaired. Run `hermes doctor`.",
                 verdict,
             )
+    if evidence.get("planned_stop"):
+        _append_exit_diag(
+            {"ts": _now_iso(), "tag": "gateway.previous_incomplete_stop", "pid": os.getpid(), **evidence}, home)
+        logger.warning(
+            "Previous gateway life (pid=%s, started_at=%s) accepted a stop request (reason=%s) at %s but "
+            "never wrote its clean-exit receipt — it was killed or died INSIDE teardown (stop grace elapsed, "
+            "supervisor TimeoutStopSec, or a crash during drain). This is NOT a SIGKILL/OOM of a running "
+            "gateway: the drain had already started. last_heartbeat_at=%s last_mem=%s suspected_oom=%s",
+            evidence.get("prior_pid"), evidence.get("prior_started_at"),
+            evidence.get("stop_reason") or "unknown", evidence.get("stop_requested_at") or "unknown",
+            evidence.get("last_heartbeat_at"), evidence.get("last_heartbeat_mem"),
+            evidence.get("suspected_oom", False),
+        )
+        return
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
@@ -338,9 +374,16 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
         # machine-readable copy (/api/status reads it to report an OOM restart).
         # Scoped to this life — the next clean exit or boot rewrites the sentinel.
         if evidence is not None:
-            claim["prior_unclean_exit"] = True
-            if evidence.get("suspected_oom"):
-                claim["prior_suspected_oom"] = True
+            if evidence.get("planned_stop"):
+                # Teardown was interrupted, not absent: record it, but do NOT claim an
+                # OOM/unclean restart (memory_status reads prior_unclean_exit).
+                claim["prior_incomplete_stop"] = True
+                if evidence.get("stop_reason"):
+                    claim["prior_stop_reason"] = evidence["stop_reason"]
+            else:
+                claim["prior_unclean_exit"] = True
+                if evidence.get("suspected_oom"):
+                    claim["prior_suspected_oom"] = True
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
@@ -429,11 +472,45 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
         logger.debug("Failed to mark lifecycle sentinel exited", exc_info=True)
 
 
+def mark_stopping(reason: str = "planned_stop", home: Optional[Path] = None) -> None:
+    """Record that this life accepted a graceful stop and is tearing down.  Idempotent, never raises.
+
+    Called at the START of teardown, before the drain, so the intent survives a kill
+    inside teardown (a stop CLI's bounded grace, systemd ``TimeoutStopSec``, an OOM at
+    the wrong moment).  Without it the next boot can only say "no exit path ran", which
+    is indistinguishable from a real SIGKILL — and was reported for a Windows gateway
+    that had already drained cleanly when ``hermes gateway stop`` gave up waiting.
+
+    Ownership-guarded exactly like :func:`mark_exited`: during ``--replace`` the
+    successor may already own the sentinel, and this process must not clobber it.
+    """
+    try:
+        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        if sentinel is not None and sentinel.get("pid") != os.getpid():
+            return
+        stopping: dict[str, Any] = {
+            "phase": "stopping", "pid": os.getpid(), "stop_reason": reason,
+            "stop_requested_at": _now_iso(),
+        }
+        # Keep the incarnation identity (and the claim time) so the Windows start
+        # attestation and the PID-reuse guard still match this life.
+        for key in ("start_time", "create_time", "started_at"):
+            if sentinel is not None and sentinel.get(key) is not None:
+                stopping[key] = sentinel[key]
+        _write_sentinel(stopping, home)
+    except Exception:
+        logger.debug("Failed to mark lifecycle sentinel stopping", exc_info=True)
+
+
 def read_prior_exit_label(profile_home: Path) -> str:
-    """``clean``/``unclean``/``unknown`` for the profile's last gateway life; annotates
-    ``container-boot.log``.  ``running`` is unclean: the old PID namespace is gone at container boot."""
+    """``clean``/``incomplete``/``unclean``/``unknown`` for the profile's last gateway life.
+
+    Annotates ``container-boot.log``.  ``running`` is unclean: the old PID namespace is
+    gone at container boot.  ``stopping`` is an interrupted planned stop — teardown had
+    begun, so it is neither a clean exit nor evidence of a kill of a live gateway.
+    """
     try:
         phase = (_read_json(get_lifecycle_sentinel_path(profile_home)) or {}).get("phase")
-        return {"exited": "clean", "running": "unclean"}.get(phase, "unknown")
+        return {"exited": "clean", "stopping": "incomplete", "running": "unclean"}.get(phase, "unknown")
     except Exception:
         return "unknown"

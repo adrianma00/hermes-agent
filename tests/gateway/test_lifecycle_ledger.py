@@ -6,10 +6,14 @@ The ledger is a tiny sentinel state machine:
 ``record_startup``/``detect_unclean_exit`` reports a still-``running``
 sentinel from a dead process as an unclean death (SIGKILL / OOM / VM loss)
 and enriches the report with the last heartbeat's memory sample.
+
+A life killed INSIDE teardown (``phase=stopping``, set by ``mark_stopping``) is a
+different verdict — an interrupted planned stop, not a kill of a live gateway.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -20,6 +24,7 @@ from gateway.lifecycle_ledger import (
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
     mark_exited,
+    mark_stopping,
     read_prior_exit_label,
     record_startup,
     sample_memory,
@@ -252,3 +257,118 @@ def test_replace_handover_is_not_a_death_and_pid_reuse_is(tmp_path: Path, monkey
     assert detect_unclean_exit(home=tmp_path) is None
     _write_sentinel(tmp_path, {**live, "start_time": 4000.0})  # born after the claim → reuser → death
     assert detect_unclean_exit(home=tmp_path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Planned stop interrupted inside teardown (phase=stopping)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_stopping_stamps_the_phase_and_keeps_the_incarnation(tmp_path: Path) -> None:
+    record_startup(home=tmp_path)
+    running = _read_sentinel(tmp_path)
+
+    mark_stopping("planned_stop", home=tmp_path)
+
+    stopping = _read_sentinel(tmp_path)
+    assert stopping["phase"] == "stopping"
+    assert stopping["stop_reason"] == "planned_stop"
+    assert stopping["stop_requested_at"]
+    # Identity must survive: the PID-reuse guard and the Windows start attestation match on these.
+    assert (stopping["pid"], stopping["start_time"]) == (running["pid"], running["start_time"])
+    assert stopping["started_at"] == running["started_at"]
+
+
+def test_mark_stopping_never_clobbers_a_successor_sentinel(tmp_path: Path) -> None:
+    """During --replace the successor claims the sentinel first; the retiring life must not
+    overwrite it with its own ``stopping`` phase."""
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID, "start_time": 1000.0})
+
+    mark_stopping("planned_stop", home=tmp_path)
+
+    assert _read_sentinel(tmp_path) == {"phase": "running", "pid": _DEAD_PID, "start_time": 1000.0}
+
+
+def test_stopping_sentinel_from_dead_pid_reports_an_interrupted_planned_stop(tmp_path: Path) -> None:
+    _write_sentinel(tmp_path, {
+        "phase": "stopping", "pid": _DEAD_PID, "start_time": 1000.0,
+        "started_at": "2026-10-18T04:53:34+00:00",
+        "stop_reason": "planned_stop", "stop_requested_at": "2026-10-18T04:54:17+00:00",
+    })
+
+    evidence = detect_unclean_exit(home=tmp_path)
+    assert evidence is not None
+    assert evidence["planned_stop"] is True
+    assert evidence["stop_reason"] == "planned_stop"
+    assert evidence["prior_pid"] == _DEAD_PID
+
+
+def test_interrupted_planned_stop_is_reported_apart_from_a_kill(tmp_path: Path, caplog) -> None:
+    """The Windows false positive: a gateway that drained and was killed mid-teardown. The next boot
+    must NOT claim "no exit path ran — SIGKILL / OOM", and must not flag an OOM restart."""
+    _write_sentinel(tmp_path, {
+        "phase": "stopping", "pid": _DEAD_PID, "start_time": 1000.0,
+        "started_at": "2026-10-18T04:53:34+00:00",
+        "stop_reason": "planned_stop", "stop_requested_at": "2026-10-18T04:54:17+00:00",
+    })
+
+    with caplog.at_level(logging.WARNING):
+        evidence = record_startup(home=tmp_path)
+
+    assert evidence is not None and evidence["planned_stop"] is True
+    warning = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "accepted a stop request (reason=planned_stop) at 2026-10-18T04:54:17+00:00" in warning
+    assert "INSIDE teardown" in warning
+    assert "no exit path ran" not in warning
+
+    records = _exit_diag_records(tmp_path)
+    assert [r["tag"] for r in records] == ["gateway.previous_incomplete_stop"]
+
+    claimed = _read_sentinel(tmp_path)
+    assert claimed["phase"] == "running"
+    assert claimed.get("prior_incomplete_stop") is True
+    assert claimed.get("prior_stop_reason") == "planned_stop"
+    assert "prior_unclean_exit" not in claimed
+    assert "prior_suspected_oom" not in claimed
+
+
+def test_kill_of_a_running_gateway_stays_unclean(tmp_path: Path, caplog) -> None:
+    """The other direction of the same signal: a deliberate taskkill /F on a RUNNING gateway runs no
+    teardown, so its sentinel is still ``running`` and the verdict stays a hard kill."""
+    _write_sentinel(tmp_path, {
+        "phase": "running", "pid": _DEAD_PID, "start_time": 1000.0,
+        "started_at": "2026-10-18T04:53:34+00:00",
+    })
+
+    with caplog.at_level(logging.WARNING):
+        evidence = record_startup(home=tmp_path)
+
+    assert evidence is not None
+    assert "planned_stop" not in evidence
+    warning = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "exited UNCLEANLY (no exit path ran" in warning
+    assert _read_sentinel(tmp_path)["prior_unclean_exit"] is True
+
+
+def test_prior_exit_label_calls_a_stopping_sentinel_incomplete(tmp_path: Path) -> None:
+    _write_sentinel(tmp_path, {"phase": "stopping", "pid": _DEAD_PID, "start_time": 1000.0})
+    assert read_prior_exit_label(tmp_path) == "incomplete"
+
+
+def test_teardown_stamp_names_the_stop_kind(monkeypatch) -> None:
+    """``_stop_begin_teardown`` stamps the ledger BEFORE the drain, and names what asked for it."""
+    from types import SimpleNamespace
+
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    seen: list[str] = []
+    monkeypatch.setattr("gateway.lifecycle_ledger.mark_stopping", lambda reason="planned_stop", home=None: seen.append(reason))
+
+    for flags, expected in (
+        ({}, "planned_stop"),
+        ({"_restart_requested": True}, "planned_restart"),
+        ({"_signal_initiated_shutdown": True}, "signal_stop"),
+    ):
+        seen.clear()
+        GatewayShutdownMixin._mark_planned_teardown(SimpleNamespace(**flags))
+        assert seen == [expected]
