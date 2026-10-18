@@ -129,6 +129,27 @@ def test_resolved_link_loop_open_refused(khome, gate_log):
     conn.close()
 
 
+def test_loop_closed_with_stale_evidence_is_refused(khome, gate_log):
+    """ACCEPTANCE: a LOOP-CLOSED line whose counterpart did NOT change after this run started.
+
+    The line is syntactically perfect and its ``at=`` is honest — it is simply about a change that
+    happened BEFORE this run. A claim is not proof: the counterpart's own rows must postdate the
+    run, or the "closed" loop is a silent completion.
+    """
+    conn = _conn()
+    other = mk(conn, title="counterpart card", age_s=3600)
+    stale = bump(conn, other, when=int(time.time()) - 1800)     # changed 30 min BEFORE this run
+    tid = mk(conn, title="Dispatcher card",
+             body=f"CROSSLINK: board=default id={other} role=work\n"
+                  f"LOOP-CLOSED: board=default id={other} via=comment at={iso(stale)}",
+             age_s=60)
+    v = g.gate_completion(conn, tid)
+    assert not v.allowed and v.check == g.CHECK_LOOP
+    assert "before this run started" in v.message
+    assert "REFUSED" in gate_log.read_text()
+    conn.close()
+
+
 def test_resolved_link_without_loop_closed_line_refused(khome, gate_log):
     conn = _conn()
     other = mk(conn, title="counterpart card")
@@ -157,14 +178,25 @@ def test_loop_closed_template_placeholder_refused(khome, gate_log):
 
 
 def test_resolved_link_pointing_at_a_missing_card_refused(khome, gate_log):
+    """An id that is not on the named board is an UNRESOLVED crosslink, not a loop claim."""
     conn = _conn()
     tid = mk(conn, title="Dispatcher card",
              body="CROSSLINK: board=default id=t_000000dead role=work\n"
                   f"LOOP-CLOSED: board=default id=t_000000dead via=close at={iso(int(time.time()))}",
              age_s=60)
     v = g.gate_completion(conn, tid)
-    assert not v.allowed and v.check == g.CHECK_LOOP
+    assert not v.allowed and v.check == g.CHECK_PENDING
     assert "does not resolve" in v.message
+    conn.close()
+
+
+def test_crosslink_line_without_an_id_refused(khome, gate_log):
+    """``CROSSLINK: board=em-board role=work`` names no counterpart — refused at once (no grace)."""
+    conn = _conn()
+    tid = mk(conn, title="Dispatcher card", body="CROSSLINK: board=default role=work")
+    v = g.gate_completion(conn, tid)
+    assert not v.allowed and v.check == g.CHECK_PENDING
+    assert "names no id" in v.message
     conn.close()
 
 
@@ -228,6 +260,33 @@ def test_approval_must_match_the_dashboard_parser(khome, gate_log):
              body="approved by landing_guard --approve " + "b" * 40)
     v = g.gate_completion(conn, tid)
     assert not v.allowed and v.check == g.CHECK_APPROVAL
+    conn.close()
+
+
+def test_structured_approve_sha_is_enough(khome, gate_log):
+    """R55: the structured field is the approval — a command string is not required."""
+    sha = "c" * 40
+    conn = _conn()
+    tid = mk(conn, title="Land the fix",
+             body=f"landing_guard gate applies.\napprove_sha={sha}\napprove_note=Adrian approved")
+    v = g.gate_completion(conn, tid)
+    assert v.allowed, v.message
+    log = gate_log.read_text()
+    assert "ALLOWED" in log and "LEGACY" not in log
+    found = g.find_approval([], f"approve_sha={sha}")
+    assert found is not None and found["source"] == "structured"
+    conn.close()
+
+
+def test_legacy_command_approval_is_logged_as_legacy(khome, gate_log):
+    """Accepted for dashboard parity, but never silently: the reader still has to move (P5)."""
+    sha = "d" * 40
+    conn = _conn()
+    tid = mk(conn, title="Land the fix", body="landing_guard gate applies.",
+             comments=(f'landing_guard.py --approve {sha} --note "Adrian"',))
+    v = g.gate_completion(conn, tid)
+    assert v.allowed, v.message
+    assert "LEGACY landing_guard command" in gate_log.read_text()
     conn.close()
 
 
@@ -326,15 +385,20 @@ def test_crosslinks_ignore_body_prose():
     """A card that QUOTES the token syntax is not linked (the P0 false positive)."""
     links = g.parse_crosslinks("no link here", "we should stop writing 🔗 ns#pending in prose")
     assert links == []
+    # R55: column 0 only. An indented bullet is prose, not a declaration.
     links = g.parse_crosslinks("plain", "  - CROSSLINK: board=em-board id=t_abc role=work")
-    assert [(l.board, l.id) for l in links] == [("em-board", "t_abc")]
+    assert links == [] and g.crosslink_problems("  - CROSSLINK: board=em-board id=t_abc") == []
+    links = g.parse_crosslinks("plain", "CROSSLINK: board=em-board id=t_abc role=work")
+    assert [(l.board, l.id, l.role) for l in links] == [("em-board", "t_abc", "work")]
     links = g.parse_crosslinks("🔗 em#t_1: work", "")
     assert [(l.board, l.id) for l in links] == [("em", "t_1")]
 
 
-def test_kv_parsing_handles_reordered_fields():
+def test_crosslink_fields_are_positional():
+    """R55: board, then id, then role — a reordered line is a declaration nobody can parse."""
     links = g.parse_crosslinks("", "CROSSLINK: id=t_abc role=tracker board=em-board")
-    assert [(l.board, l.id, l.role) for l in links] == [("em-board", "t_abc", "tracker")]
+    assert links == []
+    assert g.crosslink_problems("CROSSLINK: id=t_abc role=tracker board=em-board")[0][0] == "unparseable"
 
 
 # --- run anchor: the CURRENT attempt, not the first claim ---------------------------------------

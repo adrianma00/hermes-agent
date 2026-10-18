@@ -13,11 +13,16 @@ WHY  ``complete`` used to be a bare status flip: the card said "done" and nothin
 WHAT IS CHECKED (completion only — ``create`` is deliberately NOT gated, because several legitimate
 cards discuss the token syntax in prose)
   1. ``approval_malformed`` — the card (title, body or a comment) mentions ``landing_guard``,
-     ``--approve`` or "landing approval", but no approval the dashboard can parse is present.
-     The parser is the SAME one em-hq uses (:data:`APPROVE_RE`), on purpose: a gate that accepts
-     what the dashboard cannot read would hide the missing button it exists to catch.
-  2. ``unresolved_crosslink`` — a ``🔗 <scope>#pending`` token older than
-     :data:`DEFAULT_PENDING_GRACE_S` (900 s = three reporter cycles).
+     ``--approve`` or "landing approval", but carries no ``approve_sha``. An approval is a
+     STRUCTURED field first (R55: a human-typed command string is never the input): a body/comment
+     line ``approve_sha=<sha>`` (+ optional ``approve_note=``). While em-hq's P0 reader is still
+     live it also still parses the ``landing_guard.py --approve <sha> --note "…"`` command, so that
+     form is accepted as a LEGACY fallback and logged as such — never silently, because the
+     dashboard's release button still comes from it until P5 replaces it.
+  2. ``unresolved_crosslink`` — a crosslink declaration that cannot be resolved: no ``id=`` at all,
+     a placeholder (``pending``) older than :data:`DEFAULT_PENDING_GRACE_S` (900 s = three reporter
+     cycles), a line not in the canonical positional form (R55), or an ``id=`` that is simply not
+     on the board the line names. A board this install cannot read is a NAMED note, never a refusal.
   3. ``loop_not_closed`` — the card carries a RESOLVED crosslink and states no
      ``LOOP-CLOSED: board=… id=… via=comment|close|dm at=…`` line, or its claim fails verification:
      the counterpart must have actually changed (status/comment/event) at or after THIS RUN's
@@ -81,15 +86,28 @@ REMOTE_TIMEOUT_S = 25
 # whether to offer a release with exactly this, so "the gate is happy but no button appears" is
 # impossible by construction.
 APPROVE_RE = re.compile(r'landing_guard\.py\s+--approve\s+([0-9a-f]{7,40})\s+--note\s+"([^"\n]*)"')
-LANDING_MENTION = ("landing_guard", "--approve", "landing approval")
+# R55: approval is a STRUCTURED pair of fields, parsed by position at line start — never the
+# human-typed ``landing_guard.py --approve …`` command, which is only kept below as a legacy
+# fallback while em-hq's P0 reader (deleted by P5) still derives the release button from it.
+APPROVE_SHA_LINE_RE = re.compile(r"^approve_sha\s*[:=]\s*([0-9a-f]{7,40})\s*$", re.IGNORECASE)
+APPROVE_NOTE_LINE_RE = re.compile(r"^approve_note\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
+LANDING_MENTION = ("landing_guard", "--approve", "landing approval", "approve_sha")
 
+# R55 grammar, parsed BY POSITION and only at column 0: board, then id, then role
+# (`CROSSLINK:`), board, id, via, at (`LOOP-CLOSED:`). A line that does not fit is a DECLARATION
+# THAT CANNOT BE PARSED — reported, never guessed at. A 🔗 token belongs in prose (where it means
+# nothing) or in a title; the title form is a live P0/dashboard parity shim and retires with P5.
 LINK_RE = re.compile(r"🔗\s*([A-Za-z0-9_-]+)\s*#\s*([A-Za-z0-9_-]+)")
-CROSSLINK_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?CROSSLINK:", re.IGNORECASE)
-LOOP_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?LOOP-CLOSED:", re.IGNORECASE)
-KV_RE = re.compile(r"([A-Za-z_]+)\s*=\s*([A-Za-z0-9_.:/+-]+)")
+CROSSLINK_STRICT_RE = re.compile(
+    r"^CROSSLINK:\s+board=(\S+)(?:\s+id=(\S+))?(?:\s+role=(\S+))?(?:\s+\S.*)?$")
+LOOP_STRICT_RE = re.compile(
+    r"^LOOP-CLOSED:\s+board=(\S+)\s+id=(\S+)\s+via=(\S+)\s+at=(\S+)(?:\s+\S.*)?$")
 LOOP_VIA = ("comment", "close", "dm")
 
-PENDING_IDS = ("pending",)
+# Placeholders are honest at creation and must not STAY: `pending` gets the grace window; a line
+# with NO id at all cannot be resolved by anyone and is refused immediately.
+PENDING_IDS = ("pending", "#pending")
+MISSING_IDS = ("", "tbd", "none", "-")
 
 # ``--force`` keeps its old boolean meaning (override the live-claim guard) AND gains an optional
 # reason for the pre-complete gate: ``--force`` alone -> no reason supplied, ``--force "why"`` ->
@@ -114,8 +132,9 @@ CHECK_LOOP = "loop_not_closed"
 # --- small pure helpers -------------------------------------------------------------------------
 
 def _kv(text: str) -> dict[str, str]:
-    """``k=v`` pairs on one line. Order does not matter; unknown keys are kept, unread."""
-    return {m.group(1).lower(): m.group(2) for m in KV_RE.finditer(text or "")}
+    """``k=v`` pairs on one line — kept for callers that only need a lenient view."""
+    return {m.group(1).lower(): m.group(2)
+            for m in re.finditer(r"([A-Za-z_]+)\s*=\s*([A-Za-z0-9_.:/+#-]+)", text or "")}
 
 
 def _iso(ts: Optional[float]) -> str:
@@ -130,11 +149,29 @@ def mentions_landing(*texts: str) -> bool:
 
 
 def find_approval(comments: list[str], body: str) -> Optional[dict]:
-    """Newest comment first, then the body — the order a human would read it (mirrors em-hq)."""
-    for text in list(reversed(comments or [])) + [body or ""]:
+    """The card's landing approval, structured field FIRST, legacy command second.
+
+    Order is newest-comment-first then body, the order a human would read it. ``source`` says
+    which form was found: ``structured`` (``approve_sha=<sha>``, the R55 shape) or
+    ``legacy-command`` (the em-hq P0 reader's shape, logged as a note so nobody assumes the
+    dashboard has moved on).
+    """
+    texts = list(reversed(comments or [])) + [body or ""]
+    for text in texts:
+        for line in (text or "").splitlines():
+            m = APPROVE_SHA_LINE_RE.match(line)
+            if m:
+                note = ""
+                for cand in (text or "").splitlines():
+                    n = APPROVE_NOTE_LINE_RE.match(cand)
+                    if n:
+                        note = n.group(1)
+                        break
+                return {"sha": m.group(1), "note": note, "source": "structured"}
+    for text in texts:
         m = APPROVE_RE.search(text or "")
         if m:
-            return {"sha": m.group(1), "note": m.group(2)}
+            return {"sha": m.group(1), "note": m.group(2), "source": "legacy-command"}
     return None
 
 
@@ -149,51 +186,83 @@ class Link:
         return f"{self.board}#{self.id}"
 
 
-def parse_crosslinks(title: str, body: str) -> list[Link]:
-    """A crosslink counts only from the card TITLE or a body line that STARTS with ``CROSSLINK:``.
+def _crosslink_declarations(body: str) -> tuple[list[Link], list[tuple[str, str]]]:
+    """Parse ``CROSSLINK:`` body lines BY POSITION (R55) and report what cannot be parsed.
 
-    Body prose contributes nothing: several legitimate cards quote ``🔗 ns#pending`` while
-    discussing the syntax, and treating that as a link is the false positive this convention
-    exists to avoid. Rules mirror the em-hq P0 parser: optional leading whitespace, optional
-    ``- ``/``* `` list marker, ``CROSSLINK:`` at line start (case-insensitive); on such a line both
-    the structured ``board=<slug> id=<card_id>`` form and a ``🔗`` token count.
+    Only column-0 lines count: R55 makes the declaration the mechanism, so prose (and an indented
+    bullet) contributes nothing. Returns ``(links, problems)`` where a problem is
+    ``(kind, line)``: ``'unparseable'`` = not the canonical positional form,
+    ``'missing-id'`` = canonical form but no ``id=`` (a link with no referent).
     """
-    out: list[Link] = []
+    links: list[Link] = []
+    problems: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-
-    def add(board: str, cid: str, role: str, source: str) -> None:
-        key = ((board or "").strip().lower(), (cid or "").strip().lower())
-        if not key[0] or not key[1] or key in seen:
-            return
-        seen.add(key)
-        out.append(Link(board.strip(), cid.strip(), role.strip(), source))
-
-    for m in LINK_RE.finditer(title or ""):
-        add(m.group(1), m.group(2), "", "title")
-    for line in (body or "").splitlines():
-        if not CROSSLINK_LINE_RE.match(line):
+    for raw in (body or "").splitlines():
+        line = raw.rstrip()
+        if not re.match(r"(?i)^CROSSLINK:", line):
             continue
-        kv = _kv(line)
-        if kv.get("board") and kv.get("id"):
-            add(kv["board"], kv["id"], kv.get("role", ""), "crosslink-line")
-        for m in LINK_RE.finditer(line):
-            add(m.group(1), m.group(2), "", "crosslink-line")
+        m = CROSSLINK_STRICT_RE.match(line)
+        if not m:
+            problems.append(("unparseable", line.strip()[:160]))
+            continue
+        board = (m.group(1) or "").strip()
+        cid = (m.group(2) or "").strip()
+        role = (m.group(3) or "").strip()
+        if not cid:
+            problems.append(("missing-id", line.strip()[:160]))
+            continue
+        key = (board.lower(), cid.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append(Link(board, cid, role, "crosslink-line"))
+    return links, problems
+
+
+def parse_crosslinks(title: str, body: str) -> list[Link]:
+    """Links of a card: ``CROSSLINK:`` body lines (structural) plus a title 🔗 token.
+
+    The title token is a live PARITY SHIM for em-hq's P0 ingest, which still anchors on it; R55
+    retires both together in P5. Body prose never contributes a link — several legitimate cards
+    quote the token syntax while discussing it, and that false positive is what the convention
+    exists to end.
+    """
+    links, _ = _crosslink_declarations(body)
+    seen = {(l.board.lower(), l.id.lower()) for l in links}
+    out = list(links)
+    for m in LINK_RE.finditer(title or ""):
+        key = (m.group(1).lower(), m.group(2).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Link(m.group(1), m.group(2), "", "title"))
     return out
 
 
+def crosslink_problems(body: str) -> list[tuple[str, str]]:
+    """``CROSSLINK:`` lines that declare a link the gate (or anyone) cannot resolve."""
+    return _crosslink_declarations(body)[1]
+
+
 def parse_loop_closed(texts: list[str]) -> list[dict]:
-    """``LOOP-CLOSED:`` lines from the body and comments. Positional, never a prose search."""
+    """``LOOP-CLOSED:`` lines from the body and comments — positional, at column 0, never a search."""
     out: list[dict] = []
     for text in texts or []:
-        for line in (text or "").splitlines():
-            if not LOOP_LINE_RE.match(line):
+        for raw in (text or "").splitlines():
+            line = raw.rstrip()
+            if not re.match(r"(?i)^LOOP-CLOSED:", line):
                 continue
-            kv = _kv(line)
+            m = LOOP_STRICT_RE.match(line)
+            if not m:
+                out.append({"board": "", "id": "", "via": "", "at": "",
+                            "malformed": True, "raw": line.strip()[:200]})
+                continue
             out.append({
-                "board": (kv.get("board") or "").strip(),
-                "id": (kv.get("id") or "").strip(),
-                "via": (kv.get("via") or "").strip().lower(),
-                "at": (kv.get("at") or "").strip(),
+                "board": (m.group(1) or "").strip(),
+                "id": (m.group(2) or "").strip(),
+                "via": (m.group(3) or "").strip().lower(),
+                "at": (m.group(4) or "").strip(),
+                "malformed": False,
                 "raw": line.strip()[:200],
             })
     return out
@@ -430,43 +499,89 @@ def evaluate(*, title: str, body: str, comments: list[str], resolver: BoardResol
     title, body, comments = title or "", body or "", list(comments or [])
 
     # 1. approval_malformed
-    if mentions_landing(title, body, *comments) and not find_approval(comments, body):
-        ev.findings.append(Finding(
-            CHECK_APPROVAL,
-            "the card mentions landing_guard / --approve / 'landing approval' but carries no "
-            "approval the dashboard can parse (landing_guard.py --approve <sha> --note \"…\")",
-            "approve the landing before completing (one verb writes both the approval file and "
-            "the card's record), or drop the landing language from the card. The dashboard reads "
-            "landing_guard.py --approve <sha> --note \"<who/what>\" and nothing else, so without "
-            "it the release button silently disappears."))
+    if mentions_landing(title, body, *comments):
+        approval = find_approval(comments, body)
+        if approval is None:
+            ev.findings.append(Finding(
+                CHECK_APPROVAL,
+                "the card mentions landing_guard / --approve / 'landing approval' but carries no "
+                "approve_sha and no approval the dashboard can parse",
+                "write the structured field on its own line (R55): approve_sha=<sha> "
+                "(optionally approve_note=<who/what>). Until P5 swaps the dashboard's reader, also "
+                "keep the line `landing_guard.py --approve <sha> --note \"…\"`, because the release "
+                "button is still derived from exactly that string — without either, the button "
+                "silently disappears."))
+        elif approval["source"] == "legacy-command":
+            ev.notes.append(
+                f"approval read from the LEGACY landing_guard command (sha {approval['sha'][:12]}) "
+                f"— the dashboard's P0 reader still needs that string; also carry "
+                f"`approve_sha={approval['sha'][:12]}…` once P5 swaps the reader")
 
-    # 2. unresolved_crosslink
-    links = parse_crosslinks(title, body)
-    anchor = card_created_at or run_started_at
-    for link in links:
-        if link.id.strip().lower() not in PENDING_IDS:
-            continue
-        age = now - float(anchor)
-        if age > pending_grace_s:
+    # 2. unresolved_crosslink — a declaration that cannot be resolved
+    for kind, line in crosslink_problems(body):
+        if kind == "missing-id":
             ev.findings.append(Finding(
                 CHECK_PENDING,
-                f"{link.token()} is still a placeholder after {int(age)}s "
-                f"(> {int(pending_grace_s)}s grace, from the card's creation)",
-                f"resolve {link.token()} to the real id (retitle the card / edit the CROSSLINK: "
-                f"line) and, if the peer owns that card, ask it to send the id; then complete."))
+                f"CROSSLINK line names no id — the link has no referent: {line!r}",
+                "name the real counterpart card: `CROSSLINK: board=<slug> id=<card_id> "
+                "role=tracker|work|peer` (an id is `t_` + hex; `pending` is honest only briefly)."))
+        else:
+            ev.findings.append(Finding(
+                CHECK_PENDING,
+                f"CROSSLINK line is not in the canonical positional form: {line!r}",
+                "rewrite it at column 0, fields in order — `CROSSLINK: board=<slug> "
+                "id=<card_id> role=tracker|work|peer`. A 🔗 token or reordered `id=`/`board=` "
+                "is not a declaration the gate (or the dashboard) can resolve."))
 
-    # 3. loop_not_closed — a resolved link must be PROVEN closed on the counterpart
+    links = parse_crosslinks(title, body)
+    anchor = card_created_at or run_started_at
     loop_lines = parse_loop_closed([body] + comments)
-    resolved = [l for l in links if l.id.strip().lower() not in PENDING_IDS]
-    for link in resolved:
+    resolved: list[tuple[Link, Counterpart]] = []
+    for link in links:
+        cid = link.id.strip().lower()
+        if cid in MISSING_IDS or cid in PENDING_IDS:
+            age = now - float(anchor)
+            if age > pending_grace_s:
+                ev.findings.append(Finding(
+                    CHECK_PENDING,
+                    f"{link.token()} is still a placeholder after {int(age)}s "
+                    f"(> {int(pending_grace_s)}s grace, from the card's creation)",
+                    f"resolve {link.token()} to the real id (retitle the card / edit the "
+                    f"CROSSLINK: line) and, if the peer owns that card, ask it to send the id; "
+                    f"then complete."))
+            continue
         cp = resolver.resolve(link.board, link.id)
         if cp.unverifiable:
             ev.notes.append(f"unverifiable: {cp.unverifiable} {link.token()} — {cp.detail}")
             continue
-        claim = next((c for c in loop_lines
-                      if c["board"].lower() == link.board.lower()
+        if not cp.ok:
+            ev.findings.append(Finding(
+                CHECK_PENDING,
+                f"{link.token()} does not resolve on board {link.board!r} "
+                f"({cp.detail or 'no such card'})",
+                f"fix the id/board in the CROSSLINK: line — {link.token()} names no card, so the "
+                f"loop can never be closed on it. Complete the correct counterpart, then "
+                f"complete this card."))
+            continue
+        resolved.append((link, cp))
+
+    # 3. loop_not_closed — a resolved link must be PROVEN closed on the counterpart
+    for link, cp in resolved:
+        claim = next((c for c in loop_lines if not c["malformed"]
+                      and c["board"].lower() == link.board.lower()
                       and c["id"].lower() == link.id.lower()), None)
         if claim is None:
+            broken = next((c for c in loop_lines if c["malformed"]
+                           and (link.id.lower() in c["raw"].lower()
+                                or link.token().lower() in c["raw"].lower())), None)
+            if broken is not None:
+                ev.findings.append(Finding(
+                    CHECK_LOOP,
+                    f"LOOP-CLOSED for {link.token()} is malformed (not the positional form): "
+                    f"{broken['raw']!r}",
+                    f"rewrite the line at column 0, fields in order: LOOP-CLOSED: "
+                    f"board={link.board} id={link.id} via={'|'.join(LOOP_VIA)} at=<iso8601>"))
+                continue
             ev.findings.append(Finding(
                 CHECK_LOOP,
                 f"{link.token()} is resolved but the card states no LOOP-CLOSED line for it",
