@@ -142,6 +142,13 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "did not create any cards."
             ),
         },
+        "force_reason": _prop("string", (
+                "Override the pre-complete gate (approval_malformed / unresolved_crosslink / "
+                "loop_not_closed) for THIS completion. The reason is recorded in "
+                "~/.hermes/logs/pre-complete-gate.log together with the checks it overrode — "
+                "an override is never silent. Omit it unless the gate is wrong for a reason "
+                "you can state."
+        )),
         "artifacts": {
             "type": "array",
             "items": {"type": "string"},

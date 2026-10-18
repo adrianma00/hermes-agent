@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_precomplete as kpg
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
@@ -1000,6 +1001,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    force_reason = kpg.force_reason_from_cli(getattr(args, "force", None))
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -1010,11 +1012,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
+            # Pre-complete gate (approval_malformed / unresolved_crosslink / loop_not_closed).
+            # Runs on completion ONLY — `create` is not gated, because several legitimate cards
+            # discuss the token syntax in prose. --force "<reason>" overrides and is logged.
+            verdict = kpg.gate_completion(conn, tid, force_reason=force_reason)
+            if not verdict.allowed:
+                fail_msg[tid] = verdict.message
+                return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", None)))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "

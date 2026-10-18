@@ -13,6 +13,7 @@ import argparse
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.kanban_precomplete import BARE_FORCE as _BARE_FORCE
 
 
 def _arg(*flags: str, **kw):
@@ -331,9 +332,12 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
-        _arg("--force", action="store_true",
-             help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
+        _arg("--force", nargs="?", const=_BARE_FORCE, default=None,
+             metavar="REASON",
+             help="Two jobs, one flag. With no value: override the live-claim guard (complete a "
+                  "running, claimed task even without owning its run). With a reason: also "
+                  "override the pre-complete gate, and record that reason in "
+                  "~/.hermes/logs/pre-complete-gate.log (never silent)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

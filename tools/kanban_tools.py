@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_precomplete import gate_completion
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -747,6 +748,14 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        # Pre-complete gate: the same three checks the CLI runs, on the path workers actually use.
+        # Nothing has been written yet, so a refusal leaves the task in flight; ``force_reason``
+        # overrides it and is logged with the reason (never silent).
+        _force_reason = args.get("force_reason")
+        verdict = gate_completion(
+            conn, tid, force_reason=_force_reason if isinstance(_force_reason, str) else None)
+        if not verdict.allowed:
+            return tool_error(verdict.message)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
