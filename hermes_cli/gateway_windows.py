@@ -1722,9 +1722,39 @@ def start() -> None:
     _report_gateway_start("direct spawn")
 
 
-def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
+# Window granted to a gateway that already accepted a stop (lifecycle phase "stopping") to finish
+# its own teardown before the CLI escalates to taskkill. See _drain_gateway_pid.
+_STOP_TEARDOWN_GRACE_S = 45.0
+
+
+def _lifecycle_phase() -> str | None:
+    """``phase`` of the launch home's ``state/gateway.lifecycle.json`` — ``None`` when unreadable."""
+    try:
+        import json
+
+        from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
+
+        data = json.loads(get_lifecycle_sentinel_path().read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    return data.get("phase") if isinstance(data, dict) else None
+
+
+def _drain_gateway_pid(
+    pid: int, drain_timeout: float, *, teardown_grace: float = _STOP_TEARDOWN_GRACE_S,
+) -> bool:
     """Write the planned-stop marker and wait for the PID to exit. Windows can't deliver POSIX signals
-    to an asyncio loop, so the marker is the ONLY way to ask the gateway to drain and persist."""
+    to an asyncio loop, so the marker is the ONLY way to ask the gateway to drain and persist.
+
+    A drained gateway is NOT an exited one: adapters, MCP servers, session-DB close and the
+    clean-exit receipt (``lifecycle_ledger.mark_exited``) all come after the "drain done" log line.
+    Killing in that window is exactly what made a planned stop read as ``exited UNCLEANLY (no exit
+    path ran)`` in the lifecycle ledger, so once the gateway has stamped itself ``stopping`` — it
+    accepted the stop and is tearing down — it gets a second, bounded window (``teardown_grace``)
+    before the caller escalates to a hard kill.
+
+    Returns True when the PID is gone (drained AND exited) within the budget.
+    """
     if pid <= 0:
         return False
     try:
@@ -1738,11 +1768,15 @@ def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
         pass   # best-effort; caller escalates to a hard kill
 
     deadline = time.monotonic() + max(drain_timeout, 1.0)
+    extended = False
     while time.monotonic() < deadline:
         if not _pid_exists(pid):
             return True
+        if not extended and teardown_grace > 0 and _lifecycle_phase() == "stopping":
+            extended = True
+            deadline = time.monotonic() + teardown_grace
         time.sleep(0.5)
-    return False
+    return not _pid_exists(pid)
 
 
 def _windows_stop_drain_timeout() -> float:
@@ -1789,9 +1823,15 @@ def _force_terminate_known_gateway_pids(identities: dict[int, int | None]) -> in
         except ProcessLookupError:
             continue
         except PermissionError:
+            if not _pid_exists(pid):
+                continue  # already exiting on its own — a drained gateway needs no kill
             print(f"⚠ Permission denied to kill PID {pid}")
         except OSError as exc:
-            print(f"Failed to kill PID {pid}: {exc}")
+            # taskkill reports "Access denied" for a process that is already terminating; the
+            # gateway this stop asked to drain is often exactly that. Only a SURVIVOR is a failure.
+            if not _pid_exists(pid):
+                continue
+            print(f"⚠ Could not kill PID {pid}: {exc}")
     return killed
 
 
