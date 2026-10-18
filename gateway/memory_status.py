@@ -83,6 +83,9 @@ def collect_memory_status(
     status: dict[str, Any] = {
         "pressure": "unknown", "gateway_rss_mb": None, "system_total_mb": None, "system_available_mb": None,
         "swap_used_mb": None, "sampled_at": None, "last_boot_unclean": False, "last_boot_suspected_oom": False,
+        # Planned-stop classification of the previous life (see collect_memory_status below): kept
+        # separate from ``last_boot_unclean`` so an interrupted teardown is never reported as a kill.
+        "last_boot_incomplete_stop": False, "last_boot_stop_reason": None,
         # Identity of the CURRENT life (sentinel started_at): the dashboard keys
         # banner dismissal on it so acknowledging one OOM restart does not mute the NEXT.
         "boot_id": None,
@@ -105,7 +108,16 @@ def collect_memory_status(
 
     if sentinel:
         status["last_boot_unclean"] = bool(sentinel.get("prior_unclean_exit"))
-        status["last_boot_suspected_oom"] = bool(sentinel.get("prior_suspected_oom"))
+        # An OOM during teardown is a real OOM even though the stop was planned: OR the separate
+        # flag in so memory pressure stays visible exactly when it matters. `last_boot_incomplete_stop`
+        # below keeps the CLASSIFICATION honest (the life accepted a stop; it did not simply vanish).
+        status["last_boot_suspected_oom"] = bool(
+            sentinel.get("prior_suspected_oom") or sentinel.get("prior_teardown_suspected_oom"))
+        # Reader for the planned-stop flags the lifecycle ledger writes: without one they were a
+        # write-only surface (the log said "interrupted planned stop" while /api/status said nothing).
+        status["last_boot_incomplete_stop"] = bool(sentinel.get("prior_incomplete_stop"))
+        stop_reason = sentinel.get("prior_stop_reason")
+        status["last_boot_stop_reason"] = stop_reason if isinstance(stop_reason, str) and stop_reason else None
         started_at = sentinel.get("started_at")
         status["boot_id"] = started_at if isinstance(started_at, str) and started_at else None
 

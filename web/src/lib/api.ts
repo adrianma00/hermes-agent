@@ -2063,8 +2063,15 @@ export interface MemoryPressureStatus {
   /** Previous gateway life died without running any exit path. */
   last_boot_unclean?: boolean;
   /** ...and its final heartbeat showed near-exhausted memory. Heuristic —
-   * strong evidence of an OOM kill, not proof the kernel OOM killer acted. */
+   * strong evidence of an OOM kill, not proof the kernel OOM killer acted.
+   * Also true when the OOM happened INSIDE a teardown the gateway had already
+   * accepted: that life is an incomplete stop, but the memory pressure is real. */
   last_boot_suspected_oom?: boolean;
+  /** Previous life ACCEPTED a stop and was killed/died inside teardown, before it
+   * could write its clean-exit receipt. NOT a kill of a live gateway. */
+  last_boot_incomplete_stop?: boolean;
+  /** Why that stop was requested (`planned_stop` / `planned_restart` / `signal_stop`). */
+  last_boot_stop_reason?: string | null;
   /** Identity of the current gateway life (sentinel started_at). Changes on
    * every restart; keys per-incident banner dismissal. */
   boot_id?: string | null;

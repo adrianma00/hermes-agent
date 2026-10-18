@@ -332,6 +332,38 @@ def test_interrupted_planned_stop_is_reported_apart_from_a_kill(tmp_path: Path, 
     assert "prior_suspected_oom" not in claimed
 
 
+def test_oom_inside_teardown_keeps_the_oom_signal_on_its_own_flag(tmp_path: Path) -> None:
+    """Recorded trade-off (not drift): an OOM INSIDE an accepted teardown is classified as an
+    incomplete stop — never "no exit path ran" — but the OOM evidence survives on
+    ``prior_teardown_suspected_oom`` so memory_status can still report it. Without this the OOM
+    signal went quiet exactly when memory pressure caused the death."""
+    _write_sentinel(tmp_path, {
+        "phase": "stopping", "pid": _DEAD_PID, "start_time": 1000.0,
+        "started_at": "2026-10-18T04:53:34+00:00",
+        "stop_reason": "planned_stop", "stop_requested_at": "2026-10-18T04:54:17+00:00",
+    })
+    from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+    hb_path = get_loop_heartbeat_path(tmp_path)
+    hb_path.parent.mkdir(parents=True, exist_ok=True)
+    hb_path.write_text(json.dumps({
+        "pid": _DEAD_PID,
+        "updated_at": "2026-10-18T04:55:00+00:00",
+        "mem": {"mem_total_kib": 1024 * 1024, "mem_available_kib": 20 * 1024},
+    }), encoding="utf-8")
+
+    evidence = record_startup(home=tmp_path)
+    assert evidence is not None and evidence["planned_stop"] is True
+    assert evidence.get("suspected_oom") is True
+
+    claimed = _read_sentinel(tmp_path)
+    assert claimed["prior_incomplete_stop"] is True
+    assert claimed["prior_teardown_suspected_oom"] is True
+    # The primary classification stays honest in both directions.
+    assert "prior_unclean_exit" not in claimed
+    assert "prior_suspected_oom" not in claimed
+
+
 def test_kill_of_a_running_gateway_stays_unclean(tmp_path: Path, caplog) -> None:
     """The other direction of the same signal: a deliberate taskkill /F on a RUNNING gateway runs no
     teardown, so its sentinel is still ``running`` and the verdict stays a hard kill."""

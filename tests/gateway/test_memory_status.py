@@ -156,6 +156,54 @@ class TestCollectMemoryStatus:
             "boot_id"
         ] is None
 
+    def test_incomplete_stop_flags_have_a_reader(self, tmp_path: Path) -> None:
+        """The ledger writes ``prior_incomplete_stop``/``prior_stop_reason`` when a life accepted a
+        stop and died inside teardown. Until something read them they were a write-only surface —
+        the warning said "interrupted planned stop" while /api/status reported nothing at all."""
+        _write_sentinel(
+            tmp_path,
+            {
+                "phase": "running",
+                "pid": 999,
+                "started_at": "2026-10-18T05:10:00+00:00",
+                "prior_incomplete_stop": True,
+                "prior_stop_reason": "planned_stop",
+            },
+        )
+        status = collect_memory_status(tmp_path, now=_NOW)
+        assert status["last_boot_incomplete_stop"] is True
+        assert status["last_boot_stop_reason"] == "planned_stop"
+        # Still NOT an unclean exit: the gateway accepted the stop.
+        assert status["last_boot_unclean"] is False
+        assert status["last_boot_suspected_oom"] is False
+
+    def test_oom_inside_teardown_stays_visible(self, tmp_path: Path) -> None:
+        """The recorded trade-off: an OOM during teardown keeps ``last_boot_suspected_oom`` set via
+        the separate ``prior_teardown_suspected_oom`` flag, so memory pressure stays visible while
+        the classification stays "incomplete stop" rather than "killed a running gateway"."""
+        _write_sentinel(
+            tmp_path,
+            {
+                "phase": "running",
+                "pid": 999,
+                "started_at": "2026-10-18T05:10:00+00:00",
+                "prior_incomplete_stop": True,
+                "prior_stop_reason": "planned_restart",
+                "prior_teardown_suspected_oom": True,
+            },
+        )
+        status = collect_memory_status(tmp_path, now=_NOW)
+        assert status["last_boot_incomplete_stop"] is True
+        assert status["last_boot_stop_reason"] == "planned_restart"
+        assert status["last_boot_suspected_oom"] is True
+        assert status["last_boot_unclean"] is False
+
+    def test_no_sentinel_still_reports_the_new_keys(self, tmp_path: Path) -> None:
+        """Shape stability: a consumer can read the keys unconditionally."""
+        status = collect_memory_status(tmp_path / "nohome", now=_NOW)
+        assert status["last_boot_incomplete_stop"] is False
+        assert status["last_boot_stop_reason"] is None
+
     def test_clean_sentinel_has_no_flags(self, tmp_path: Path) -> None:
         _write_sentinel(
             tmp_path,

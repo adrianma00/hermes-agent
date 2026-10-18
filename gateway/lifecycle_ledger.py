@@ -376,10 +376,16 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
         if evidence is not None:
             if evidence.get("planned_stop"):
                 # Teardown was interrupted, not absent: record it, but do NOT claim an
-                # OOM/unclean restart (memory_status reads prior_unclean_exit).
+                # OOM/unclean restart (memory_status reads prior_unclean_exit) — the primary
+                # classification must not be a false positive, which is the whole defect.
                 claim["prior_incomplete_stop"] = True
                 if evidence.get("stop_reason"):
                     claim["prior_stop_reason"] = evidence["stop_reason"]
+                if evidence.get("suspected_oom"):
+                    # The reverse loss must not be silent either: an OOM INSIDE teardown keeps the
+                    # OOM signal on a flag of its own, so "interrupted planned stop" does not read
+                    # as "nothing to see" on an 8 GB box. memory_status ORs it into the OOM report.
+                    claim["prior_teardown_suspected_oom"] = True
             else:
                 claim["prior_unclean_exit"] = True
                 if evidence.get("suspected_oom"):
