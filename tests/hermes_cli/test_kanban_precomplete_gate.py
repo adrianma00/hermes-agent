@@ -221,7 +221,8 @@ def test_crosslink_line_without_an_id_refused(khome, gate_log):
 
 def test_pending_link_inside_grace_allowed(khome, gate_log):
     conn = _conn()
-    tid = mk(conn, title="🔗 surface#pending: ask the peer", age_s=120)
+    tid = mk(conn, title="ask the peer",
+             body="CROSSLINK: board=surface id=pending role=peer", age_s=120)
     v = g.gate_completion(conn, tid)
     assert v.allowed, v.message
     assert v.findings == []
@@ -230,7 +231,9 @@ def test_pending_link_inside_grace_allowed(khome, gate_log):
 
 def test_pending_link_past_grace_refused(khome, gate_log):
     conn = _conn()
-    tid = mk(conn, title="🔗 mac#pending: ask the peer", age_s=g.DEFAULT_PENDING_GRACE_S + 60)
+    tid = mk(conn, title="ask the peer",
+             body="CROSSLINK: board=mac id=pending role=peer",
+             age_s=g.DEFAULT_PENDING_GRACE_S + 60)
     v = g.gate_completion(conn, tid)
     assert not v.allowed and v.check == g.CHECK_PENDING
     assert "still a placeholder" in v.message
@@ -241,7 +244,8 @@ def test_pending_link_past_grace_refused(khome, gate_log):
 def test_pending_grace_is_configurable(khome, gate_log, monkeypatch):
     monkeypatch.setenv("EMHQ_GATE_PENDING_GRACE_S", "60")
     conn = _conn()
-    tid = mk(conn, title="🔗 mac#pending: ask the peer", age_s=120)
+    tid = mk(conn, title="ask the peer",
+             body="CROSSLINK: board=mac id=pending role=peer", age_s=120)
     v = g.gate_completion(conn, tid)
     assert not v.allowed and v.check == g.CHECK_PENDING
     conn.close()
@@ -255,7 +259,7 @@ def test_landing_mention_without_approval_refused(khome, gate_log):
              body="Merge to main once landing_guard approves; then --approve it.")
     v = g.gate_completion(conn, tid)
     assert not v.allowed and v.check == g.CHECK_APPROVAL
-    assert "no approval the dashboard can parse" in v.message
+    assert "instruction, not an approval" in v.message
     assert "approval_malformed" in gate_log.read_text()
     conn.close()
 
@@ -264,14 +268,14 @@ def test_landing_mention_with_approval_allowed(khome, gate_log):
     sha = "a" * 40
     conn = _conn()
     tid = mk(conn, title="Land the fix", body="landing_guard gate applies.",
-             comments=(f'approved: landing_guard.py --approve {sha} --note "Adrian approved"',))
+             comments=(f"approved (R55 declaration):\napprove_sha={sha}",))
     v = g.gate_completion(conn, tid)
     assert v.allowed, v.message
     conn.close()
 
 
 def test_approval_must_match_the_dashboard_parser(khome, gate_log):
-    """A bare sha with no ``--note`` is NOT something em-hq can read, so it is malformed here too."""
+    """The gate accepts exactly what em-hq reads: an approve_sha= declaration, nothing looser."""
     conn = _conn()
     tid = mk(conn, title="Land the fix",
              body="approved by landing_guard --approve " + "b" * 40)
@@ -295,15 +299,18 @@ def test_structured_approve_sha_is_enough(khome, gate_log):
     conn.close()
 
 
-def test_legacy_command_approval_is_logged_as_legacy(khome, gate_log):
-    """Accepted for dashboard parity, but never silently: the reader still has to move (P5)."""
+def test_legacy_command_approval_is_refused(khome, gate_log):
+    """P5 retired the fallback WITH em-hq's reader: a quoted command is an instruction, not an
+    approval, and must be REFUSED — accepting it would advertise a release button that no longer
+    exists."""
     sha = "d" * 40
     conn = _conn()
     tid = mk(conn, title="Land the fix", body="landing_guard gate applies.",
              comments=(f'landing_guard.py --approve {sha} --note "Adrian"',))
     v = g.gate_completion(conn, tid)
-    assert v.allowed, v.message
-    assert "LEGACY landing_guard command" in gate_log.read_text()
+    assert not v.allowed and v.check == g.CHECK_APPROVAL
+    assert "instruction, not an approval" in v.message
+    assert g.find_approval([f'landing_guard.py --approve {sha} --note "Adrian"'], "") is None
     conn.close()
 
 
@@ -335,8 +342,9 @@ def test_bare_force_is_still_logged_as_forced(khome, gate_log):
 def test_peer_install_link_passes_with_explicit_note(khome, gate_log):
     """Mac/Surface cards are on their own disk: pass, but never silently."""
     conn = _conn()
-    tid = mk(conn, title="🔗 surface#t_abc123: peer work",
-             body="CROSSLINK: board=mac id=t_def456 role=peer",
+    tid = mk(conn, title="peer work",
+             body="CROSSLINK: board=surface id=t_abc123 role=peer\n"
+                  "CROSSLINK: board=mac id=t_def456 role=peer",
              age_s=60)
     v = g.gate_completion(conn, tid)
     assert v.allowed, v.message
@@ -407,8 +415,20 @@ def test_crosslinks_ignore_body_prose():
     assert links == [] and g.crosslink_problems("  - CROSSLINK: board=em-board id=t_abc") == []
     links = g.parse_crosslinks("plain", "CROSSLINK: board=em-board id=t_abc role=work")
     assert [(l.board, l.id, l.role) for l in links] == [("em-board", "t_abc", "work")]
-    links = g.parse_crosslinks("🔗 em#t_1: work", "")
-    assert [(l.board, l.id) for l in links] == [("em", "t_1")]
+    # P5: the title shim is gone with em-hq's reader — a 🔗 token in the TITLE is prose too.
+    assert g.parse_crosslinks("🔗 em#t_1: work", "") == []
+
+
+def test_title_link_token_alone_is_not_a_link(khome, gate_log):
+    """A title 🔗 used to declare a link; em-hq no longer reads it, so neither does the gate."""
+    conn = _conn()
+    tid = mk(conn, title="🔗 surface#pending: follow-up", body="no declaration here")
+    v = g.gate_completion(conn, tid)
+    assert v.allowed, v.message
+    log = gate_log.read_text()
+    assert "ALLOWED" in log and "surface#pending" not in log
+    conn.close()
+    assert g.parse_crosslinks("🔗 surface#pending: follow-up", "body prose 🔗 ns#pending") == []
 
 
 def test_crosslink_fields_are_positional():

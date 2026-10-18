@@ -14,15 +14,16 @@ WHAT IS CHECKED (completion only — ``create`` is deliberately NOT gated, becau
 cards discuss the token syntax in prose)
   1. ``approval_malformed`` — the card (title, body or a comment) mentions ``landing_guard``,
      ``--approve`` or "landing approval", but carries no ``approve_sha``. An approval is a
-     STRUCTURED field first (R55: a human-typed command string is never the input): a body/comment
-     line ``approve_sha=<sha>`` (+ optional ``approve_note=``). While em-hq's P0 reader is still
-     live it also still parses the ``landing_guard.py --approve <sha> --note "…"`` command, so that
-     form is accepted as a LEGACY fallback and logged as such — never silently, because the
-     dashboard's release button still comes from it until P5 replaces it.
+     STRUCTURED field and nothing else (R55): a body/comment line ``approve_sha=<sha>``
+     (+ optional ``approve_note=``) at column 0. A ``landing_guard.py --approve <sha> --note "…"``
+     command quoted in prose is an INSTRUCTION, never an approval — em-hq's reader that used to
+     parse it is gone (P5), so accepting it here would hide a missing release button.
   2. ``unresolved_crosslink`` — a crosslink declaration that cannot be resolved: no ``id=`` at all,
      a placeholder (``pending``) older than :data:`DEFAULT_PENDING_GRACE_S` (900 s = three reporter
      cycles), a line not in the canonical positional form (R55), or an ``id=`` that is simply not
      on the board the line names. A board this install cannot read is a NAMED note, never a refusal.
+     Only ``CROSSLINK:`` body lines declare links: body prose, a 🔗 token and the card TITLE all
+     contribute nothing (the title shim retired with P5, together with em-hq's reader for it).
   3. ``loop_not_closed`` — the card carries a RESOLVED crosslink and states no
      ``LOOP-CLOSED: board=… id=… via=comment|close|dm at=…`` line, or its claim fails verification:
      the counterpart must have actually changed (status/comment/event) at or after THIS RUN's
@@ -82,22 +83,18 @@ REMOTE_TIMEOUT_S = 25
 
 # --- vocabulary ---------------------------------------------------------------------------------
 
-# Mirrors em-hq's reporter (reporter/report.py:42). Same regex on purpose: the dashboard decides
-# whether to offer a release with exactly this, so "the gate is happy but no button appears" is
-# impossible by construction.
-APPROVE_RE = re.compile(r'landing_guard\.py\s+--approve\s+([0-9a-f]{7,40})\s+--note\s+"([^"\n]*)"')
 # R55: approval is a STRUCTURED pair of fields, parsed by position at line start — never the
-# human-typed ``landing_guard.py --approve …`` command, which is only kept below as a legacy
-# fallback while em-hq's P0 reader (deleted by P5) still derives the release button from it.
+# human-typed ``landing_guard.py --approve …`` command, which is prose. em-hq's reporter derives the
+# release button from these same declarations (reporter/report.py, P5), so "the gate is happy but no
+# button appears" is impossible by construction — there is no second grammar for them to diverge on.
 APPROVE_SHA_LINE_RE = re.compile(r"^approve_sha\s*[:=]\s*([0-9a-f]{7,40})\s*$", re.IGNORECASE)
 APPROVE_NOTE_LINE_RE = re.compile(r"^approve_note\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
 LANDING_MENTION = ("landing_guard", "--approve", "landing approval", "approve_sha")
 
 # R55 grammar, parsed BY POSITION and only at column 0: board, then id, then role
 # (`CROSSLINK:`), board, id, via, at (`LOOP-CLOSED:`). A line that does not fit is a DECLARATION
-# THAT CANNOT BE PARSED — reported, never guessed at. A 🔗 token belongs in prose (where it means
-# nothing) or in a title; the title form is a live P0/dashboard parity shim and retires with P5.
-LINK_RE = re.compile(r"🔗\s*([A-Za-z0-9_-]+)\s*#\s*([A-Za-z0-9_-]+)")
+# THAT CANNOT BE PARSED — reported, never guessed at. A 🔗 token means nothing anywhere: not in
+# prose, and no longer in the title either (the title parity shim retired with P5).
 CROSSLINK_STRICT_RE = re.compile(
     r"^CROSSLINK:\s+board=(\S+)(?:\s+id=(\S+))?(?:\s+role=(\S+))?(?:\s+\S.*)?$")
 LOOP_STRICT_RE = re.compile(
@@ -149,12 +146,11 @@ def mentions_landing(*texts: str) -> bool:
 
 
 def find_approval(comments: list[str], body: str) -> Optional[dict]:
-    """The card's landing approval, structured field FIRST, legacy command second.
+    """The card's landing approval: the structured ``approve_sha=`` declaration, or nothing.
 
-    Order is newest-comment-first then body, the order a human would read it. ``source`` says
-    which form was found: ``structured`` (``approve_sha=<sha>``, the R55 shape) or
-    ``legacy-command`` (the em-hq P0 reader's shape, logged as a note so nobody assumes the
-    dashboard has moved on).
+    Newest comment first, then body — the order a human would read it. ``source`` is always
+    ``structured``; it stays in the dict because callers/log lines name it, but there is no second
+    grammar left to accept (P5 retired the legacy command fallback with em-hq's reader for it).
     """
     texts = list(reversed(comments or [])) + [body or ""]
     for text in texts:
@@ -168,10 +164,6 @@ def find_approval(comments: list[str], body: str) -> Optional[dict]:
                         note = n.group(1)
                         break
                 return {"sha": m.group(1), "note": note, "source": "structured"}
-    for text in texts:
-        m = APPROVE_RE.search(text or "")
-        if m:
-            return {"sha": m.group(1), "note": m.group(2), "source": "legacy-command"}
     return None
 
 
@@ -220,23 +212,15 @@ def _crosslink_declarations(body: str) -> tuple[list[Link], list[tuple[str, str]
 
 
 def parse_crosslinks(title: str, body: str) -> list[Link]:
-    """Links of a card: ``CROSSLINK:`` body lines (structural) plus a title 🔗 token.
+    """Links of a card: ``CROSSLINK:`` body lines, and nothing else.
 
-    The title token is a live PARITY SHIM for em-hq's P0 ingest, which still anchors on it; R55
-    retires both together in P5. Body prose never contributes a link — several legitimate cards
-    quote the token syntax while discussing it, and that false positive is what the convention
-    exists to end.
+    ``title`` is accepted for call-site compatibility and IGNORED: a 🔗 token in a title is prose
+    like any other, and em-hq's P0 ingest no longer reads it (both retired together in P5). Body
+    prose never contributes either — several legitimate cards quote the token syntax while
+    discussing it, and that false positive is what the convention exists to end.
     """
     links, _ = _crosslink_declarations(body)
-    seen = {(l.board.lower(), l.id.lower()) for l in links}
-    out = list(links)
-    for m in LINK_RE.finditer(title or ""):
-        key = (m.group(1).lower(), m.group(2).lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(Link(m.group(1), m.group(2), "", "title"))
-    return out
+    return links
 
 
 def crosslink_problems(body: str) -> list[tuple[str, str]]:
@@ -505,17 +489,12 @@ def evaluate(*, title: str, body: str, comments: list[str], resolver: BoardResol
             ev.findings.append(Finding(
                 CHECK_APPROVAL,
                 "the card mentions landing_guard / --approve / 'landing approval' but carries no "
-                "approve_sha and no approval the dashboard can parse",
-                "write the structured field on its own line (R55): approve_sha=<sha> "
-                "(optionally approve_note=<who/what>). Until P5 swaps the dashboard's reader, also "
-                "keep the line `landing_guard.py --approve <sha> --note \"…\"`, because the release "
-                "button is still derived from exactly that string — without either, the button "
-                "silently disappears."))
-        elif approval["source"] == "legacy-command":
-            ev.notes.append(
-                f"approval read from the LEGACY landing_guard command (sha {approval['sha'][:12]}) "
-                f"— the dashboard's P0 reader still needs that string; also carry "
-                f"`approve_sha={approval['sha'][:12]}…` once P5 swaps the reader")
+                "approve_sha — a quoted command is an instruction, not an approval",
+                "write the structured declaration on its own line at column 0 (R55): "
+                "approve_sha=<sha> (optionally approve_note=<who/what>). That declaration IS the "
+                "approval the dashboard derives its release button from; quoting "
+                "`landing_guard.py --approve <sha> --note \"…\"` proves nothing and no longer "
+                "produces a button."))
 
     # 2. unresolved_crosslink — a declaration that cannot be resolved
     for kind, line in crosslink_problems(body):
@@ -530,8 +509,9 @@ def evaluate(*, title: str, body: str, comments: list[str], resolver: BoardResol
                 CHECK_PENDING,
                 f"CROSSLINK line is not in the canonical positional form: {line!r}",
                 "rewrite it at column 0, fields in order — `CROSSLINK: board=<slug> "
-                "id=<card_id> role=tracker|work|peer`. A 🔗 token or reordered `id=`/`board=` "
-                "is not a declaration the gate (or the dashboard) can resolve."))
+                "id=<card_id> role=tracker|work|peer`. Field order is the grammar: a 🔗 token, a "
+                "retitled card, or reordered `id=`/`board=` declares nothing the gate (or the "
+                "dashboard) can resolve."))
 
     links = parse_crosslinks(title, body)
     anchor = card_created_at or run_started_at
@@ -546,8 +526,8 @@ def evaluate(*, title: str, body: str, comments: list[str], resolver: BoardResol
                     CHECK_PENDING,
                     f"{link.token()} is still a placeholder after {int(age)}s "
                     f"(> {int(pending_grace_s)}s grace, from the card's creation)",
-                    f"resolve {link.token()} to the real id (retitle the card / edit the "
-                    f"CROSSLINK: line) and, if the peer owns that card, ask it to send the id; "
+                    f"resolve {link.token()} to the real id (edit the CROSSLINK: line — the title "
+                    f"is not read) and, if the peer owns that card, ask it to send the id; "
                     f"then complete."))
             continue
         cp = resolver.resolve(link.board, link.id)
