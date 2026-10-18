@@ -567,20 +567,26 @@ def evaluate(*, title: str, body: str, comments: list[str], resolver: BoardResol
 
     # 3. loop_not_closed — a resolved link must be PROVEN closed on the counterpart
     for link, cp in resolved:
-        claim = next((c for c in loop_lines if not c["malformed"]
-                      and c["board"].lower() == link.board.lower()
-                      and c["id"].lower() == link.id.lower()), None)
+        cands = [c for c in loop_lines if not c["malformed"]
+                 and c["board"].lower() == link.board.lower()
+                 and c["id"].lower() == link.id.lower()]
+        usable = [c for c in cands if c["via"] in LOOP_VIA and _at_is_a_claim(c["at"])]
+        # Newest usable claim wins: a card's body may still carry the template placeholder while a
+        # later comment carries the real line — the first line found must not poison the proof.
+        claim = usable[-1] if usable else None
         if claim is None:
-            broken = next((c for c in loop_lines if c["malformed"]
-                           and (link.id.lower() in c["raw"].lower()
-                                or link.token().lower() in c["raw"].lower())), None)
+            broken = next((c for c in cands), None) or next(
+                (c for c in loop_lines if c["malformed"]
+                 and (link.id.lower() in c["raw"].lower()
+                      or link.token().lower() in c["raw"].lower())), None)
             if broken is not None:
                 ev.findings.append(Finding(
                     CHECK_LOOP,
-                    f"LOOP-CLOSED for {link.token()} is malformed (not the positional form): "
-                    f"{broken['raw']!r}",
+                    f"LOOP-CLOSED for {link.token()} is malformed: {broken['raw']!r} "
+                    f"(via={broken['via']!r} at={broken['at']!r})",
                     f"rewrite the line at column 0, fields in order: LOOP-CLOSED: "
-                    f"board={link.board} id={link.id} via={'|'.join(LOOP_VIA)} at=<iso8601>"))
+                    f"board={link.board} id={link.id} via={'|'.join(LOOP_VIA)} at=<iso8601> — "
+                    f"'via' and a real timestamp are required."))
                 continue
             ev.findings.append(Finding(
                 CHECK_LOOP,

@@ -150,6 +150,23 @@ def test_loop_closed_with_stale_evidence_is_refused(khome, gate_log):
     conn.close()
 
 
+def test_template_placeholder_in_body_does_not_poison_a_real_comment_claim(khome, gate_log):
+    """A card body may keep the template while a later comment carries the proven line."""
+    conn = _conn()
+    other = mk(conn, title="counterpart card")
+    tid = mk(conn, title="Dispatcher card",
+             body=f"CROSSLINK: board=default id={other} role=work\n"
+                  f"LOOP-CLOSED: board=default id={other} via=comment at=<fill when done>",
+             age_s=60)
+    stamp = bump(conn, other)
+    kb.add_comment(conn, tid, "worker",
+                   f"LOOP-CLOSED: board=default id={other} via=comment at={iso(stamp)}")
+    conn.commit()
+    v = g.gate_completion(conn, tid)
+    assert v.allowed, v.message
+    conn.close()
+
+
 def test_resolved_link_without_loop_closed_line_refused(khome, gate_log):
     conn = _conn()
     other = mk(conn, title="counterpart card")
