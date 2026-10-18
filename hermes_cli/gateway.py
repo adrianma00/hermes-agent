@@ -5355,8 +5355,14 @@ def _cmd_stop(args):
         else:
             print("✗ No gateway processes found")
         return
+    kind = _installed_service_kind()
     if _stop_installed_service(system):
-        print(f"✓ Stopped {get_service_name()} service")
+        if kind == "windows" and not _gw_windows().is_task_registered():
+            # A Startup-folder VBS is a launcher, not a service: naming a service that does not
+            # exist (`sc query hermes-gateway` → 1060) is fiction, and it hid which path ran.
+            print("✓ Stopped the gateway (Startup-folder launcher; no service or Scheduled Task installed)")
+        else:
+            print(f"✓ Stopped {get_service_name()} service")
     elif stop_profile_gateway():
         print("✓ Stopped gateway for this profile")
     else:
