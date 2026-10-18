@@ -602,8 +602,11 @@ def _kill_stale_dashboard_processes(
     ``HERMES_HOME`` are candidates; unknown ownership fails closed. This is
     used by ``dashboard --stop`` and the per-profile update cleanup.
 
-    Manually-started dashboards are not auto-restarted because we don't know the original launch args
-    (--host, --port, --insecure, --tui, --no-open). See #68934.
+    On POSIX, manually-started dashboards ARE auto-restarted: their argv
+    (--host, --port, --insecure, --tui, --no-open) is captured below and replayed.
+    On Windows they are not — not because the launch args are unknown, but because
+    the restart-managed branch is gated on win32: ``_dashboard_cmdline_for_pid``
+    returns None there by design. #68934 tracks that win32 respawn gap itself.
     *already_restarted_units* names units (no ``.service`` suffix) the caller already restarted directly —
     e.g. ``hermes update``'s systemd fleet-restart loop, which restarts ``hermes-serve*`` units before this
     function runs. Without excluding them, a Serve-only install's freshly restarted process is found again
