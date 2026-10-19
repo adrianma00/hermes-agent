@@ -22,6 +22,7 @@ export const enBoot = {
       openLogs: 'Open logs',
       desktopBootFailed: "Hermes couldn't start",
       gatewayConnectionLost: 'Hermes lost its connection',
+      gatewayConnectionLostNamed: ({ connection }) => `Lost connection to “${connection}”`,
       gatewayConnectionLostDetail:
         'Still trying to reconnect. You can keep reading and drafting. If this keeps up, reconnect now or check your connection settings.',
       gatewayStaleCode: ({ connection }) => `“${connection}” backend was updated — restart required`,

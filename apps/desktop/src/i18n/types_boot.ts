@@ -18,6 +18,7 @@ export interface BootTranslations {
     openLogs: string
     desktopBootFailed: string
     gatewayConnectionLost: string
+    gatewayConnectionLostNamed: (opts: { connection: string }) => string
     gatewayConnectionLostDetail: string
     gatewayStaleCode: string | ((opts: { connection: string }) => string)
     gatewayStaleCodeDetail: string

@@ -1483,6 +1483,70 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(FakeWebSocket.instances.length).toBeGreaterThan(1)
   })
 
+  it('the prolonged-drop toast names the connection that dropped', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    // Gateway down, WS never comes back — walk well past the escalate window.
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+
+    // With several backends configured, a bare "Hermes lost its connection"
+    // leaves the user guessing WHICH one — the model must carry the identity.
+    const toast = $notifications.get().find(entry => entry.title?.includes('em'))
+    expect(toast?.title).toBe('Lost connection to “em”')
+  })
+
+  it('a stale backend swaps the toast action to Restart backend and recycles it', async () => {
+    const recycleBackend = vi.fn(async () => ({ ok: true }))
+    const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & {
+      api: ReturnType<typeof vi.fn>
+      recycleBackend: typeof recycleBackend
+    }
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    desktop.recycleBackend = recycleBackend
+
+    // The gateway answers /api/health with a boot/disk commit mismatch — the
+    // code-skew signal a backend emits after `hermes update` moved the checkout
+    // under a process that never restarted.
+    desktop.api = vi.fn(async ({ path }: { path: string }) => {
+      if (path === '/api/health') {
+        return { ok: true, code_skew: { boot_rev: 'aaaa', disk_rev: 'bbbb' } }
+      }
+
+      return { ok: true }
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+
+    // Reconnecting can never fix stale code, so the recovery must be a recycle.
+    const toast = $notifications.get().find(entry => entry.kind === 'error')
+    expect(toast?.title).toBe('“em” backend was updated — restart required')
+    expect(toast?.action?.label).toBe('Restart backend')
+
+    toast?.action?.onClick()
+    expect(recycleBackend).toHaveBeenCalledWith('default')
+  })
+
   it('#83134: a proxy that accepts then immediately closes every socket does not reset the backoff to attempt 0', async () => {
     render(<Harness />)
     await flushAsync()

@@ -634,16 +634,19 @@ export function useGatewayBoot({
             const isSkewed = await detectCodeSkew()
             notify({
               kind: isSkewed ? 'error' : 'warning',
+              // Name the connection either way: with several backends
+              // configured, "Hermes lost its connection" leaves the user
+              // guessing which one dropped.
               title: isSkewed
                 ? translateNow('boot.errors.gatewayStaleCode', { connection: connLabel })
-                : translateNow('boot.errors.gatewayConnectionLost'),
+                : translateNow('boot.errors.gatewayConnectionLostNamed', { connection: connLabel }),
               message: isSkewed
                 ? translateNow('boot.errors.gatewayStaleCodeDetail')
                 : translateNow('boot.errors.gatewayConnectionLostDetail'),
               durationMs: 0,
               action: isSkewed
                 ? {
-                    label: translateNow('settings.models.restartBackend'),
+                    label: translateNow('settings.model.restartBackend'),
                     // Call recycleBackend directly, the way the Models page does
                     // (#97067). requestBackendRestart branches on
                     // `$connection.mode === 'remote'` and would only reconnect —
