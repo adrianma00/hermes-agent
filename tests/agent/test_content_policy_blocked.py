@@ -41,6 +41,27 @@ class TestContentPolicyBlockedClassification:
         assert result.should_compress is False
         assert result.should_rotate_credential is False
 
+    def test_modelark_sensitive_input_400(self):
+        """ModelArk content moderation returns HTTP 400 with this prose and no
+        other marker; it used to fall through to format_error, which downstream
+        reads as 'the request format was rejected' rather than a policy block."""
+        from agent.error_classifier import classify_api_error, FailoverReason
+
+        class _StatusErr(Exception):
+            def __init__(self, msg, status_code):
+                super().__init__(msg)
+                self.status_code = status_code
+
+        e = _StatusErr(
+            "The request failed because the input text may contain sensitive information.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="modelark", model="deepseek-v3.2")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.reason != FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+
 
 
 

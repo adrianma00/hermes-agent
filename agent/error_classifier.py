@@ -363,6 +363,7 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = (
     "prompt was flagged by our safety", "responses cannot be generated due to safety",
     "content_filter", "responsibleaipolicyviolation", "new_sensitive",
     "content exists risk", "data may contain inappropriate content", "data_inspection_failed",
+    "input text may contain sensitive information",
 )
 
 # Auth patterns (non-status-code signals).
