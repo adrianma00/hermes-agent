@@ -41,7 +41,7 @@ class ResponseCheckVerdict:
     _preflight_compression_blocked: Any
     _last_preflight_pressure: Any
     api_duration: Any
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
 
 def _codex_finish_reason(response: Any) -> str:
@@ -103,7 +103,7 @@ def check_api_response(
     reset only when the usage fold re-arms the compression budget."""
     from agent.turn_recovery import validate_response_shape
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ResponseCheckVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ResponseCheckVerdict:
         return ResponseCheckVerdict(
             action=action, thinking_spinner=thinking_spinner, messages=messages,
             active_system_prompt=active_system_prompt, finish_reason=finish_reason,
@@ -215,6 +215,14 @@ def check_api_response(
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
     agent._touch_activity(f"API call #{api_call_count} completed")
+    # A successful API call means the provider is working — clear the route from any pending wall notice
+    try:
+        from agent.provider_wall_notice import read_pending, clear_route
+        if read_pending():
+            clear_route(agent.provider, agent.model)
+            logger.info("Provider wall notice: provider %s recovered (successful API call)", agent.provider)
+    except Exception:
+        pass
     return _verdict("break")
 
 
@@ -230,7 +238,7 @@ class InvalidResponseVerdict:
     active_system_prompt: Any
     retry_count: Any
     compression_attempts: Any
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
 
 def retry_invalid_response(
@@ -249,7 +257,7 @@ def retry_invalid_response(
         classify_codex_soft_failure, describe_invalid_response, interruptible_backoff_sleep,
     )
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> InvalidResponseVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> InvalidResponseVerdict:
         return InvalidResponseVerdict(
             action=action, thinking_spinner=thinking_spinner,
             active_system_prompt=active_system_prompt, retry_count=retry_count,

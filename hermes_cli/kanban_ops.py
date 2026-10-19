@@ -101,6 +101,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_namespace": [
+                {"task_id": tid, "assignee": who, "reason": reason}
+                for (tid, who, reason) in res.skipped_namespace
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -154,6 +158,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for tid, who, reason in res.skipped_namespace:
+        print(
+            f"Skipped (assignee {who!r} not resolvable here — {reason}): {tid}"
+        )
     return 0
 
 
@@ -294,7 +302,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                 payload = None
             pl = f" {payload}" if payload else ""
             print(
-                f"[{_fmt_ts(r['created_at'])}] {r['task_id']:10s} "
+                f"[{_fmt_ts(kb._to_epoch(r['created_at']))}] {r['task_id']:10s} "
                 f"{r['kind']:18s} (@{r['assignee'] or '-'}){pl}",
                 flush=True,
             )
@@ -316,28 +324,32 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
             "WHERE status = 'archived'"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook.
-            # Same safety predicate: only clean, fully-pushed worktrees go.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        # Same containment predicate as completion cleanup (#28818): strictly below a
-        # managed root, never the root itself (which holds every task's scratch dir).
-        # Cheap existence/symlink check first: most rows were already cleaned at
-        # completion, and rmtree refuses a symlink (so it must not be counted).
-        if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-        if not path.exists():
-            removed_ws += 1
+        for row in rows:
+            if row["workspace_kind"] == "worktree":
+                # Backstop for worktrees that escaped the completion/archive hook.
+                # Same safety predicate: only clean, fully-pushed worktrees go.
+                wt_path = row["workspace_path"]
+                if wt_path and Path(wt_path).is_dir():
+                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
+                        continue
+                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    if not Path(wt_path).is_dir():
+                        removed_ws += 1
+                continue
+            if row["workspace_kind"] != "scratch":
+                continue
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            # Same containment predicate as completion cleanup (#28818): strictly below a
+            # managed root, never the root itself (which holds every task's scratch dir).
+            # Cheap existence/symlink check first: most rows were already cleaned at
+            # completion, and rmtree refuses a symlink (so it must not be counted).
+            if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
+                continue
+            if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                removed_ws += 1
 
     removed_events = 0
     if event_days:

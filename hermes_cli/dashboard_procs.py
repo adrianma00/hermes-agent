@@ -57,7 +57,7 @@ def _iter_process_table() -> list[tuple[int, str]]:
                 _append_row(rows, line[len("ProcessId=") :], current_cmd)
         return rows
     # ps, not `pgrep -f "hermes.*dashboard"` (greedy regex; consistent with gateway pid scan).
-    result = subprocess.run(["ps", "-A", "-o", "pid=,command="], timeout=10, **_PS_RUN_KWARGS)
+    result = subprocess.run(["ps", "-A", "-o", "pid=,command="], timeout=10, **_PS_RUN_KWARGS, check=False)
     if result.returncode == 0:
         for line in getattr(result, "stdout", "").split("\n"):
             parts = line.strip().split(None, 1)
@@ -438,9 +438,9 @@ def _kill_pids_windows(pids: list[int], killed: list[int], failed: list[tuple[in
                 failed.append((pid, "not hermes-owned or process identity changed"))
             else:
                 result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                    errors="replace", timeout=10, creationflags=windows_hide_flags())
+                    ["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                    stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                    errors="replace", timeout=10, creationflags=windows_hide_flags(), check=False)
                 if result.returncode == 0:
                     killed.append(pid)
                 else:
@@ -462,6 +462,10 @@ _POSIX_TERM_GRACE_SECONDS = 10.0
 # wedged ui-tui keeps the deleted state.db-wal inode open until the next start refuses with
 # DeletedWalGenerationError (#112631) — no finite root grace can cover an unbounded teardown.
 _POSIX_DESCENDANT_GRACE_SECONDS = 2.0
+# How long to wait for ``taskkill /F`` victims to actually disappear on Windows before replaying
+# their argv. taskkill returns as soon as the termination is requested; a dashboard that has not
+# released its fixed --port yet makes the respawn die at startup (EADDRINUSE).
+_WIN32_KILL_SETTLE_SECONDS = 5.0
 _NO_TTY = ("?", "??", "-")  # Linux / macOS / BSD spellings of "no controlling terminal"
 
 
@@ -500,7 +504,7 @@ def _posix_descendants(roots: list[int]) -> dict[int, tuple[int, int | None]]:
     """
     from gateway.status import get_process_start_time
     try:
-        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty="], timeout=10, **_PS_RUN_KWARGS)
+        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty="], timeout=10, **_PS_RUN_KWARGS, check=False)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return {}
     children: dict[int, list[tuple[int, str]]] = {}
@@ -588,7 +592,7 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
 
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend", *,
-    restart_managed: bool = False, already_restarted_units: "set[str] | None" = None,
+    restart_managed: bool = False, already_restarted_units: set[str] | None = None,
     scope_home: str | None = None,
 ) -> dict[str, list]:
     """Kill running ``hermes dashboard`` / ``hermes serve`` processes (update end, ``--stop``).
@@ -602,8 +606,12 @@ def _kill_stale_dashboard_processes(
     ``HERMES_HOME`` are candidates; unknown ownership fails closed. This is
     used by ``dashboard --stop`` and the per-profile update cleanup.
 
-    Manually-started dashboards are not auto-restarted because we don't know the original launch args
-    (--host, --port, --insecure, --tui, --no-open). See #68934.
+    Manually-started dashboards ARE auto-restarted on every platform: their argv
+    (--host, --port, --insecure, --tui, --no-open) is captured below and replayed on POSIX and
+    on Windows (``psutil``). The only case that cannot be replayed is an argv the platform
+    refuses to hand over — an elevated or other-user process — and those PIDs come back under
+    ``manual_relaunch``, never ``unrecovered``: a restart this code never attempted must not
+    read as a failed one (#68934).
     *already_restarted_units* names units (no ``.service`` suffix) the caller already restarted directly —
     e.g. ``hermes update``'s systemd fleet-restart loop, which restarts ``hermes-serve*`` units before this
     function runs. Without excluding them, a Serve-only install's freshly restarted process is found again
@@ -641,12 +649,14 @@ def _kill_stale_dashboard_processes(
     def _launchd_owner(pid: int, cmdline: list[str] | None):
         return _dash._launchd_job_owning_backend(pid, cmdline, launchd_jobs, ancestors=_process_ancestors(pid))
 
-    if restart_managed and sys.platform != "win32":
+    if restart_managed:
         for pid in pids:
-            pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
-            pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
-            if pid_service[pid]:
-                continue
+            if sys.platform != "win32":
+                # systemd/cgroup ownership is Linux-only; both fail closed elsewhere.
+                pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
+                pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
+                if pid_service[pid]:
+                    continue
             cmdline = _dash._dashboard_cmdline_for_pid(pid)
             if launchd_jobs and (job := _launchd_owner(pid, cmdline)):
                 pid_launchd[pid] = job
@@ -670,15 +680,21 @@ def _kill_stale_dashboard_processes(
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
     (_kill_pids_windows if sys.platform == "win32" else _kill_pids_posix)(pids, killed, failed)
+    if sys.platform == "win32" and killed:
+        # ``taskkill /F`` returns before the process is fully gone and its listening socket
+        # released: a respawn replaying a fixed --port would bind nothing and die on startup.
+        # Wait for the PIDs to actually disappear before the argv replay below.
+        _wait_gone(killed, _WIN32_KILL_SETTLE_SECONDS)
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
     for pid, err_msg in failed:
         print(f"    ✗ failed to stop PID {pid}: {err_msg}")
     if killed and restart_managed:
-        unrecovered = _restart_killed_backends(
+        unrecovered, manual_relaunch = _restart_killed_backends(
             killed, pid_service, pid_cgroup, pid_cmdline, pid_home, pid_launchd=pid_launchd)
     else:
         unrecovered = list(killed)
+        manual_relaunch = []
         # A stopped launchd job with KeepAlive restarts itself: say so instead of a misleading
         # "restart it yourself" hint, and give the command that actually keeps it down.
         for target in sorted({f"{d}/{l}" for p in killed if (j := pid_launchd.get(p)) for d, l, _ in (j,)}):
@@ -687,22 +703,29 @@ def _kill_stale_dashboard_processes(
         if any(p not in pid_launchd for p in killed):
             print("  Restart the dashboard when you're ready:\n    hermes dashboard --port <port>")
     return {"matched": list(pids), "killed": list(killed), "failed": list(failed),
-            "unrecovered": list(unrecovered)}
+            "unrecovered": list(unrecovered), "manual_relaunch": list(manual_relaunch)}
 
 
 def _restart_killed_backends(
     killed: list[int], pid_service: dict[int, str | None], pid_cgroup: dict[int, str | None],
     pid_cmdline: dict[int, list[str]], pid_home: dict[int, str | None], *,
-    pid_launchd: dict[int, tuple[str, str, int | None]] | None = None) -> list[int]:
+    pid_launchd: dict[int, tuple[str, str, int | None]] | None = None) -> tuple[list[int], list[int]]:
     """Update path: restart systemd units, kickstart launchd jobs (macOS), respawn manual argv
     (detached, headless, logged to logs/dashboard-restart.log; one per profile, no ``--port 0``).
-    Returns PIDs not brought back."""
+
+    Returns ``(unrecovered, manual_relaunch)``: PIDs a restart was ATTEMPTED for and failed, and
+    PIDs this platform has no way to bring back (Windows, no supervisor, no captured argv) that an
+    operator must relaunch by hand. The two are deliberately separate — booking the second as the
+    first armed a ``gateway_restart`` obligation no launch method on Windows could discharge
+    (#68934).
+    """
     # Two categories: Without this, a remote backend (hermes serve) under Restart=on-failure never comes
     # back after our clean SIGTERM, and the Desktop can't reconnect (#68934). Filtered so Desktop
     # ``serve|dashboard --port 0`` backends are not resurrected and duplicates collapse to one per profile
     # (#78821).
     from hermes_cli import main_dashboard as _dash
     unrecovered: list[int] = []
+    manual_relaunch: list[int] = []
     failed_restarts: list[tuple[str, str]] = []
     seen_services: set[str] = set()
     respawn_candidates: list[tuple[int, list[str], str | None]] = []
@@ -738,6 +761,12 @@ def _restart_killed_backends(
                 unrecovered.append(pid)
         elif pid in pid_cmdline:
             respawn_candidates.append((pid, pid_cmdline[pid], pid_home.get(pid)))
+        elif sys.platform == "win32":
+            # Nothing to hand this PID back to: Windows has neither systemd nor launchd, and no
+            # argv was captured (the process was elevated, owned by another user, or already
+            # gone). An operator relaunches it; that is a manual step, not a failed restart
+            # (#68934).
+            manual_relaunch.append(pid)
         else:
             unrecovered.append(pid)
     for svc, err in failed_restarts:
@@ -748,7 +777,10 @@ def _restart_killed_backends(
         unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
     if failed_restarts or unrecovered:
         print("  Restart anything not auto-restarted when you're ready:\n    hermes dashboard --port <port>")
-    return unrecovered
+    if manual_relaunch:
+        print("  ⚠ No managed supervisor on this platform — relaunch by hand to pick up the update:\n"
+              "    hermes dashboard --port <port>")
+    return unrecovered, manual_relaunch
 
 
 def _norm_exe(path) -> str:
@@ -814,7 +846,7 @@ def _process_ppid(pid: int) -> int | None:
     try:
         if sys.platform == "win32":
             return None
-        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], timeout=5, **_PS_RUN_KWARGS)
+        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], timeout=5, **_PS_RUN_KWARGS, check=False)
         if result.returncode != 0 or not result.stdout:
             return None
         return int(result.stdout.strip().split()[0])
@@ -829,6 +861,7 @@ def _process_ppid(pid: int) -> int | None:
 _LOCKFILE_SCHEMA_VERSION = 2
 _PROTOCOL_VERSION = 1
 _REMOTE_LOCK_SUBDIR = "desktop-ssh"
+BACKEND_LOCK_NAME = "backend.lock.json"
 _HEX32 = set("0123456789abcdef")
 
 
@@ -886,7 +919,6 @@ def _remote_lock_roots(base_dir: Path | None) -> list[Path]:
 def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """PIDs claimed by valid ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` records
     (best-effort: a bad record contributes no PID; never raises)."""
-    import json
     owned: set[int] = set()
     entries: list[Path] = []
     for root in _remote_lock_roots(base_dir):
@@ -895,20 +927,28 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
         except OSError:
             continue
     for entry in entries:
-        ownership_id = entry.name
-        lock_path = entry / "backend.lock.json"
-        try:  # validateOwnershipId(): exactly 32 lowercase hex chars
-            if not entry.is_dir() or not _is_hex(ownership_id, 32) or not lock_path.is_file():
-                continue
-            data = lock_path.read_bytes()
-            if len(data) > 65536:
-                continue
-            parsed = json.loads(data)
-        except (OSError, UnicodeDecodeError, ValueError):
-            continue
-        if _valid_lockfile_payload(parsed, ownership_id):
-            owned.add(parsed["pid"])  # validated as int above
+        lock = read_valid_backend_lock(entry / BACKEND_LOCK_NAME)
+        if lock is not None:
+            owned.add(lock["pid"])  # validated as int
     return owned
+
+
+def read_valid_backend_lock(lock_path: Path) -> dict | None:
+    """The validated body of one ``desktop-ssh/<ownershipId>/backend.lock.json``, or None when it is
+    missing, unreadable, oversized or does not match the writer's schema (never raises)."""
+    import json
+    ownership_id = lock_path.parent.name
+    try:  # validateOwnershipId(): exactly 32 lowercase hex chars
+        if not _is_hex(ownership_id, 32) or not lock_path.is_file():
+            return None
+        with lock_path.open("rb") as f:  # bounded: this runs on every owner-watchdog poll
+            data = f.read(65537)
+        if len(data) > 65536:
+            return None
+        parsed = json.loads(data)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return parsed if _valid_lockfile_payload(parsed, ownership_id) else None
 
 
 # Covers the gap between process start and the Desktop client writing backend.lock.json.

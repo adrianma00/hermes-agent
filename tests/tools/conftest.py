@@ -88,6 +88,41 @@ def _clear_web_result_cache():
     search_memo.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_context_vars():
+    """Reset ``gateway.session_context`` ContextVars around every tools test.
+
+    ``set_session_vars``/``clear_session_vars`` write ContextVars in the running
+    ``pytest`` context, so a binding survives into every LATER test in the same
+    process (ContextVars are context-local, not process-local, and a test run is
+    one context). ``clear_session_vars`` is the worse half: it sets each var to
+    ``""`` instead of restoring ``_UNSET``, so ``get_session_env`` stops falling
+    back to ``os.environ`` and later tests' ``monkeypatch.setenv`` of a
+    ``HERMES_SESSION_*`` var is silently ignored.
+
+    Observed: with ``pytest tests/tools -k approval`` (one process) the platform
+    ContextVar is left at ``""`` from
+    ``test_execute_code_approval_cluster.py::test_guard_explicit_non_cron_masks_leaked_env``
+    onward, so ``tools/approval_context._session_env("HERMES_SESSION_PLATFORM")``
+    never sees the ``api_server`` that
+    ``test_request_tool_approval.py::test_api_server_without_exec_ask_remains_fail_closed``
+    monkeypatches — the gate falls through to the generic fail-closed message and
+    the test fails. It passes in isolation (fresh context, vars ``_UNSET``), which
+    is what made it look like a random flake.
+
+    Reset to ``_UNSET`` (not ``""``) on both sides so each test starts from the
+    same "never bound here" state and ends without poisoning the next one.
+    """
+    try:
+        from gateway.session_context import reset_session_vars
+    except Exception:
+        yield
+        return
+    reset_session_vars()
+    yield
+    reset_session_vars()
+
+
 def register_all_web_providers():
     """Register all bundled web-search providers into the global registry.
 

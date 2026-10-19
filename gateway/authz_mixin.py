@@ -48,9 +48,9 @@ _ALLOW_BOTS_ENV = {
 
 
 # Gate reads use the shared per-profile isolated reader (allowlist leak under multiplex, #72348).
-from gateway.platforms._shared import decode_json_list_literal as _decode_json_list_literal  # noqa: E402
-from gateway.platforms._shared import extra_or_secret as _extra_or_secret  # noqa: E402
-from gateway.platforms._shared import platform_gate_env as _auth_env  # noqa: E402
+from gateway.platforms._shared import decode_json_list_literal as _decode_json_list_literal
+from gateway.platforms._shared import extra_or_secret as _extra_or_secret
+from gateway.platforms._shared import platform_gate_env as _auth_env
 
 
 def _env_truthy(name: str) -> bool:
@@ -448,7 +448,7 @@ class GatewayAuthorizationMixin:
             return bool(sender_allow.strip())
         return isinstance(sender_allow, (list, tuple, set)) and any(str(item).strip() for item in sender_allow)
 
-    def _pairing_store_for(self, source: "SessionSource"):
+    def _pairing_store_for(self, source: SessionSource):
         """Per-profile PairingStore for a source, else the global ``self.pairing_store``."""
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
@@ -597,10 +597,26 @@ class GatewayAuthorizationMixin:
         platform = source.platform.value if source.platform else ""
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
+    def _is_declared_bot_sender(self, source: SessionSource) -> bool:
+        """True when this sender is named in ``gateway.bot_loop_guard.bot_senders``.
+
+        Platforms that never mark bot authors (Matrix has no bot flag at all) deliver a peer bot as
+        an ordinary AUTHORIZED user: ``source.is_bot`` is False, so the guard below would return
+        early and two Hermes instances in one room could answer each other forever. Names listed
+        here are counted as bot-authored -- same window budget, same cooldown.
+        """
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return False
+        platform = getattr(getattr(source, "platform", None), "value", "") or ""
+        if not platform:
+            return False
+        return self._bot_loop_guard_instance().is_declared_bot(platform, str(user_id))
+
     def _admit_bot_message(self, source: SessionSource) -> bool:
         """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
-        if not getattr(source, "is_bot", False):
+        if not (getattr(source, "is_bot", False) or self._is_declared_bot_sender(source)):
             return True
         allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
         if state == "tripped":
@@ -621,15 +637,21 @@ class GatewayAuthorizationMixin:
         """
         if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
             return False
-        if not getattr(source, "is_bot", False):
+        if not (getattr(source, "is_bot", False) or self._is_declared_bot_sender(source)):
             return True
         # The guard judges the final verdict: a chat allowlist admits a bot before the ALLOW_BOTS block runs.
         return not self._bot_loop_guard_instance().blocked(self._bot_loop_guard_conversation(source))
 
     def _principal_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool) -> bool:
         """The allowlist verdict alone, before the bot loop guard."""
-        # HA events are system-generated (HASS_TOKEN); webhook events are HMAC-verified.
-        if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
+        from gateway.session_local import authorize_local_source
+        local_verdict = authorize_local_source(self, source)
+        if local_verdict is not None:
+            return local_verdict
+
+        # Webhook events are HMAC-verified; a ``trusted_inbound`` platform's events come from the
+        # service its adapter authenticated to (no human sender to allowlist).
+        if source.platform == Platform.WEBHOOK or getattr(_registry_entry(source.platform), "trusted_inbound", False) is True:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)

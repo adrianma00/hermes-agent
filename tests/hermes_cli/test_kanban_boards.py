@@ -144,6 +144,36 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
         assert p != forced
 
+    def test_board_metadata_db_path_is_caller_effective_under_pin(
+        self, fresh_home, monkeypatch,
+    ):
+        """``read_board_metadata()['db_path']`` follows the pin — do not "fix" it.
+
+        The two consumers of that field (``gateway.kanban_watchers_notifier``,
+        ``tui_gateway.session_notifications``) key a seen-DB set on it so a
+        pinned DB is polled once instead of once per aliased slug, and it stays
+        consistent with ``connect()``/``_board_counts()`` in the same process.
+        A board's CANONICAL file is ``board_db_path_unpinned()``, which the
+        cross-board readers use and which is never affected by the pin.
+        """
+        kb.create_board("second")
+        canonical_second = fresh_home / "kanban" / "boards" / "second" / "kanban.db"
+        assert kb.board_db_path_unpinned("second") == canonical_second
+
+        pinned = fresh_home / "kanban.db"  # the default board's legacy DB
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+        metas = {m["slug"]: m["db_path"] for m in kb.list_boards(include_archived=False)}
+        assert set(metas) == {"default", "second"}
+        # Every slug reports the pinned file: the watcher dedupe keys on this,
+        # and every path-taking API in this process resolves the same way.
+        assert {str(Path(p).expanduser().resolve()) for p in metas.values()} == {
+            str(pinned.resolve())
+        }
+        assert kb.kanban_db_path(board="second") == pinned
+        # Canonical derivation stays pin-blind for cross-board reads.
+        assert kb.board_db_path_unpinned("second") == canonical_second
+
 
 # ---------------------------------------------------------------------------
 # Current-board resolution
@@ -185,11 +215,12 @@ class TestBoardCRUD:
 
     @pytest.mark.parametrize("archive", [True, False])
     def test_remove_clears_init_cache_for_recreated_db(self, fresh_home, archive):
-        # Regression for #23833: poll loops that call connect(board=slug) right
-        # after remove_board() recreate an empty kanban.db at the same path
-        # (connect() does mkdir(exist_ok=True)). If _INITIALIZED_PATHS still
-        # contains the resolved path, the CREATE TABLE pass is skipped and
-        # downstream readers hit `no such table: task_events`.
+        # Regression for #23833: a poll loop that re-creates a just-removed
+        # board must get a fresh schema-init pass — if _INITIALIZED_PATHS
+        # still contained the resolved path, the CREATE TABLE pass would be
+        # skipped and downstream readers hit `no such table: task_events`.
+        # (Since #43243 connect() itself refuses to recreate a removed board,
+        # so the re-creation goes through create_board, as it should.)
         kb.create_board("recycle")
         # First connect populates _INITIALIZED_PATHS for this DB.  Use
         # connect_closing: `with connect() as conn` does NOT close the fd, and
@@ -205,8 +236,9 @@ class TestBoardCRUD:
         # connect() gets a fresh schema-init pass.
         assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
 
-        # Simulate the event-stream poll: re-open the same slug. connect()
-        # recreates the directory + empty .db; the schema must be re-applied.
+        # Simulate the board being re-created at the same slug: the schema
+        # must be re-applied on the fresh DB file.
+        kb.create_board("recycle")
         with kbc.connect_closing(board="recycle") as conn:
             tables = {
                 row[0]
@@ -340,6 +372,7 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
         text=True,
         cwd=str(_WORKTREE),
         timeout=30,
+        check=False,
     )
 
 
@@ -372,3 +405,58 @@ class TestCLI:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Archived / deleted board resurrection (#43243)
+# ---------------------------------------------------------------------------
+
+class TestBoardResurrection:
+    """Read/watch paths must not resurrect archived or deleted boards.
+
+    Stale dashboard tabs, gateway notifiers and event-stream pollers can hand
+    ``connect(board=<slug>)`` a slug whose board was archived (moved to
+    ``_archived/`` with an ``archived`` tombstone) or hard-deleted
+    (``rmtree``).  ``connect`` must refuse to recreate the directory/DB, and
+    ``list_boards`` must not surface a DB-only stub as an active board.
+    """
+
+    def test_connect_does_not_recreate_archived_board(self, fresh_home):
+        kb.create_board("gone")
+        kb.remove_board("gone", archive=True)
+        tombstone = kb.board_metadata_path("gone")
+        assert tombstone.exists() and kb.read_board_metadata("gone")["archived"] is True
+        with pytest.raises(ValueError, match="archived"):
+            kbc.connect(board="gone")
+        assert not (kb.board_dir("gone") / "kanban.db").exists()
+
+    def test_connect_does_not_recreate_deleted_board(self, fresh_home):
+        kb.create_board("nuked")
+        kb.remove_board("nuked", archive=False)
+        assert not kb.board_dir("nuked").exists()
+        with pytest.raises(ValueError, match="does not exist"):
+            kbc.connect(board="nuked")
+        assert not kb.board_dir("nuked").exists()
+
+    def test_connect_still_opens_live_board(self, fresh_home):
+        kb.create_board("live")
+        with kbc.connect_closing(board="live") as conn:
+            conn.execute("SELECT 1").fetchone()
+        assert kb.board_exists("live")
+
+    def test_list_boards_ignores_db_only_stub(self, fresh_home):
+        # Simulate the historical stub shape: kanban.db with no board.json.
+        stub = kb.board_dir("ghost")
+        stub.mkdir(parents=True)
+        (stub / "kanban.db").touch()
+        assert "ghost" not in [b["slug"] for b in kb.list_boards()]
+        assert "ghost" not in [b["slug"] for b in kb.list_boards(include_archived=True)]
+
+    def test_archive_tombstone_keeps_name(self, fresh_home):
+        kb.create_board("keepname", name="My Board")
+        kb.remove_board("keepname", archive=True)
+        meta = kb.read_board_metadata("keepname")
+        assert meta["archived"] is True
+        assert meta["name"] == "My Board"
+        assert "keepname" in [b["slug"] for b in kb.list_boards(include_archived=True)]
+        assert "keepname" not in [b["slug"] for b in kb.list_boards(include_archived=False)]

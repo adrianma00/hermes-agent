@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import logging
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -103,7 +105,6 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -135,7 +136,7 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
-def _assert_not_delegated_child_mutation(path: "str | Path | None" = None) -> None:
+def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None:
     """Reject Kanban mutations from ``delegate_task`` child contexts.
 
     The tool/CLI fast-fail guards are UX, not a trust boundary (a child can shell
@@ -162,7 +163,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
-def _fire_task_hook(event: str, task: Optional["Task"], task_id: str, run_id: Optional[int], **fields: Any) -> None:
+def _fire_task_hook(event: str, task: Optional[Task], task_id: str, run_id: Optional[int], **fields: Any) -> None:
     """Lifecycle hook for a task transition; ``assignee`` from the (possibly missing) row."""
     _fire_kanban_lifecycle_hook(
         event, task_id, board=get_current_board(),
@@ -192,7 +193,7 @@ def _kanban_observer_consumed(event: str) -> bool:
 
 
 def _fire_worker_spawned_hook(
-    conn: sqlite3.Connection, task: "Task", workspace_path: str, pid: Optional[int], *,
+    conn: sqlite3.Connection, task: Task, workspace_path: str, pid: Optional[int], *,
     board: Optional[str] = None,
 ) -> None:
     """``on_kanban_worker_spawned`` AFTER the PID is durably persisted; best-effort."""
@@ -235,12 +236,12 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "skipped_namespace",
 )
 
 
 def _fire_dispatch_tick_hook(
-    result: "DispatchResult", *, board: Optional[str] = None, dry_run: bool = False,
+    result: DispatchResult, *, board: Optional[str] = None, dry_run: bool = False,
 ) -> None:
     """``on_kanban_dispatch_tick`` — strictly AFTER ``_dispatch_tick_lock`` is
     released so a slow subscriber cannot stall a sibling dispatcher.
@@ -322,14 +323,6 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
-
-
-# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
-_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
-_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -458,7 +451,14 @@ def get_current_board() -> str:
             normed = _normalize_board_slug(candidate)
         except ValueError:
             return None
-        return normed if normed and board_exists(normed) else None
+        if not (normed and board_exists(normed)):
+            return None
+        # An archived board leaves a tombstone board.json; a stale `current`
+        # file or HERMES_KANBAN_BOARD pointing at one falls through to
+        # default rather than resurrecting it (#43243).
+        if read_board_metadata(normed).get("archived"):
+            return None
+        return normed
 
     for candidate in (
         (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
@@ -511,15 +511,45 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Board has ``board.json`` or ``kanban.db`` on disk; ``default`` always exists."""
+    """Board has a ``board.json`` on disk; ``default`` always exists."""
     slug = _slug_or_default(board)
     if slug == DEFAULT_BOARD:
         return True
     return _dir_holds_board(board_dir(slug))
 
 
-def _dir_holds_board(d: Path) -> bool:
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+
+
+def _pinned_board_slug() -> Optional[str]:
+    """The board the caller's pins identify, per the environment — or ``None``.
+
+    The dispatcher injects ``HERMES_KANBAN_BOARD`` next to ``HERMES_KANBAN_DB``,
+    and it is what makes the pin authoritative for the caller's OWN board even
+    when the pinned path cannot be compared to a derived one (``hermes -p``
+    rewriting ``HERMES_HOME``, Docker / symlink layouts — see the spawn path).
+    """
+    raw = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if not raw:
+        return None
+    try:
+        return _normalize_board_slug(raw)
+    except ValueError:
+        return None
+
+
+def _pin_answers_for(slug: str, pinned: Path, canonical: Path) -> bool:
+    """Whether the caller's pin may answer a request for ``slug``.
+
+    True when ``slug`` IS the caller's own board: ``HERMES_KANBAN_BOARD`` — injected
+    next to the pin by the dispatcher — says so, or (absent that declaration) the
+    pinned path already IS ``slug``'s canonical file. The declaration matters
+    because the pinned path cannot always be compared to a derived one: the pin
+    exists precisely to survive ``hermes -p`` rewriting ``HERMES_HOME`` (symlink /
+    Docker layouts — see the spawn path).
+    """
+    if _pinned_board_slug() == slug:
+        return True
+    return _same_db_file(pinned, canonical)
 
 
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
@@ -561,6 +591,7 @@ def _explicit_board_intent_pinned() -> bool:
 
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
+    *, identity: bool = False,
 ) -> Path:
     """Shared resolver. An explicit ``board=`` argument — or the scoped
     ``--board`` context (:func:`scoped_current_board`) — outranks the ``env_var``
@@ -584,8 +615,142 @@ def _board_path(
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
-    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir. The pin
+    answers only for the board it names — see :func:`_board_path`."""
+    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db", identity=True)
+
+
+def board_db_path_unpinned(board: Optional[str] = None) -> Path:
+    """``kanban.db`` path for a *named* board, ignoring ``HERMES_KANBAN_DB``.
+
+    ``HERMES_KANBAN_DB`` is pinned into every dispatched worker and is only
+    authoritative for the caller's OWN board (:func:`kanban_db_path`). Resolving
+    a sibling board through it would collapse every slug onto the pinned file,
+    so cross-board lookups (:func:`_other_board_db_paths`) must use this helper:
+    pure path derivation, ``default`` -> ``<root>/kanban.db`` (back-compat),
+    else ``board_dir(slug)/kanban.db``.
+
+    Also ignores ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_ATTACHMENTS_ROOT``
+    (unrelated pins) — only the boards root and the slug feed the path.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+class BoardPinConflict(ValueError):
+    """An explicit ``board=`` that contradicts the caller's own board pin.
+
+    Raised instead of silently resolving the pinned ``HERMES_KANBAN_DB`` when a
+    board-scoped process (dispatcher worker / delegate child) asks for a
+    DIFFERENT board: resolving through the pin would create or read the task on
+    the caller's own board — a silent mis-delivery that reports success.
+    """
+
+
+def _board_pin_conflict(env_var: str, slug: str, pinned: Path) -> BoardPinConflict:
+    """The one refusal message every site of the pin collapse raises."""
+    return BoardPinConflict(
+        f"board {slug!r} is out of scope for this process: {env_var} pins it "
+        f"to {pinned}, which is the caller's own board, not {slug!r}. A dispatcher "
+        f"worker (or a descendant of one) cannot read or write another board — route "
+        f"cross-board work from a non-pinned context (dashboard or interactive "
+        f"session) instead."
+    )
+
+
+def _pinned_db_override() -> Optional[Path]:
+    """``HERMES_KANBAN_DB`` as a path — the caller's OWN board — or ``None``."""
+    raw = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def _is_board_scoped_process() -> bool:
+    """True when this process acts for ONE board, not as a board-agnostic owner.
+
+    Dispatcher-spawned workers (``HERMES_KANBAN_TASK``), ``delegate_task``
+    children and cron jobs fired in-process from a worker are all scoped: the
+    pin the dispatcher injects identifies THEIR board, so it can never be used
+    to reach a sibling board. Gateways, the dashboard, an interactive session
+    and top-level cron runs are owners and may route across boards.
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        owned = is_dispatcher_owned_worker_context()
+    except Exception:
+        owned = not os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
+    return (not owned) or bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _same_db_file(a: Path, b: Path) -> bool:
+    """Whether two DB paths name the same file (symlinks/relative paths resolved)."""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
+def connection_db_path(board: Optional[str] = None, db_path: Optional[Path] = None) -> Path:
+    """DB path for a connection opened with an OPTIONAL explicit board.
+
+    ``db_path`` wins outright; ``board=None`` keeps the whole legacy chain
+    (:func:`kanban_db_path`). An explicit ``board`` is a request for THAT board,
+    so the caller's ``HERMES_KANBAN_DB`` pin is honoured only while that board IS
+    the caller's own (:func:`_pin_answers_for`: ``HERMES_KANBAN_BOARD`` says so,
+    or the pinned file already is that board's canonical file). When the pin names
+    something else:
+
+    * a board-scoped process (:func:`_is_board_scoped_process`) raises
+      :class:`BoardPinConflict` — resolving through the pin would create or read
+      the task on the WRONG board while reporting success;
+    * any other caller (gateway, dashboard, interactive session, top-level cron)
+      gets the board's canonical file, which is what ``board=`` promises.
+
+    Connector-side counterpart of ``_other_board_db_paths()``: both must ignore
+    the pin for any board that is not the caller's own.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        return kanban_db_path(None)
+    pinned = _pinned_db_override()
+    if pinned is None:
+        return kanban_db_path(slug)
+    if _PIN_FIRST_BOARD_RESOLUTION.get():
+        # Machine-flow resolution: every board slug opens the pinned DB.
+        return pinned
+    canonical = board_db_path_unpinned(slug)
+    if _pin_answers_for(slug, pinned, canonical):
+        return pinned
+    if _is_board_scoped_process():
+        raise _board_pin_conflict("HERMES_KANBAN_DB", slug, pinned)
+    return canonical
+
+
+def board_db_path_unpinned(board: Optional[str] = None) -> Path:
+    """``kanban.db`` path for a *named* board, ignoring ``HERMES_KANBAN_DB``.
+
+    ``HERMES_KANBAN_DB`` is pinned into every dispatched worker and is only
+    authoritative for the caller's OWN board (:func:`kanban_db_path`). Resolving
+    a sibling board through it would collapse every slug onto the pinned file,
+    so cross-board lookups (:func:`_other_board_db_paths`) must use this helper:
+    pure path derivation, ``default`` -> ``<root>/kanban.db`` (back-compat),
+    else ``board_dir(slug)/kanban.db``.
+
+    Also ignores ``HERMES_KANBAN_WORKSPACES_ROOT`` / ``HERMES_KANBAN_ATTACHMENTS_ROOT``
+    (unrelated pins) — only the boards root and the slug feed the path.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -605,160 +770,58 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     return attachments_root(board=board) / task_id
 
 
+# A board tree that is meant to be SHARED is marked by the setgid bit (2775): that is
+# the tree's declared contract, "the other fleet's user may write here". A bare ``mkdir``
+# cannot keep it. ``mkdir`` applies the creating process's umask, so a worker running
+# umask 022 under a 2775 root creates 2755 -- the setgid bit is inherited from the parent,
+# group WRITE is not -- and the per-card dir is unusable to the other user until something
+# chmods it out of band. Measured on this host (2026-09-30): umask 022 -> 2755, umask 002
+# -> 2775. Aligning at creation time is what makes the property hold without a repair pass.
+_DIR_MODE_MASK = 0o7777
+
+
+def mkdir_aligned(path: Path) -> Path:
+    """``mkdir -p`` that preserves a deliberately SHARED tree's mode.
+
+    When the nearest existing ancestor carries the setgid bit, that ancestor's
+    permission bits are this tree's declared contract, so every component this call
+    creates is chmodded to them (``mkdir`` alone answers to the process umask, and no
+    umask expresses "the group may write" without also opening the dir to the world).
+    A tree without the setgid bit keeps the historical umask behaviour, so nothing
+    changes for private trees. Never fails the caller: a chmod the filesystem refuses
+    (a mount without those bits) leaves the dir created and merely unaligned, which is
+    what a plain mkdir would have left anyway.
+    """
+    path = Path(path)
+    if path.is_dir():
+        return path
+    anchor = path.parent
+    while not anchor.exists() and anchor.parent != anchor:
+        anchor = anchor.parent
+    want = None
+    with contextlib.suppress(OSError):
+        mode = anchor.stat().st_mode
+        if mode & stat.S_ISGID:
+            want = mode & _DIR_MODE_MASK
+    created: list[Path] = []
+    if want is not None:
+        probe = path
+        while not probe.exists():
+            created.append(probe)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for d in created:
+        with contextlib.suppress(OSError):
+            os.chmod(d, want)
+    return path
+
+
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Per-board worker log dir (logs follow the board so ``hermes kanban log``
     is unambiguous when two boards share a task id)."""
     return _board_path(None, board, ("kanban", "logs"), "logs")
-
-
-def board_metadata_path(board: Optional[str] = None) -> Path:
-    """``board.json`` path — display metadata only; the directory slug is the identity."""
-    return board_dir(_slug_or_default(board)) / "board.json"
-
-
-def _default_board_display_name(slug: str) -> str:
-    """``atm10-server`` -> ``Atm10 Server``."""
-    return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
-
-
-def read_board_metadata(board: Optional[str] = None) -> dict:
-    """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
-    raises — a missing/malformed file yields the synthesized entry."""
-    slug = _slug_or_default(board)
-    meta: dict[str, Any] = {
-        "slug": slug,
-        "name": _default_board_display_name(slug),
-        "description": "",
-        "icon": "",
-        "color": "",
-        "default_workdir": None,
-        # Project scope: new tasks inherit it (deterministic worktree + branch).
-        "project_id": None,
-        "created_at": None,
-        "archived": False,
-    }
-    try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8-sig"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
-
-
-def write_board_metadata(
-    board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
-    icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
-    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
-) -> dict:
-    """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
-    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
-    _assert_not_delegated_child_mutation()
-    slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
-
-
-def create_board(
-    slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
-    icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
-    project_id: Optional[str] = None,
-) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
-    normed = _require_slug(slug)
-    meta = write_board_metadata(
-        normed, name=name, description=description, icon=icon, color=color,
-        default_workdir=default_workdir, project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
-    return meta
-
-
-def list_boards(*, include_archived: bool = True) -> list[dict]:
-    """Metadata for every board: ``default`` first (always present), then
-    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted."""
-    entries = [read_board_metadata(DEFAULT_BOARD)]
-    seen = {DEFAULT_BOARD}
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            try:
-                normed = _normalize_board_slug(child.name)  # skip junk dirs, don't raise
-            except ValueError:
-                continue
-            if not normed or normed in seen or not _dir_holds_board(child):
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
-            entries.append(meta)
-            seen.add(normed)
-    return entries
-
-
-def remove_board(slug: str, *, archive: bool = True) -> dict:
-    """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
-    _assert_not_delegated_child_mutation()
-    normed = _require_slug(slug)
-    if normed == DEFAULT_BOARD:
-        raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
-
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---
@@ -774,7 +837,7 @@ class Task:
     status: str
     priority: int
     created_by: Optional[str]
-    created_at: int
+    created_at: Optional[int]  # None only for an unparseable stamp
     started_at: Optional[int]
     completed_at: Optional[int]
     workspace_kind: str
@@ -810,14 +873,21 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Quota-gate override: 1 = may run while the primary provider quota is
+    # walled (routed to the fallback chain for that spawn only).
+    quota_override: bool = False
+    # Cost-window override: 1 = may run inside the provider's peak-price hours
+    # rather than waiting for the off-peak discount.
+    run_now: bool = False
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
-        g = lambda col, default=None: _lossy_text(_row_get(row, col, default))  # noqa: E731
+    def from_row(cls, row: sqlite3.Row) -> Task:
+        g = lambda col, default=None: _lossy_text(_row_get(row, col, default))
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
+            **{col: _to_epoch(g(col)) for col in _TASK_EPOCH_COLUMNS},  # outside writers may store text: epoch or None
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
             **{col: g(col) or None for col in _TASK_EMPTY_IS_NULL_COLUMNS},
             # Pre-migration fallbacks (spawn_failures / last_spawn_error) are only
@@ -827,18 +897,21 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            quota_override=bool(g("quota_override")),
+            run_now=bool(g("run_now")),
         )
 
 
 # Columns every schema version has (KeyError if the SELECT omitted them).
 _TASK_REQUIRED_COLUMNS = (
-    "id", "title", "body", "assignee", "status", "priority", "created_by", "created_at",
-    "started_at", "completed_at", "workspace_kind", "workspace_path", "claim_lock", "claim_expires",
+    "id", "title", "body", "assignee", "status", "priority", "created_by",
+    "workspace_kind", "workspace_path", "claim_lock",
 )
+_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
-    "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
+    "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
@@ -870,17 +943,16 @@ class Run:
     error: Optional[str]
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Run":
+    def from_row(cls, row: sqlite3.Row) -> Run:
         return cls(
             **{
                 col: _lossy_text(row[col]) for col in (
-                    "task_id", "profile", "step_key", "status", "claim_lock", "claim_expires",
-                    "worker_pid", "max_runtime_seconds", "last_heartbeat_at", "outcome", "summary", "error",
+                    "task_id", "profile", "step_key", "status", "claim_lock",
+                    "worker_pid", "max_runtime_seconds", "outcome", "summary", "error",
                 )
             },
-            id=int(row["id"]),
-            started_at=int(row["started_at"]),
-            ended_at=_opt_int(row["ended_at"]),
+            **{col: _to_epoch(row[col]) for col in ("claim_expires", "last_heartbeat_at", "ended_at")},
+            id=int(row["id"]), started_at=_to_epoch(row["started_at"]) or 0,
             metadata=_json_or(_lossy_text(row["metadata"])),
         )
 
@@ -894,10 +966,10 @@ class Comment:
     created_at: int
 
     @classmethod
-    def from_row(cls, r: sqlite3.Row) -> "Comment":
+    def from_row(cls, r: sqlite3.Row) -> Comment:
         return cls(
             id=r["id"], task_id=r["task_id"], author=_lossy_text(r["author"]),
-            body=_lossy_text(r["body"]), created_at=r["created_at"],
+            body=_lossy_text(r["body"]), created_at=_to_epoch(r["created_at"]) or 0,
         )
 
 
@@ -915,11 +987,11 @@ class Attachment:
     created_at: int
 
     @classmethod
-    def from_row(cls, r: sqlite3.Row) -> "Attachment":
+    def from_row(cls, r: sqlite3.Row) -> Attachment:
         return cls(
             id=r["id"], task_id=r["task_id"], filename=r["filename"],
             stored_path=r["stored_path"], content_type=r["content_type"],
-            size=r["size"] or 0, uploaded_by=r["uploaded_by"], created_at=r["created_at"],
+            size=r["size"] or 0, uploaded_by=r["uploaded_by"], created_at=_to_epoch(r["created_at"]) or 0,
         )
 
 
@@ -933,11 +1005,12 @@ class Event:
     run_id: Optional[int] = None
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Event":
+    def from_row(cls, row: sqlite3.Row) -> Event:
         run_id = _row_get(row, "run_id")
         return cls(
             id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
-            payload=_json_or(_lossy_text(row["payload"])), created_at=row["created_at"], run_id=_opt_int(run_id),
+            payload=_json_or(_lossy_text(row["payload"])), created_at=_to_epoch(row["created_at"]) or 0,
+            run_id=_opt_int(run_id),
         )
 
 
@@ -1338,6 +1411,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    quota_override: bool = False,
+    run_now: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1361,6 +1436,16 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # R33 (cross-fleet assignee discipline): refuse at CREATION a card that hands
+    # work belonging to ANOTHER install to one of its children. The receiving
+    # dispatcher cannot catch this one — a bare child name there resolves to the
+    # board's own namespace and looks like its top bot's legitimate delegation, so
+    # the child is already spawned by the time any rule is read. Creation is the
+    # only point that has the information. Visible refusal, never a silent rewrite.
+    from hermes_cli.kanban_db_dispatch import cross_fleet_assignee_refusal
+    refusal = cross_fleet_assignee_refusal(assignee, board=board)
+    if refusal:
+        raise ValueError(refusal)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1437,8 +1522,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        quota_override, run_now
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1448,6 +1534,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if quota_override else 0,
+                        1 if run_now else 0,
                     ),
                 )
                 for pid in parents:
@@ -1666,6 +1754,37 @@ def set_model_override(
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
+    )
+
+
+def set_quota_override(conn: sqlite3.Connection, task_id: str, enabled: bool) -> bool:
+    """Set/clear the per-task quota-gate override.
+
+    ``enabled=True`` lets the task spawn while the provider-quota gate is
+    closed, routed to the fallback chain for that spawn only — nothing durable
+    is written, so the card returns to the primary once the gate reopens.
+    """
+    return _set_task_override(
+        conn, task_id,
+        "UPDATE tasks SET quota_override = ? WHERE id = ?", (1 if enabled else 0,),
+        "quota_override_set", {"quota_override": bool(enabled)},
+        ("quota_override",), archived_msg="cannot set quota override",
+    )
+
+
+def set_run_now(conn: sqlite3.Connection, task_id: str, enabled: bool) -> bool:
+    """Set/clear the per-task cost-window override.
+
+    ``enabled=True`` lets the task spawn INSIDE the provider's peak-price hours
+    instead of waiting for the off-peak discount — the "force an immediate run"
+    escape hatch. Independent of the quota override: this one buys time with
+    money, whereas ``quota_override`` spends money to beat a quota wall.
+    """
+    return _set_task_override(
+        conn, task_id,
+        "UPDATE tasks SET run_now = ? WHERE id = ?", (1 if enabled else 0,),
+        "run_now_set", {"run_now": bool(enabled)},
+        ("run_now",), archived_msg="cannot set run-now",
     )
 
 
@@ -1927,8 +2046,7 @@ def store_attachment_bytes(
     if len(data) > max_bytes:
         raise AttachmentTooLarge(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
     safe_name = _safe_attachment_name(filename)
-    dest_dir = task_attachments_dir(task_id, board=board)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = mkdir_aligned(task_attachments_dir(task_id, board=board))
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
     try:
@@ -2058,10 +2176,33 @@ def _end_run(
     return run_id
 
 
-def _first_line(text: Optional[str], limit: int) -> str:
-    """First non-blank-stripped line of ``text`` capped at ``limit`` chars; "" when empty."""
-    lines = (text or "").strip().splitlines()
-    return lines[0][:limit] if lines else ""
+def _preview(text: Optional[str], limit: int) -> str:
+    """Word-safe single-line preview of ``text`` of at most ``limit`` chars.
+
+    Fork customization (``FORK-CUSTOMIZATIONS.md`` §11) replacing upstream's
+    ``_first_line``, which kept ONLY line 1 and hard-cut at ``limit`` with no
+    marker -- a 1079-char handoff surfaced as a 400-char fragment that read
+    like a complete sentence.
+
+    * newlines and whitespace runs collapse to single spaces, so a multi-line
+      handoff keeps its content past line 1 (nothing is silently dropped);
+    * a truncated preview always ends with ``…`` and is cut at the last word
+      boundary inside the window -- a hard cut is used only when no boundary
+      sits in the window at all -- so it never ends mid-word;
+    * the result never exceeds ``limit`` chars (``""`` for empty input).
+    """
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    if limit <= 0:
+        return ""
+    if len(flat) <= limit:
+        return flat
+    window = flat[: max(0, limit - 1)]  # one char reserved for the ellipsis
+    boundary = window.rfind(" ")
+    if boundary > 0:
+        window = window[:boundary]
+    return window.rstrip() + "…"
 
 
 def _opt_int(value: Any) -> Optional[int]:
@@ -2203,7 +2344,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
+def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
@@ -2293,10 +2434,16 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, profile: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn.
+
+    ``profile`` overrides the run's recorded profile: an assignee may carry a
+    namespace (``yummi:default``) or be claimed by an explicit ``ama:<profile>``
+    override, and the run row must name the profile that actually ran — not the
+    routing string. Defaults to the raw assignee for every pre-existing caller.
+    """
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -2325,7 +2472,9 @@ def _claim_and_open_run(
         ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
         """,
         (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
+            task_id,
+            profile or (trow["assignee"] if trow else None),
+            trow["current_step_key"] if trow else None,
             lock, expires, trow["max_runtime_seconds"] if trow else None, now,
         ),
     )
@@ -2340,12 +2489,13 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). ``profile`` is recorded on
+    the run row instead of the raw assignee (see :func:`_claim_and_open_run`).
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2365,7 +2515,7 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, profile=profile)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2375,11 +2525,11 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
+    separately from the implementer. ``profile`` as in :func:`claim_task`."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2396,7 +2546,8 @@ def claim_review_task(
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review"}, profile=profile,
         )
         if run_id is None:
             return None
@@ -2523,12 +2674,15 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
     for row in stale:
+        if owner_reclaim_paused(conn, row["id"]):
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
-        hb = row["last_heartbeat_at"]
+        hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):
@@ -2564,8 +2718,8 @@ def release_stale_claims(
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
-                    "claim_expires": int(row["claim_expires"]),
-                    "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
+                    "claim_expires": _to_epoch(row["claim_expires"]),
+                    "last_heartbeat_at": hb,
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
@@ -2627,9 +2781,9 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
                 "reason": "pid_alive",
                 "worker_pid": int(row["worker_pid"]),
                 "claim_lock": row["claim_lock"],
-                "claim_expires_was": int(row["claim_expires"]),
+                "claim_expires_was": _to_epoch(row["claim_expires"]),
                 "claim_expires_now": new_expires,
-                "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
+                "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
             },
             run_id=run_id,
         )
@@ -2926,7 +3080,7 @@ def _gate_created_cards(
                 {
                     "phantom_cards": phantom_cards,
                     "verified_cards": verified_cards,
-                    "summary_preview": _first_line(preview_text, 200) or None,
+                    "summary_preview": _preview(preview_text, 200) or None,
                 },
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
@@ -2964,8 +3118,8 @@ def _gate_empty_completion(
         _append_event(
             conn, task_id, "completion_blocked_empty_result",
             {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
+                "result_preview": _preview(result, 200) or None,
+                "summary_preview": _preview(summary, 200) or None,
             },
         )
     raise EmptyCompletionError(task_id)
@@ -3012,7 +3166,10 @@ def _completed_event_payload(
     # ignored the config (#18994).
     payload: dict = {
         "result_len": len(result) if result else 0,
-        "summary": _first_line(event_summary, 400) or None,
+        "summary": _preview(event_summary, 400) or None,
+        # Full length BEFORE capping: a consumer can tell a truncated preview
+        # (len(summary) < summary_chars) from a genuinely short handoff.
+        "summary_chars": len(event_summary) if event_summary else 0,
     }
     if verified_cards:
         payload["verified_cards"] = verified_cards
@@ -3023,23 +3180,195 @@ def _completed_event_payload(
     return payload
 
 
+def _other_board_db_paths(conn: sqlite3.Connection) -> list[tuple[str, Path]]:
+    """``(slug, kanban.db path)`` for every board EXCEPT the one ``conn`` is on.
+
+    A worker legitimately cites tasks that live on another board (e.g. a shared
+    cross-tenant board), so a ``t_<hex>`` id absent from THIS board's DB must be
+    resolved against the others before it is called hallucinated.
+
+    Paths come from :func:`board_db_path_unpinned` — NOT :func:`kanban_db_path` —
+    because dispatched workers carry ``HERMES_KANBAN_DB`` pinned to their own
+    board; through that override every slug resolves to the pinned file, is
+    skipped as "the current board", and the caller sees no other boards at all."""
+    current: Optional[Path] = None
+    try:
+        current = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    except Exception:
+        current = None
+    out: list[tuple[str, Path]] = []
+    try:
+        boards = list_boards()
+    except Exception:
+        return out
+    for meta in boards:
+        slug = meta.get("slug")
+        if not slug:
+            continue
+        try:
+            path = board_db_path_unpinned(slug)
+        except Exception:
+            continue
+        try:
+            if current is not None and path.resolve() == current:
+                continue
+        except Exception:
+            pass
+        if path.is_file():
+            out.append((slug, path))
+    return out
+
+
+def _resolve_refs_across_boards(
+    conn: sqlite3.Connection, missing: list[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Split ``missing`` (ids absent from this board) into
+    ``(truly_phantom, {id: board_slug})`` by looking each id up on every other
+    board's DB (read-only). Never creates a board or writes anything."""
+    if not missing:
+        return [], {}
+    remaining = list(missing)
+    cross_board: dict[str, str] = {}
+    for slug, path in _other_board_db_paths(conn):
+        if not remaining:
+            break
+        other: Optional[sqlite3.Connection] = None
+        try:
+            other = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            other.row_factory = sqlite3.Row
+            still_missing = set(_missing_task_ids(other, remaining))
+        except Exception:
+            continue
+        finally:
+            if other is not None:
+                with contextlib.suppress(Exception):
+                    other.close()
+        for rid in remaining:
+            if rid not in still_missing:
+                cross_board[rid] = slug
+        remaining = [rid for rid in remaining if rid in still_missing]
+    return remaining, cross_board
+
+
+def other_board_task_ids(conn: sqlite3.Connection) -> set[str]:
+    """Every task id that exists on ANOTHER board (not the one ``conn`` is on).
+
+    One read-only ``SELECT id`` per other board. The diagnostics layer uses it so
+    a citation to a task on a shared/sibling board is not reported as a phantom
+    reference. Returns an empty set when there are no other boards or none is
+    readable — callers then fall back to this board only."""
+    ids: set[str] = set()
+    for _slug, path in _other_board_db_paths(conn):
+        other: Optional[sqlite3.Connection] = None
+        try:
+            other = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            ids.update(str(r[0]) for r in other.execute("SELECT id FROM tasks"))
+        except Exception:
+            continue
+        finally:
+            if other is not None:
+                with contextlib.suppress(Exception):
+                    other.close()
+    return ids
+
+
 def _flag_phantom_prose_refs(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
     summary: Optional[str], result: Optional[str], verified_cards: list[str],
 ) -> None:
     """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
     references; emits ``suspected_hallucinated_references`` in its own txn so
-    the completion is already durable. Never blocks."""
+    the completion is already durable. Never blocks.
+
+    An id absent from THIS board is first looked up on every OTHER board
+    (``_resolve_refs_across_boards``). One that resolves there is recorded as
+    ``cross_board_references`` (informational — the citation was real, just not
+    local) and is NOT treated as a hallucination. Only ids that resolve nowhere
+    count as phantoms; those are recorded as
+    ``suspected_hallucinated_references``, and — only when the caller opted in via
+    ``kanban.auto_verify_phantom_refs`` — spawn a ``verify:`` child task so the
+    hallucinated claim is independently re-checked. Default is off: flag the
+    reference, do not manufacture a task from it.
+    """
     scan_text = " ".join(filter(None, [summary, result]))
     if not scan_text:
         return
-    phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
-    if phantom_refs:
+    missing = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
+    if not missing:
+        return
+    phantom_refs, cross_board = _resolve_refs_across_boards(conn, missing)
+    if cross_board:
         with write_txn(conn):
             _append_event(
-                conn, task_id, "suspected_hallucinated_references",
-                {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
+                conn, task_id, "cross_board_references",
+                {"refs": cross_board, "source": "completion_summary",
+                 "note": "cited task ids exist on another board — legitimate, not hallucinated"},
+                run_id=run_id,
             )
+    if not phantom_refs:
+        return
+    auto_verify = _auto_verify_phantom_refs_config()
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "suspected_hallucinated_references",
+            {"phantom_refs": phantom_refs, "source": "completion_summary",
+             "auto_verify_card": auto_verify},
+            run_id=run_id,
+        )
+    if not auto_verify:
+        # Opt-in (``kanban.auto_verify_phantom_refs``, default off): flagging the
+        # reference is the detector's job; spawning work nobody requested is not.
+        _log.debug(
+            "auto verify child for phantom refs on %s suppressed (%s) — "
+            "set kanban.auto_verify_phantom_refs: true to spawn it",
+            task_id, ", ".join(phantom_refs),
+        )
+        return
+    # Auto-create a re-verification child task so the phantom claim gets
+    # independently checked by the same profile.
+    try:
+        task = get_task(conn, task_id)
+        if task and task.assignee:
+            phantoms_str = ", ".join(phantom_refs)
+            create_task(
+                conn,
+                title=f"verify: {task.title}",
+                assignee=task.assignee,
+                parents=[task_id],
+                body=(
+                    f"The completion summary of parent task {task_id} referenced "
+                    f"task ids that exist on NO board: {phantoms_str}. "
+                    "The worker likely hallucinated a test/verification step.\n\n"
+                    "Re-check the specific claim(s) involving these ids "
+                    "and confirm whether the parent task's actual work is complete "
+                    "and correct. If the phantom claim was the only evidence of a "
+                    "verification step, re-run that verification now. "
+                    "Complete this task with the outcome."
+                ),
+                created_by="system",
+            )
+    except Exception:
+        _log.warning("Failed to create verify child for phantom refs on %s", task_id, exc_info=True)
+
+
+def _auto_verify_phantom_refs_config() -> bool:
+    """Whether an unresolved prose reference spawns an automatic ``verify:`` child.
+
+    Read from ``kanban.auto_verify_phantom_refs`` (``config.yaml``) and OPT-IN,
+    default false: the detector always records ``suspected_hallucinated_references``,
+    it just does not manufacture a task nobody requested. Any read failure is
+    treated as "off" — the detector's write path must never fail on config.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = ((load_config_readonly() or {}).get("kanban") or {})
+    except Exception:
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("auto_verify_phantom_refs", False))
+
 
 
 def _merge_completion_prose_artifacts(
@@ -3135,7 +3464,7 @@ def _persist_scratch_completion_artifacts(
 
         dest: Optional[Path] = None
         try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
+            mkdir_aligned(attachment_dir)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
             _copy_capped(resolved_src, dest, artifact)
         except Exception as exc:
@@ -3277,7 +3606,8 @@ def edit_task(
                 {
                     "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
                     "result_len": len(result) if result else 0,
-                    "summary": _first_line(handoff_summary, 400) or None,
+                    "summary": _preview(handoff_summary, 400) or None,
+                    "summary_chars": len(handoff_summary) if handoff_summary else 0,
                 },
                 run_id=run_id,
             )
@@ -3537,7 +3867,8 @@ def request_review(
                 profile=implementer,
             )
             payload: dict = {
-                "summary": _first_line(summary, 400) or None,
+                "summary": _preview(summary, 400) or None,
+                "summary_chars": len(summary) if summary else 0,
                 "implementer": implementer,
                 "reviewer": reviewer,
             }
@@ -4068,6 +4399,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+    from hermes_cli.kanban_db_context import (
+        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
+        _ctx_role_history,
+    )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
@@ -4078,198 +4413,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
-
-
-def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-    """Truncate to ``limit`` chars with a visible ellipsis."""
-    if not s:
-        return ""
-    s = s.strip()
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-
-
-def _ctx_stamp(ts: int, now: int) -> str:
-    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
-    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-    age = _relative_age(ts, now)
-    return f"{disp}, {age}" if age else disp
-
-
-def _ctx_metadata_line(metadata: Any) -> Optional[str]:
-    if not metadata:
-        return None
-    try:
-        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
-    except Exception:
-        return None
-
-
-def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
-    """Keep the newest ``cap`` items; describe the omitted head, if any."""
-    omitted = max(0, len(items) - cap)
-    if not omitted:
-        return items, None
-    return items[-cap:], (
-        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
-        f"omitted; showing most recent {cap})_"
-    )
-
-
-def _ctx_header(lines: list[str], task: Task) -> None:
-    lines.append(f"# Kanban task {task.id}: {task.title}")
-    lines.append("")
-    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
-    lines.append(f"Status:   {task.status}")
-    if task.tenant:
-        lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
-    if task.max_runtime_seconds is not None:
-        terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
-        )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
-        if effective_terminal_timeout:
-            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
-    if task.branch_name:
-        lines.append(f"Branch:   {task.branch_name}")
-    lines.append("")
-    if task.body and task.body.strip():
-        lines.append("## Body")
-        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
-        lines.append("")
-
-
-def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
-    """Absolute on-disk paths so the worker's file tools read them directly
-    (remote terminal backends need the attachments dir mounted)."""
-    if not attachments:
-        return
-    lines.append("## Attachments")
-    lines.append(
-        "Files attached to this task. Read them with the file/terminal "
-        "tools at the absolute paths below:"
-    )
-    for att in attachments:
-        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
-        size_str = f", {size_kb} KB" if size_kb else ""
-        ctype = f", {att.content_type}" if att.content_type else ""
-        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
-    lines.append("")
-
-
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Closed runs on this task (the active run is this worker), newest
-    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
-    if not shown:
-        return
-    first_shown_idx = len(all_prior) - len(shown) + 1
-    lines.append("## Prior attempts on this task")
-    if omitted_note:
-        lines.append(omitted_note)
-    for offset, run in enumerate(shown):
-        profile = run.profile or "(unknown)"
-        outcome = run.outcome or run.status
-        lines.append(
-            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
-        )
-        if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        if run.error and run.error.strip():
-            lines.append(f"_error_: {_ctx_cap(run.error)}")
-        meta_line = _ctx_metadata_line(run.metadata)
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
-    falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
-    ).fetchall()
-    wrote_header = False
-    for pid in (r["parent_id"] for r in parent_rows):
-        pt = get_task(conn, pid)
-        if not pt or pt.status != "done":
-            continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-        runs.sort(key=lambda r: r.started_at, reverse=True)
-        run = runs[0] if runs else None
-        if not wrote_header:
-            lines.append("## Parent task results")
-            lines.append(
-                "_Handoffs from upstream tasks, captured when each parent "
-                "completed (see age below). These are point-in-time "
-                "snapshots, not live state — if a result drives your "
-                "current work and it's not recent, re-verify against the "
-                "source before acting on it as current._"
-            )
-            wrote_header = True
-        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
-        age = _relative_age(done_ts, now)
-        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-        if run is not None and run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        elif pt.result:
-            lines.append(_ctx_cap(pt.result))
-        else:
-            lines.append("(no result recorded)")
-        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
-    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
-    role continuity without wiring anything into SOUL.md / MEMORY.md."""
-    if not task.assignee:
-        return
-    role_rows = conn.execute(
-        "SELECT t.id, t.title, r.summary, r.ended_at "
-        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-        "WHERE r.profile = ? AND r.task_id != ? "
-        "  AND r.outcome = 'completed' "
-        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
-    ).fetchall()
-    if not role_rows:
-        return
-    lines.append(f"## Recent work by @{task.assignee}")
-    for row in role_rows:
-        first = _first_line(row["summary"], 200) or "(no summary)"
-        lines.append(
-            f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
-        )
-    lines.append("")
-
-
-def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
-    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
-    worker" framing stops an operator-controlled HERMES_PROFILE like
-    "hermes-system" being read as a system directive above an
-    attacker-influenceable body (defense-in-depth)."""
-    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
-    if not shown:
-        return
-    lines.append("## Comment thread")
-    if omitted_note:
-        lines.append(omitted_note)
-    for c in shown:
-        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
-        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
-        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
-        # author-forgery surface was already closed in #22435. See #22452.
-        safe_author = (c.author or "").replace("`", "")
-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
-        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
-        lines.append("")
 
 
 # --- Stats + SLA helpers ---
@@ -4330,7 +4473,7 @@ def _to_epoch(val) -> Optional[int]:
     # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
     try:
         from datetime import datetime
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s)
         return int(dt.timestamp())
     except (ValueError, OSError):
         return None
@@ -4339,9 +4482,7 @@ def _to_epoch(val) -> Optional[int]:
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
-    _c = _to_epoch(task.created_at)
-    _s = _to_epoch(task.started_at)
-    _co = _to_epoch(task.completed_at)
+    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
     return {
         "created_age_seconds": now - _c if _c is not None else None,
         "started_age_seconds": now - _s if _s is not None else None,
@@ -4559,18 +4700,28 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
-from hermes_cli.kanban_db_connect import (  # noqa: E402
+from hermes_cli.kanban_db_boards import (
+    _default_board_display_name,
+    _dir_holds_board,
+    board_metadata_path,
+    create_board,
+    list_boards,
+    read_board_metadata,
+    remove_board,
+    write_board_metadata,
+)
+from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
     init_db,
     write_txn,
 )
-from hermes_cli.kanban_db_workspace import (  # noqa: E402
+from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_db_dispatch import (  # noqa: E402
+from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
@@ -4583,3 +4734,79 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
+
+
+# ── Quota gate ──────────────────────────────────────────────────────────────
+
+
+from hermes_cli.quota_state import QuotaGateState  # noqa: F401
+
+
+def read_quota_gate_state(
+    fallback_chain: Optional[list[dict]] = None,
+    *,
+    enabled: Optional[bool] = None,
+    board: Optional[str] = None,
+) -> QuotaGateState:
+    """Read the provider-quota gate state from the local state DB.
+
+    Phase 2A: delegates to :func:`quota_state.read_state` instead of the board
+    card.  ``board`` is accepted but ignored (it was the board slug in the card
+    era) — kept for API compatibility.
+
+    ``fallback_chain`` is the list of ``fallback_providers`` entries from the
+    dispatcher's config (e.g. ``[{"provider": "deepseek", "model": …}]``).
+    When provided, the first entry is used as the override route.
+
+    Opt-in via ``kanban.quota_gate.enabled`` (default **false**): a dispatcher
+    that never opted in is never paused.
+    """
+    if enabled is None:
+        cfg_enabled, _cfg_board = _quota_gate_config()
+        enabled = cfg_enabled
+    if not enabled:
+        return QuotaGateState(is_closed=False)
+
+    try:
+        from hermes_cli.quota_state import read_state as _read_state
+        return _read_state(fallback_chain=fallback_chain)
+    except Exception as exc:
+        _log.warning("Quota state unreadable — holding the fleet: %s", exc)
+        return QuotaGateState(is_closed=True)
+
+
+def _quota_gate_config() -> "tuple[bool, str]":
+    """``(enabled, board_slug)`` from ``kanban.quota_gate``; disabled by default."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("quota_gate") or {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    enabled = bool(cfg.get("enabled", False))
+    board = str(cfg.get("board") or "yummi-board").strip() or "yummi-board"
+    return enabled, board
+
+def quota_gate_fallback_chain() -> "Optional[list[dict]]":
+    """The route the gate sends flagged work to: this profile's fallback chain.
+
+    ONE resolver for every reader of the override route — the kanban dispatcher, the
+    cron gate and ``hermes quota status``.  They must agree by construction: a CLI that
+    resolved its own chain (or none) reported "Hard pause: no fallback route" while the
+    dispatcher was routing ``quota_override`` cards to one, so the operator read a
+    pause that was not in effect.
+
+    Built on ``fallback_config.get_fallback_chain`` so a legacy ``fallback_model:``
+    entry and a malformed one are handled the same way on every path.  ``None`` when
+    no usable route exists (the callers then treat the gate as a hard pause).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        return get_fallback_chain(load_config_readonly() or {}) or None
+    except Exception:
+        return None
+

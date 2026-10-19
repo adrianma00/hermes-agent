@@ -79,10 +79,13 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     meta = kb.create_board(
         normed, name=args.name, description=args.description, icon=args.icon, color=args.color,
         default_workdir=args.default_workdir,
+        namespace=getattr(args, "namespace", None),
     )
     print(f"Board {meta['slug']!r} {'already exists' if already else 'created'}.\n"
           f"  Display name: {meta.get('name', '')}\n"
           f"  DB path:      {meta['db_path']}")
+    if meta.get("namespace"):
+        print(f"  Namespace:    {meta['namespace']}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
@@ -102,7 +105,8 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
         return _err(f"kanban boards rm: {exc}")
     if res["action"] == "archived":
         print(f"Board {res['slug']!r} archived → {res['new_path']}\n"
-              "Recover by moving the directory back to <root>/kanban/boards/<slug>/.")
+              "Recover by moving the directory back to <root>/kanban/boards/<slug>/ "
+              "and deleting the archived tombstone board.json left in its place.")
     else:
         print(f"Board {res['slug']!r} deleted.")
     return 0
@@ -117,6 +121,10 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
             f"kanban boards switch: board {normed!r} does not exist. "
             f"Create it with `hermes kanban boards create {normed}`."
         )
+    # An archived board has a tombstone board.json; switching to it would pin
+    # `current` at a dead slug (#43243).
+    if kb.read_board_metadata(normed).get("archived"):
+        return _err(f"kanban boards switch: board {normed!r} is archived.")
     kb.set_current_board(normed)
     print(f"Active board is now {normed!r}.")
     return 0
@@ -152,6 +160,29 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_namespace(args: argparse.Namespace) -> int:
+    """Declare/clear the namespace bare assignees on a board resolve within."""
+    normed, rc = _board_slug_arg(args, "set-namespace", must_exist=True)
+    if rc:
+        return rc
+    new_val = kb.write_board_metadata(normed, namespace=args.owner).get("namespace")
+    if new_val:
+        print(
+            f"Board {normed!r} namespace set to {new_val!r}.\n"
+            f"  Bare assignees here mean {new_val}:<profile> — only that install's "
+            "dispatcher claims them. Qualify explicitly (e.g. 'em:sysadmin') to "
+            "place work across namespaces."
+        )
+    else:
+        print(
+            f"Board {normed!r} namespace cleared.\n"
+            "  Bare unique names keep working as before; a bare install-relative "
+            "assignee ('default') is now refused by every dispatcher, visibly "
+            "('dispatch_skipped' event per card)."
+        )
     return 0
 
 
@@ -209,6 +240,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-namespace": _cmd_boards_set_namespace,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

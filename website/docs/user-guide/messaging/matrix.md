@@ -102,7 +102,7 @@ matrix:
   session_scope: room             # auto|room|thread; room is recommended for project rooms
   auto_thread: true               # Auto-create threads for responses (default: true)
   dm_mention_threads: false       # Create thread when @mentioned in DM (default: false)
-  max_message_length: 16000       # Outbound chunk size in chars (default: 16000, max: 65535)
+  max_message_length: 15000       # Outbound chunk size in UTF-8 bytes (default and max: 15000)
 ```
 
 Or via environment variables:
@@ -316,6 +316,34 @@ your bridge uses a different naming convention:
 MATRIX_IGNORE_USER_PATTERNS='^@telegram_,^@slack_,^@whatsapp_'
 ```
 
+### Two Hermes instances in one room (bot-to-bot loops)
+
+Matrix carries no bot flag, so a peer Hermes bot arrives as an ordinary **authorized** user: the
+gateway's bot loop guard cannot recognise it, and two instances will keep answering each other's
+automatic messages — model-fallback and interrupt notices are plain `m.text`, so
+`MATRIX_PROCESS_NOTICES` does not filter them. Two settings guard such a room:
+
+1. Name the peer in the loop guard, so its messages are counted as bot-authored:
+
+   ```yaml
+   gateway:
+     bot_loop_guard:
+       bot_senders:
+         matrix:
+           - "@peer-bot:example.org"
+   ```
+
+   Past `max_events` within `window_seconds` the room cools down for `cooldown_seconds`
+   (defaults: 20 messages / 300s / 600s). The list also accepts `["matrix:@peer-bot:example.org"]`,
+   and is re-read on every message — no restart needed.
+
+2. Set `MATRIX_THREAD_REQUIRE_MENTION=true` on **both** sides, so a turn needs an explicit
+   `@mention` even inside a thread the bot has already joined.
+
+A room holding only the two bots is DM-classified (`member_count <= 2`) and bypasses every mention
+gate, so keep a human in the room. For work rather than chat, prefer `hermes peer dm` or a kanban
+card over room traffic.
+
 Only enable notices when a trusted human workflow really sends `m.notice`:
 
 ```bash
@@ -361,12 +389,15 @@ Hermes supports Matrix end-to-end encryption, so you can chat with your bot in e
 
 ### Requirements
 
-E2EE requires the `mautrix` library with encryption extras and the `libolm` C library:
+E2EE requires the `mautrix` library with encryption extras (the `[matrix-e2ee]` extra) and the `libolm` C library:
 
 ```bash
-# Request the declared Matrix dependencies
-python -c "import pm; pm.sync_venv(['matrix'], explicit=True)"
+# Request the E2EE closure (mautrix[encryption] → python-olm; Linux only)
+python -c "import pm; pm.sync_venv(['matrix-e2ee'], explicit=True)"
 ```
+
+The `[matrix]` extra on its own is the plain client — it never resolves `python-olm`, so an
+E2EE-off deployment installs no crypto dependency and needs no C++ toolchain.
 
 You also need `libolm` installed on your system:
 
@@ -491,7 +522,7 @@ Other Matrix clients (Element, matrix-commander) may cache the old device keys. 
 :::
 
 :::info
-If `mautrix[encryption]` is not installed or `libolm` is missing, the bot falls back to a plain (unencrypted) client automatically. You'll see a warning in the logs.
+If `mautrix[encryption]` (the `[matrix-e2ee]` extra) is not installed or `libolm` is missing, the bot falls back to a plain (unencrypted) client automatically. You'll see a warning in the logs. With `MATRIX_E2EE_MODE=off` — the default — nothing is installed and no warning is logged.
 :::
 
 ## Home Room
@@ -716,10 +747,12 @@ history, so other clients trust it immediately.
 
 ## Proxy Mode (E2EE on macOS)
 
-The `matrix` extra is gated to Linux. On macOS or Windows, run the Matrix
-adapter and encryption dependencies in a Linux container and forward requests
-to the native agent. The example below uses a macOS host; the same separation
-applies to Windows with the corresponding host address and authentication.
+The `matrix` extra installs on Linux and macOS; only its E2EE closure
+(`[matrix-e2ee]` → `python-olm`, which publishes no macOS wheels) does not.
+On Windows, or on macOS when you need encrypted rooms, run the Matrix adapter
+and encryption dependencies in a Linux container and forward requests to the
+native agent. The example below uses a macOS host; the same separation applies
+to Windows with the corresponding host address and authentication.
 
 ### How It Works
 

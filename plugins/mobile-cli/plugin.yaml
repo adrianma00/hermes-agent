@@ -1,0 +1,5 @@
+name: mobile-cli
+version: 1.0.0
+description: "Mobile pairing CLI (hermes mobile): reports the address, port, TLS state and Dashboard URL a phone client needs, then renders the hermes://pair payload as a QR code or link. Operator-facing only; never prints the Gateway key by default."
+provides_cli_commands:
+  - mobile

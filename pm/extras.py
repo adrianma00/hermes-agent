@@ -24,7 +24,6 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "parallel-web": "parallel",
     "ddgs": "ddgs",
     "otlp": "opentelemetry.sdk",
-    "langfuse": "langfuse",
     "mistral": "mistralai",
     "edge-tts": "edge_tts",
     "neutts": "neutts",
@@ -40,12 +39,14 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "wake-sherpa": "sherpa_onnx",
     "wake-porcupine": "pvporcupine",
     "fal": "fal_client",
-    "mem0": "mem0",
     "messaging": "telegram",
     "telegram": "telegram",
     "discord": "discord",
     "slack": "slack_bolt",
     "matrix": ("mautrix", "asyncpg", "aiosqlite", "markdown", "aiohttp_socks"),
+    # Encryption closure, installed only when MATRIX_E2EE_MODE is on. The
+    # anchor is the crypto lib itself: `matrix` already proves mautrix.
+    "matrix-e2ee": "olm",
     "dingtalk": "dingtalk_stream",
     "feishu": "lark_oapi",
     "wecom": "defusedxml",
@@ -170,7 +171,7 @@ def _evaluate_in_runtime(marker: str, environment: dict[str, str]) -> bool:
         command = runtime_command(Path(__file__).with_name("_marker_eval.py"),
                                   [marker, json.dumps(environment)])
         result = subprocess.run(command, env=runtime_environment(), capture_output=True,
-                                text=True, timeout=60)
+                                text=True, timeout=60, check=False)
     except Exception:
         return True  # same fallback as a malformed marker: the resolver decides
     if result.returncode != 0:

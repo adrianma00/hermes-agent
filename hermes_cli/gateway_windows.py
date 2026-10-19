@@ -7,6 +7,7 @@ hidden-console launcher instead of ``schtasks /Run`` so start/restart behavior i
 
 from __future__ import annotations
 
+import codecs
 import ctypes
 import json
 import locale
@@ -19,7 +20,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
@@ -96,6 +97,11 @@ def _decode_schtasks_output(data: bytes) -> str:
     Scheduled-Task drift check could never settle (#116193). Strict UTF-8 first (ASCII and genuine
     UTF-8 output pass; legacy multi-byte text fails loudly), then the native code pages, then a lossy
     fallback so a reader thread never raises."""
+    if data[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+        try:
+            return data.decode("utf-16")  # a genuine UTF-16 write (BOM) decodes as such, never as a code page
+        except UnicodeDecodeError:
+            pass  # malformed UTF-16 falls through to the same fallbacks as any other bytes
     for encoding in ("utf-8", *_windows_console_encodings()):
         try:
             return data.decode(encoding)
@@ -182,7 +188,7 @@ def _quote_vbs_string(value: str) -> str:
 
 # ── schtasks.exe wrapper
 
-def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
+def _exec_schtasks(args: list[str], timeout: float = _SCHTASKS_TIMEOUT_S) -> tuple[int, str, str]:
     """Run ``schtasks.exe`` with a hard timeout. Return (code, stdout, stderr); a wedge returns
     code=124 with a synthetic stderr so the fallback regex matches."""
     _assert_windows()
@@ -194,7 +200,8 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
         # UnicodeDecodeError from subprocess' reader threads. CREATE_NO_WINDOW: no flashing console under a TUI.
         proc = subprocess.run(
             [schtasks, *args], capture_output=True, text=False,
-            timeout=_SCHTASKS_TIMEOUT_S, creationflags=windows_hide_flags(),
+            timeout=timeout, creationflags=windows_hide_flags(),
+            check=False,
         )
         return (
             proc.returncode,
@@ -202,7 +209,7 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
             _decode_schtasks_output(proc.stderr or b""),
         )
     except subprocess.TimeoutExpired:
-        return (124, "", f"schtasks timed out after {_SCHTASKS_TIMEOUT_S}s")
+        return (124, "", f"schtasks timed out after {timeout}s")
     except OSError as e:
         return (1, "", f"schtasks invocation failed: {e}")
 
@@ -717,7 +724,7 @@ def _build_gateway_argv(home: Path | None = None) -> tuple[list[str], str, dict[
     return _gateway_run_argv(python_exe, profile_arg), working_dir, env_overlay
 
 
-def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str, dict[str, str]]:
+def windowless_gateway_restart_spec(run_argv: list[str], home: str | None = None) -> tuple[list[str], str, dict[str, str]]:
     """(argv, cwd, env overlay) for a hidden-console gateway respawn; arguments after the interpreter
     are preserved verbatim. Non-Windows or a non-python argv[0] → argv unchanged, empty overlay.
 
@@ -728,6 +735,8 @@ def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str
     every console-subsystem child allocated a visible conhost). This helper now only normalizes the
     interpreter via ``_resolve_detached_python`` and supplies the stable cwd + env overlay (HERMES_HOME,
     VIRTUAL_ENV, PYTHONPATH) so the respawn doesn't depend on the watcher's transient working directory.
+    ``HERMES_HOME`` is ``home`` when given: a replayed selectorless argv runs on whatever home its
+    environment names, so the paused runtime's home, not the updater's, must come back.
     """
     if not run_argv or sys.platform != "win32":
         return run_argv, "", {}
@@ -739,7 +748,7 @@ def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str
         return run_argv, "", {}
 
     try:
-        hermes_home = str(_hermes_home().resolve())
+        hermes_home = str(Path(home or _hermes_home()).resolve())
     except Exception:
         hermes_home = ""
     env_overlay: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "HERMES_GATEWAY_DETACHED": "1", "VIRTUAL_ENV": str(venv_dir)}
@@ -864,7 +873,7 @@ def _start_or_report_running(running_pids: list[int] | None = None) -> None:
     if running_pids:
         _report_already_running(running_pids)
     else:
-        pid = _spawn_detached()
+        _spawn_detached()
         _report_gateway_start("direct spawn")
 
 
@@ -1083,7 +1092,7 @@ def _write_start_attestation(pids: list[int], via: str, home: Path | None = None
         from hermes_cli.process_identity import _process_create_time
 
         payload = {
-            "pids": [int(p) for p in pids], "via": via, "ts": datetime.now(timezone.utc).isoformat(),
+            "pids": [int(p) for p in pids], "via": via, "ts": datetime.now(UTC).isoformat(),
             "generation": uuid.uuid4().hex,
         }
         # Bind each PID to its incarnation (#110020 review): the ledger sentinel is matched by PID
@@ -1121,7 +1130,7 @@ def _attestation_within_horizon(data: object) -> bool:
         if ts is None:
             return False
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
         age = time.time() - ts.timestamp()
         return -_ATTESTATION_CLOCK_SLACK_S <= age <= START_ATTESTATION_MAX_AGE_S
     except Exception:
@@ -1380,6 +1389,29 @@ def _query_scheduled_task_xml(task_name: str) -> str | None:
     return out
 
 
+# The install probe runs before the desktop backend says ready: a wedged schtasks must not hold that.
+_TASK_PROBE_TIMEOUT_S = 5
+
+
+def registered_task_launchers() -> list[str]:
+    """The scripts this OS user's ``Hermes_Gateway*`` Scheduled Tasks start (``install_state``). A task
+    install removes the Startup-folder entries, so for a custom home the task is all that still names
+    it. Empty off Windows, and when Task Scheduler does not answer, as for an unreadable Startup entry."""
+    if sys.platform != "win32":
+        return []
+    from hermes_cli.gateway_service_owner import service_definition_launchers
+
+    code, listing, _err = _exec_schtasks(["/Query", "/FO", "CSV", "/NH"], timeout=_TASK_PROBE_TIMEOUT_S)
+    names = re.findall(rf'^"\\({_TASK_NAME_DEFAULT}[^"\\]*)"', listing, flags=re.MULTILINE) if code == 0 else []
+    launchers: list[str] = []
+    for name in dict.fromkeys(names):
+        code, xml, _err = _exec_schtasks(["/Query", "/TN", name, "/XML"], timeout=_TASK_PROBE_TIMEOUT_S)
+        leaves = (_task_xml_leaf_values(xml) if code == 0 else None) or {}
+        command = leaves.get("Task/Actions/Exec/Command", "").strip('"')
+        launchers += service_definition_launchers(f'"{command}" {leaves.get("Task/Actions/Exec/Arguments", "")}')
+    return launchers
+
+
 def _task_xml_leaf_values(xml: str) -> dict[str, str] | None:
     """Namespace-agnostic ``Task/Settings/...`` leaf-path → text map, or ``None`` for invalid XML.
     The root ``version`` attribute is exposed as ``Task@version``."""
@@ -1472,7 +1504,7 @@ def is_installed() -> bool:
 
 def query_task_status() -> dict[str, str]:
     """Parse ``schtasks /Query /V /FO LIST`` and pull the interesting keys."""
-    code, out, err = _exec_schtasks(["/Query", "/TN", get_task_name(), "/V", "/FO", "LIST"])
+    code, out, _err = _exec_schtasks(["/Query", "/TN", get_task_name(), "/V", "/FO", "LIST"])
     if code != 0:
         return {}
     info: dict[str, str] = {}
@@ -1568,8 +1600,8 @@ def _probe_state_file(state_path: Path) -> None:
         age_str = ""
         if updated_at:
             try:
-                updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                age_seconds = int((datetime.now(timezone.utc) - updated_dt).total_seconds())
+                updated_dt = datetime.fromisoformat(updated_at)
+                age_seconds = int((datetime.now(UTC) - updated_dt).total_seconds())
                 age_str = f" (updated {age_seconds}s ago)"
             except Exception:
                 pass
@@ -1686,13 +1718,43 @@ def start() -> None:
 
     # Manual starts use the same console-less direct spawn as restart() and install --start-now;
     # Scheduled Task / Startup entries are only login persistence.
-    pid = _spawn_detached()
+    _spawn_detached()
     _report_gateway_start("direct spawn")
 
 
-def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
+# Window granted to a gateway that already accepted a stop (lifecycle phase "stopping") to finish
+# its own teardown before the CLI escalates to taskkill. See _drain_gateway_pid.
+_STOP_TEARDOWN_GRACE_S = 45.0
+
+
+def _lifecycle_phase() -> str | None:
+    """``phase`` of the launch home's ``state/gateway.lifecycle.json`` — ``None`` when unreadable."""
+    try:
+        import json
+
+        from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
+
+        data = json.loads(get_lifecycle_sentinel_path().read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    return data.get("phase") if isinstance(data, dict) else None
+
+
+def _drain_gateway_pid(
+    pid: int, drain_timeout: float, *, teardown_grace: float = _STOP_TEARDOWN_GRACE_S,
+) -> bool:
     """Write the planned-stop marker and wait for the PID to exit. Windows can't deliver POSIX signals
-    to an asyncio loop, so the marker is the ONLY way to ask the gateway to drain and persist."""
+    to an asyncio loop, so the marker is the ONLY way to ask the gateway to drain and persist.
+
+    A drained gateway is NOT an exited one: adapters, MCP servers, session-DB close and the
+    clean-exit receipt (``lifecycle_ledger.mark_exited``) all come after the "drain done" log line.
+    Killing in that window is exactly what made a planned stop read as ``exited UNCLEANLY (no exit
+    path ran)`` in the lifecycle ledger, so once the gateway has stamped itself ``stopping`` — it
+    accepted the stop and is tearing down — it gets a second, bounded window (``teardown_grace``)
+    before the caller escalates to a hard kill.
+
+    Returns True when the PID is gone (drained AND exited) within the budget.
+    """
     if pid <= 0:
         return False
     try:
@@ -1706,11 +1768,15 @@ def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
         pass   # best-effort; caller escalates to a hard kill
 
     deadline = time.monotonic() + max(drain_timeout, 1.0)
+    extended = False
     while time.monotonic() < deadline:
         if not _pid_exists(pid):
             return True
+        if not extended and teardown_grace > 0 and _lifecycle_phase() == "stopping":
+            extended = True
+            deadline = time.monotonic() + teardown_grace
         time.sleep(0.5)
-    return False
+    return not _pid_exists(pid)
 
 
 def _windows_stop_drain_timeout() -> float:
@@ -1757,9 +1823,15 @@ def _force_terminate_known_gateway_pids(identities: dict[int, int | None]) -> in
         except ProcessLookupError:
             continue
         except PermissionError:
+            if not _pid_exists(pid):
+                continue  # already exiting on its own — a drained gateway needs no kill
             print(f"⚠ Permission denied to kill PID {pid}")
         except OSError as exc:
-            print(f"Failed to kill PID {pid}: {exc}")
+            # taskkill reports "Access denied" for a process that is already terminating; the
+            # gateway this stop asked to drain is often exactly that. Only a SURVIVOR is a failure.
+            if not _pid_exists(pid):
+                continue
+            print(f"⚠ Could not kill PID {pid}: {exc}")
     return killed
 
 

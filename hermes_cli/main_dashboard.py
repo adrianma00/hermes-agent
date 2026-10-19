@@ -87,7 +87,7 @@ _SYSTEMCTL_ERRORS = (FileNotFoundError, subprocess.TimeoutExpired, OSError)
 def _run_probe(cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess:
     """Captured, text-decoded ``subprocess.run`` for short local probes (systemctl, ps)."""
     return subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
 
 
 def _restart_managed_dashboard_service(reason: str, unit: str = _DASHBOARD_SYSTEMD_UNIT) -> bool:
@@ -315,7 +315,7 @@ def _loaded_launchd_backend_jobs(
 
 def _launchd_job_owning_backend(
     pid: int, cmdline: list[str] | None, jobs: list[tuple[str, str, list[str], int | None]],
-    ancestors: "list[int] | tuple[int, ...]" = (),
+    ancestors: list[int] | tuple[int, ...] = (),
 ) -> tuple[str, str, int | None] | None:
     """``(domain, label, live_pid)`` of the loaded launchd job that owns *pid*: launchd reports *pid*
     (or one of its *ancestors* — a plist may wrap the backend in ``/bin/sh -c …`` without ``exec``)
@@ -352,9 +352,19 @@ def _restart_launchd_job(domain: str, label: str, old_pid: int | None, *, timeou
 
 def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
     """Exact argv of a running process: ``/proc/<pid>/cmdline`` (Linux), ``ps -o command=`` + shlex
-    (macOS), None on Windows (no graceful taskkill window; Desktop manages its backend)."""
+    (macOS), ``psutil`` (Windows — no ``/proc`` and no ``ps``; its ``cmdline()`` reads the PEB and
+    fails closed to None for a process this user cannot open, e.g. an elevated one)."""
     if sys.platform == "win32":
-        return None
+        # Fails closed on purpose: an unreadable argv must never become a guessed respawn, and a
+        # PID whose argv cannot be read comes back to the caller as "relaunch by hand" (#68934).
+        try:
+            import psutil
+        except ImportError:
+            return None
+        try:
+            return list(psutil.Process(pid).cmdline()) or None
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            return None
     try:
         cmdline_path = f"/proc/{pid}/cmdline"
         if os.path.exists(cmdline_path):
@@ -406,11 +416,39 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     """
     from hermes_constants import get_hermes_home
     respawned: list[list[str]] = []
-    spawned: list[tuple[list[str], list[str], "subprocess.Popen"]] = []
+    spawned: list[tuple[list[str], list[str], subprocess.Popen]] = []
     failed: list[tuple[list[str], list[str], str]] = []
     log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
     with contextlib.suppress(OSError):
         log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if sys.platform == "win32":
+        # POSIX detaches with ``start_new_session``; Windows needs creation flags instead, and a
+        # job object that forbids breakaway refuses the spawn outright (PermissionError) — the
+        # documented fallback is the same flags minus CREATE_BREAKAWAY_FROM_JOB.
+        from hermes_cli._subprocess_compat import (
+            windows_detach_flags, windows_detach_flags_without_breakaway)
+
+        def _spawn(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                close_fds=True, start_new_session=False,
+                creationflags=windows_detach_flags())
+
+        def _spawn_without_breakaway(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                close_fds=True, start_new_session=False,
+                creationflags=windows_detach_flags_without_breakaway())
+
+        spawn_attempts = [_spawn, _spawn_without_breakaway]
+    else:
+        def _spawn_posix(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True)
+
+        spawn_attempts = [_spawn_posix]
 
     for original in commands:
         command = _respawnable_command_for_current_install(original)
@@ -418,14 +456,22 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
         # background update is noisy and fails in SSH/headless sessions.
         if "dashboard" in command and "--no-open" not in command:
             command = [*command, "--no-open"]
-        try:
-            with open(log_path, "ab") as log_f:
-                proc = subprocess.Popen(
-                    command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
-                    start_new_session=True, close_fds=True)
+        proc = None
+        last_exc: Exception | None = None
+        for attempt in spawn_attempts:
+            try:
+                with open(log_path, "ab") as log_f:
+                    proc = attempt(command, log_f)
+                break
+            except PermissionError as exc:  # Windows job object forbids breakaway
+                last_exc = exc
+            except (OSError, ValueError) as exc:
+                last_exc = exc
+                break  # not a detach-flag problem; retrying the flags cannot help
+        if proc is None:
+            failed.append((original, command, str(last_exc)))
+        else:
             spawned.append((original, command, proc))
-        except (OSError, ValueError) as exc:
-            failed.append((original, command, str(exc)))
 
     # A respawned backend is a resident server: one that exits within the grace
     # window died at startup (SyntaxError on a stale argv, port already bound,
@@ -515,10 +561,11 @@ def _install_hangup_protection(gateway_mode: bool = False):
 
     # Any failure here is non-fatal; we just skip the wrap.
     try:
-        # Late-bound import so tests can monkeypatch
-        # hermes_cli.config.get_hermes_home to simulate setup failure.
-        from hermes_cli.config import get_hermes_home as _get_hermes_home
-        logs_dir = _get_hermes_home() / "logs"
+        # Late-bound import so tests can monkeypatch it to simulate setup failure. The ROOT
+        # home, never a sticky profile's: the update mutates the shared checkout, and the
+        # Desktop and the hand-off scripts read <root>/logs/update.log.
+        from hermes_constants import get_default_hermes_root as _get_root_home
+        logs_dir = _get_root_home() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_file = open(logs_dir / "update.log", "a", buffering=1, encoding="utf-8")
 
@@ -926,7 +973,9 @@ def _attach_to_host_backend(args, headless_backend: bool) -> None:
     except Exception:
         profile = "default"
     wanted = getattr(args, "open_profile", "") or profile
-    url = f"http://{hr.dial_host(record)}:{record.port}/?profile={wanted}"
+    from hermes_cli.url_utils import format_url_host
+
+    url = f"http://{format_url_host(hr.dial_host(record))}:{record.port}/?profile={wanted}"
 
     kind = "backend" if headless_backend else "dashboard"
     print(f"Hermes {kind} already running on this host: PID {record.pid}, port {record.port}.")

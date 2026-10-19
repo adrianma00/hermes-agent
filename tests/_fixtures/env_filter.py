@@ -147,6 +147,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_REAL_HOME",
     "TERMINAL_HOME_MODE",
     "HERMES_INTERACTIVE",
+    # A `hermes chat -q` launcher (and every dispatched worker that inherits it)
+    # exports this, and `tools.approval_context._is_single_query_approval_context`
+    # reads it straight from the session env at call time. Un-scrubbed, every
+    # approval test that assumes a CLI/gateway context instead resolves the
+    # single-query branch (the gate clears the presence trio) and fails.
+    "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_QUIET",
     "HERMES_TOOL_PROGRESS",
     "HERMES_TOOL_PROGRESS_MODE",

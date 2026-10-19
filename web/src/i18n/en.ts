@@ -103,6 +103,8 @@ export const en: Translations = {
       "Managing profile \u201c{name}\u201d \u2014 config, keys, skills, MCPs, model, and new chats apply to that profile.",
     memoryOomRestartBanner:
       "Your agent restarted unexpectedly, most likely because it ran out of memory. Long sessions and many concurrent tasks increase memory use.",
+    memoryIncompleteStopBanner:
+      "Your agent accepted a stop request and did not finish shutting down. That is an interrupted shutdown, not a crash, and no action is needed unless it keeps happening.",
     memoryCriticalBanner:
       "Your agent is almost out of memory and may restart. Consider closing idle sessions or upgrading its memory.",
     memoryElevatedBanner: "Your agent is running low on memory.",
@@ -116,6 +118,8 @@ export const en: Translations = {
     sharedMetricsTitle: "Help improve Hermes?",
     sharedMetricsBody:
       "Shared metrics are bounded counters, never prompts, files, paths or error text. Collection stays on this machine; sending to Nous is a separate choice.",
+    sharedMetricsReaskBody:
+      "Asking once more: an earlier version could save \"No thanks\" before you saw this question.",
     sharedMetricsShare: "Send to Nous",
     sharedMetricsLocal: "Local only",
     sharedMetricsOff: "No thanks",
@@ -126,6 +130,7 @@ export const en: Translations = {
   status: {
     actionFailed: "Action failed",
     actionFinished: "Finished",
+    actionFinishedOwed: "Updated, but still owed (re-run `hermes update` to finish)",
     actions: "Actions",
     agent: "Agent",
     activeSessions: "Active Sessions",

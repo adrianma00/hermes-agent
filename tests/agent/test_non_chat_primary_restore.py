@@ -39,6 +39,10 @@ def _restore_after_fallback(primary_model):
         assert agent._try_activate_fallback() is True
     emitted = []
     agent._emit_status = emitted.append
+    # The restore notice marks a QUOTA-GATED recovery: this fleet's build suppresses it
+    # for a plain (non-quota) fallback, so a notice-asserting test needs the reset-gate
+    # wait signal the production path raises while the gate blocks the restore.
+    agent._restore_wait_logged = True
     with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
         restored = agent._restore_primary_runtime()
     return agent, restored, emitted

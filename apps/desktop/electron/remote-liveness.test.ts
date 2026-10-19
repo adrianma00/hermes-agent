@@ -2,8 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   ensureHealthyPooledRemoteBackendForDispatch,
+  type EnsureHealthyPooledRemoteBackendForDispatchOptions,
+  POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS,
   POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
   POWER_RESUME_REVALIDATION_HOLDOFF_MS,
+  probeFailureDescription,
   REMOTE_LIVENESS_FAILURE_LIMIT,
   REMOTE_LIVENESS_FAILURE_WINDOW_MS,
   REMOTE_LIVENESS_TIMEOUT_MS,
@@ -281,7 +284,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => connectionPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(healthy)
 
@@ -320,7 +324,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => currentPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker(1)
       })
     ).resolves.toBe(replacement)
 
@@ -350,7 +355,8 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
         currentConnectionPromise: () => legacyPromise,
         probe,
         reconnect,
-        retire
+        retire,
+        tracker: new RemoteLivenessTracker()
       })
     ).resolves.toBe(legacy)
 
@@ -359,6 +365,386 @@ describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
     })
     expect(retire).not.toHaveBeenCalled()
     expect(reconnect).not.toHaveBeenCalled()
+  })
+
+  it('keeps a healthy descriptor when one transient hang-up clears on the confirmation probe (#131765)', async () => {
+    const healthy = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const healthyPromise = Promise.resolve(healthy)
+    const retire = vi.fn()
+    const reconnect = vi.fn()
+    const log = vi.fn()
+
+    // The reporter's shape: the forward is bound and answering (a direct
+    // curl gets 200), but the pooled dispatch probe sees one socket hang up.
+    const hangUp = new Error('socket hang up') as Error & { code: string }
+    hangUp.code = 'ECONNRESET'
+
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValueOnce(hangUp)
+      .mockResolvedValueOnce({ ok: true })
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: healthyPromise,
+        currentConnectionPromise: () => healthyPromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
+      })
+    ).resolves.toBe(healthy)
+
+    expect(probe).toHaveBeenCalledTimes(2)
+    expect(retire).not.toHaveBeenCalled()
+    expect(reconnect).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('recovered after one retry')
+    )
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('errno ECONNRESET'))
+  })
+
+  it('retires the descriptor only when the confirmation probe fails too', async () => {
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    let currentPromise: Promise<typeof stale> | null = stalePromise
+    const log = vi.fn()
+
+    const retire = vi.fn(async () => {
+      currentPromise = null
+    })
+
+    const reconnect = vi.fn(async () => {
+      currentPromise = Promise.resolve(replacement)
+
+      return replacement
+    })
+
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:49525'))
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => currentPromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker(1)
+      })
+    ).resolves.toBe(replacement)
+
+    // One failure re-verified before death, and the streak limit reached on
+    // that second round: two probe rounds, then retire.
+    expect(probe.mock.calls.filter(([connection]) => connection === stale)).toHaveLength(2)
+    expect(retire).toHaveBeenCalledOnce()
+    expect(reconnect).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('failed twice'))
+  })
+
+  it('does not touch a descriptor replaced during the retry backoff', async () => {
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    let currentPromise: Promise<typeof stale> | null = stalePromise
+    const retire = vi.fn()
+    const log = vi.fn()
+
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockImplementationOnce(() => {
+        currentPromise = Promise.resolve(replacement)
+
+        return Promise.reject(new Error('socket hang up'))
+      })
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => currentPromise,
+        probe,
+        reconnect: () => Promise.resolve(replacement),
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
+      })
+    ).resolves.toBe(replacement)
+
+    expect(probe).toHaveBeenCalledTimes(1)
+    expect(retire).not.toHaveBeenCalled()
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('bypasses a busy descriptor below the streak limit, retiring only on the third round (#131765)', async () => {
+    // The observed shape: a live bridge starves past the probe budget twice, and the old gate
+    // retired it - tearing down the forward and killing the running turn. Retirement is now
+    // streak-gated on the same tracker the background revalidation uses.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const retire = vi.fn()
+    const reconnect = vi.fn(async () => stale)
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+    const run = () =>
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).not.toHaveBeenCalled()
+    // A bypass hands dispatch the cached descriptor; it never re-dials (a
+    // re-entrant dial would await the run calling it - see the self-await test).
+    expect(reconnect).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+    // Attribution: the line must name which connection stalled, so the next incident does not
+    // need ssh-argv forensics to identify the dead forward.
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('for http://127.0.0.1:49525'))
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (2/3)'))
+
+    await expect(run()).resolves.toBe(stale)
+    expect(retire).toHaveBeenCalledOnce()
+    expect(reconnect).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('retiring descriptor'))
+  })
+
+  it('retires a stalled descriptor whose remote dashboard has exited, instead of bypassing', async () => {
+    // A bound local forward keeps a dead far end looking like a stall, so the
+    // streak policy would read (1/3) and keep the descriptor - the route then
+    // stays on a dead backend until relaunch. A proven-gone pid is not a busy
+    // bridge.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    let currentPromise: Promise<typeof stale> | null = stalePromise
+    const log = vi.fn()
+    const retire = vi.fn(async () => {
+      currentPromise = null
+    })
+
+    const reconnect = vi.fn(async () => {
+      currentPromise = Promise.resolve(replacement)
+
+      return replacement
+    })
+
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+    const remoteDashboardAlive = vi.fn(async () => false)
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => currentPromise,
+        probe,
+        reconnect,
+        retire,
+        log,
+        remoteDashboardAlive,
+        retryDelayMs: 0,
+        tracker: new RemoteLivenessTracker()
+      })
+    ).resolves.toBe(replacement)
+
+    expect(remoteDashboardAlive).toHaveBeenCalledOnce()
+    expect(retire).toHaveBeenCalledOnce()
+    expect(reconnect).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('retiring descriptor (remote dashboard is gone)')
+    )
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry'))
+  })
+
+  it('keeps a stalled descriptor when the far end is alive or its proof cannot settle', async () => {
+    const shape = (
+      remoteDashboardAlive: () => Promise<boolean>
+    ) => {
+      const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+      const stalePromise = Promise.resolve(stale)
+      const log = vi.fn()
+      const retire = vi.fn()
+      const probe = vi
+        .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+        .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+      return {
+        log,
+        options: {
+          connectionPromise: stalePromise,
+          currentConnectionPromise: () => stalePromise,
+          probe,
+          reconnect: vi.fn(),
+          retire,
+          log,
+          remoteDashboardAlive,
+          retryDelayMs: 0,
+          tracker: new RemoteLivenessTracker()
+        },
+        retire,
+        stale
+      }
+    }
+
+    const alive = shape(async () => true)
+
+    await expect(ensureHealthyPooledRemoteBackendForDispatch(alive.options)).resolves.toBe(alive.stale)
+    expect(alive.retire).not.toHaveBeenCalled()
+    expect(alive.log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+
+    // An unsettled ownership probe must never be read as "gone".
+    const unsettled = shape(async () => {
+      throw new Error('Could not verify the SSH backend process.')
+    })
+
+    await expect(ensureHealthyPooledRemoteBackendForDispatch(unsettled.options)).resolves.toBe(
+      unsettled.stale
+    )
+    expect(unsettled.retire).not.toHaveBeenCalled()
+    expect(unsettled.log).toHaveBeenCalledWith(
+      expect.stringContaining('keeping descriptor for retry (1/3)')
+    )
+  })
+
+  it('never re-enters the dial from the bypass: a re-entrant dial self-awaits the in-flight run', async () => {
+    // The caller wraps this gate in RemoteRevalidationCoordinator keyed by the
+    // cached promise, so a keep path that called reconnect() -> the same ensure
+    // path would be handed its own in-flight run and await itself forever -
+    // the app stays offline with no failed dispatch to advance the streak.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const coordinator = new RemoteRevalidationCoordinator()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(new Error('Timed out connecting to Hermes backend after 12000ms'))
+
+    const dial = (): Promise<typeof stale> =>
+      coordinator.run(stalePromise, () =>
+        ensureHealthyPooledRemoteBackendForDispatch({
+          connectionPromise: stalePromise,
+          currentConnectionPromise: () => stalePromise,
+          probe,
+          reconnect: () => dial(),
+          retire: vi.fn(),
+          retryDelayMs: 0,
+          tracker: new RemoteLivenessTracker()
+        })
+      )
+
+    await expect(dial()).resolves.toBe(stale)
+  })
+
+  it('clears the dispatch streak after a successful probe', async () => {
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce({ ok: true })
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockRejectedValueOnce(new Error('socket hang up'))
+
+    const run = () =>
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect: vi.fn(async () => stale),
+        retire: vi.fn(),
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+
+    // Round 1: one blip, then the confirmation succeeds - the streak clears.
+    await run()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('recovered after one retry'))
+
+    // Round 2: a double failure must read 1/3, not 2/3.
+    await run()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry (1/3)'))
+  })
+
+  it('retires immediately when the transport is gone, instead of bypassing (#131765)', async () => {
+    // A reset far end is not a live-but-busy bridge. Deferring this retire left the app offline
+    // with its route pointed at a dead backend, because no dispatch ever advanced the streak.
+    const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
+    const stalePromise = Promise.resolve(stale)
+    const tracker = new RemoteLivenessTracker()
+    const log = vi.fn()
+    const retire = vi.fn()
+    const probe = vi
+      .fn<EnsureHealthyPooledRemoteBackendForDispatchOptions<unknown>['probe']>()
+      .mockRejectedValue(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+
+    await expect(
+      ensureHealthyPooledRemoteBackendForDispatch({
+        connectionPromise: stalePromise,
+        currentConnectionPromise: () => stalePromise,
+        probe,
+        reconnect: vi.fn(async () => stale),
+        retire,
+        log,
+        retryDelayMs: 0,
+        tracker
+      })
+    ).resolves.toBe(stale)
+
+    expect(retire).toHaveBeenCalledOnce()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('retiring descriptor'))
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining('keeping descriptor for retry'))
+  })
+
+  it('keeps the retry bounded relative to the power-resume holdoff', () => {
+    expect(POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS).toBeGreaterThan(0)
+    expect(POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS).toBeLessThan(5_000)
+    // The confirmation round is bounded by the probe timeout, and the pair
+    // (probe + backoff) must stay under the resume holdoff so a wake sweep can
+    // never queue behind a dispatch gate. The probe timeout already exceeds
+    // the holdoff, so the retry's own budget is what has to fit here.
+    expect(
+      POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS + POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS
+    ).toBeLessThan(POWER_RESUME_REVALIDATION_HOLDOFF_MS)
+  })
+
+  it('describes a probe failure with its errno and cause, not only the message', () => {
+    const cause = new Error('read ECONNRESET')
+    const error = new Error('socket hang up') as Error & { cause: Error; code: string }
+    error.cause = cause
+    error.code = 'ECONNRESET'
+
+    const described = probeFailureDescription(error)
+
+    expect(described).toContain('socket hang up')
+    expect(described).toContain('errno ECONNRESET')
+    expect(described).toContain('cause: read ECONNRESET')
+
+    // Deduplicated across the pair and tolerant of non-Error values.
+    expect(probeFailureDescription(error, error)).toBe('socket hang up; cause: read ECONNRESET; errno ECONNRESET')
+    expect(probeFailureDescription('raw failure')).toBe('raw failure')
+    expect(probeFailureDescription()).toBe('')
   })
 })
 

@@ -119,7 +119,7 @@ A worker that is blocked on `t_parent` and creates a support card for the missin
 
 **Use Kanban when** work crosses agent boundaries, needs to survive restarts, might need human input, might be picked up by a different role, or needs to be discoverable after the fact.
 
-They coexist: a kanban worker may call `delegate_task` internally during its run.
+They coexist, but not inside one run: a kanban task executes in an isolated managed worker under the profile's gateway, and that worker is not offered `delegate_task` (a delegated child would need its own owner-registered execution, which the single-turn worker cannot reserve). Split work that needs fan-out into child cards instead (`kanban_create` with `parents`).
 
 ## Core concepts
 
@@ -829,6 +829,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 |---|---|---|
 | `auto_decompose` | `true` | Dispatcher auto-runs the built-in decomposer for Triage tasks every tick. It does not gate profile-driven `kanban_create` calls or creator wake turns. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
+| `auto_verify_phantom_refs` | `false` | Opt-in. When a completion summary cites a task id that exists on **no** board, spawn a `verify:` child task on the completing profile so the claim is independently re-checked. Off by default: the reference is still flagged (the `suspected_hallucinated_references` event and the `prose_phantom_refs` diagnostic) and the suppressed spawn is logged at debug level, but no card is created that nobody requested — a single misread citation on a shared board would otherwise cascade into one child card per unresolved id. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = the root task keeps its own assignee, else the active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to the root task's assignee, else the active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
@@ -1038,7 +1039,7 @@ The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 err
 
 To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
 
-`recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+`recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window. `active_pr` honours the same operator re-queues — a board/dashboard status move, `hermes kanban promote` (`promoted_manual`) or `hermes kanban unblock` — which is the escape hatch for a card whose comment merely *links* an upstream PR instead of having opened one. An automatic re-queue does **not** lift it: `promoted` (a dependency release or failure retry) and `reclaimed` (crash / stale-claim recovery) leave the guard armed, because re-spawning there risks the duplicate PR it exists to prevent.
 
 ### Drag-to-delete and bulk delete (dashboard)
 
@@ -1340,6 +1341,26 @@ in the board DB. No relays, credential sharing, or extra dispatchers are
 needed — each profile gateway simply delivers through its own adapters.
 
 ## Runs — one row per attempt
+
+Canonical workers execute through the assigned profile's gateway owner. The local
+transport carries the dispatcher's exact board database path, including custom
+paths and shared boards assigned to another profile; it does not create a separate
+transcript writer. The owner validates the task/run/claim and freezes its policy.
+
+If the owner or managed worker disappears with an **unknown** admission while the
+interpreter the owner bound to the attempt (its `worker_bound` event) may still be
+running, the card keeps its run and claim: expired claims, stale heartbeats and
+runtime limits do not reexecute that ambiguous attempt, and an unavailable owner
+ledger also pauses reclaim. Once that bound interpreter is itself dead, nothing can
+still be running the attempt, so the crash sweep reclaims it like any dead worker:
+the run closes as crashed and the card returns to `ready` (or `review`) under the
+normal crash budget, which can re-execute effects the lost attempt already had.
+Resolve an unknown admission explicitly using `prompt.resolve_unknown` with its
+admission ID and execution generation. This acknowledges uncertainty; it does
+**not** authorize another Kanban attempt. Inspect the effects, then explicitly
+complete or block the card; unblock a blocked card only when a new attempt is
+intended. Confirmed timeouts and provider rate-limit results retain their ordinary
+retry/failure-accounting behavior.
 
 A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.
 

@@ -373,6 +373,20 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
                             "status": result.get("status") or "queued", "delivery_id": result.get("delivery_id")},
                      [f"Peer '{peer_name}' has its Bot Chat open, so the message went into that chat (session "
                       f"{queued_in}) and is answered there. The reply cannot come back on this call. Do NOT resend."])
+    if result.get("failed"):
+        # The peer served the request but its turn failed: the message WAS delivered, no reply was
+        # produced, and the failure text is all the body carries. That is exactly the "peer error"
+        # the exit contract names in the parser epilog, so it must not exit 0 as though the text
+        # were a reply — a caller checking $? cannot read the text to tell them apart.
+        detail = str(result.get("error") or result.get("failure_reason") or "").strip()
+        if getattr(args, "json", False):
+            print(json.dumps({"peer": peer_name, "profile": profile,
+                              "session_id": result.get("session_id") or session_id,
+                              "failed": True, "error": detail,
+                              "failure_reason": str(result.get("failure_reason") or "")}))
+        print(f"Peer '{peer_name}' accepted the message but its agent failed to answer"
+              f"{': ' + detail if detail else '.'}", file=sys.stderr)
+        return 1
     msg = result.get("message")
     reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
     # A successful bare silence marker is a delivery decision, not a message:

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hermes_cli.kanban_workflow import ARCHIVED, DEFAULT_WORKFLOW
+
 _DESC_TASK_ID_DEFAULT = (
     "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env — the "
     "task the dispatcher spawned you to work on. That default only exists for "
@@ -76,10 +78,7 @@ KANBAN_LIST_SCHEMA = _schema(
         "assignee": _prop("string", "Optional assignee/profile filter."),
         "status": {
             "type": "string",
-            "enum": [
-                "triage", "todo", "ready", "running",
-                "blocked", "done", "archived",
-            ],
+            "enum": [*DEFAULT_WORKFLOW.keys(), ARCHIVED],
             "description": "Optional task status filter.",
         },
         "tenant": _prop("string", "Optional tenant/project namespace filter."),
@@ -143,6 +142,13 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "did not create any cards."
             ),
         },
+        "force_reason": _prop("string", (
+                "Override the pre-complete gate (approval_malformed / unresolved_crosslink / "
+                "loop_not_closed) for THIS completion. The reason is recorded in "
+                "~/.hermes/logs/pre-complete-gate.log together with the checks it overrode — "
+                "an override is never silent. Omit it unless the gate is wrong for a reason "
+                "you can state."
+        )),
         "artifacts": {
             "type": "array",
             "items": {"type": "string"},
@@ -512,6 +518,22 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "continuation turns the worker may take before the task "
                 "is blocked for review. Ignored unless goal_mode is "
                 "true. Defaults to the goal-engine default (20)."
+        )),
+        "quota_override": _prop("boolean", (
+                "Priority card: still runs while the provider-quota gate is "
+                "closed (the primary model's subscription window is "
+                "exhausted). The worker is routed to the configured fallback "
+                "chain for that spawn only, so the card returns to the "
+                "primary automatically when the window reopens. Defaults to "
+                "false: the card waits with the rest of the fleet."
+        )),
+        "run_now": _prop("boolean", (
+                "Run immediately even inside the provider's peak-price window, "
+                "instead of waiting for the off-peak discount (some providers "
+                "price by time of day). Costs money, saves time. Independent of "
+                "quota_override: that one beats a quota wall, this one beats the "
+                "clock. Defaults to false: the card waits for the discounted "
+                "window."
         )),
         "model": _prop("string", (
                 "Pin the dispatched worker to this model instead of "

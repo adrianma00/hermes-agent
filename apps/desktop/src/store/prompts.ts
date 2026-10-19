@@ -82,7 +82,7 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
 // card answers that request when it is still open and falls back to the
 // `approval.respond` RPC when the prompt was restored from `approval.pending`.
 export interface ApprovalRequest extends KeyedPrompt {
-  // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
+  // false when the backend won't honor a permanent allow → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
@@ -90,6 +90,10 @@ export interface ApprovalRequest extends KeyedPrompt {
   requestId?: string
   serverRequestId?: string
   smartDenied?: boolean
+  // Set when the guardian LLM could not run and the gate fell back to asking a human, so the
+  // card can say WHY it is asking. Announcement only: it never changes the choice set, and the
+  // fall-back to a human prompt is deliberate fail-safe behaviour.
+  smartUnavailable?: string
 }
 
 interface ApprovalGateway {
@@ -103,6 +107,7 @@ interface PendingApprovalPayload {
   description?: unknown
   request_id?: unknown
   smart_denied?: boolean
+  smart_unavailable?: unknown
 }
 
 export interface SudoRequest extends KeyedPrompt {
@@ -331,7 +336,9 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
         description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
         requestId: pending.request_id,
         sessionId,
-        smartDenied: pending.smart_denied === true
+        smartDenied: pending.smart_denied === true,
+        smartUnavailable:
+          typeof pending.smart_unavailable === 'string' ? pending.smart_unavailable : undefined
       })
     })
   )
@@ -472,10 +479,10 @@ export const $activeSessionAwaitingInput = computed(
 )
 
 /** True when `sessionId` is parked on a blocking prompt that typing cannot
- *  answer (approval / sudo / secret). Clarify is deliberately excluded: typing
- *  a real message IS an answer to a clarify ("none of these" — the composer
- *  skips it and routes the words), but no message text can approve a command
- *  or supply a password. Imperative read — the composer checks this on Enter,
+ *  answer (approval / sudo / secret). Clarify is deliberately excluded: typed
+ *  text answers a clarify's next question (the composer locks it through
+ *  `answerParkedCard`), but no message text can approve a command or supply a
+ *  password. Imperative read — the composer checks this on Enter,
  *  not on every render. */
 export const hasBlockingPromptRequest = (sessionId: string | null | undefined): boolean => {
   const key = keyFor(sessionId)

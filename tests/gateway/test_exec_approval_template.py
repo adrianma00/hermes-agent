@@ -27,7 +27,7 @@ class _Plain(BasePlatformAdapter):
     async def send(self, *a: Any, **k: Any) -> SendResult:
         return SendResult(success=True)
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {}
 
 
@@ -88,3 +88,32 @@ def test_runner_only_offers_buttons_to_adapters_that_render_them():
 
     assert _renders_exec_approval_buttons(_DuckTyped) is True
     assert _renders_exec_approval_buttons(object) is False
+
+
+@pytest.mark.asyncio
+async def test_button_card_announces_a_guardian_that_could_not_run():
+    """A prompt whose guardian never ran must say so: without the notice it reads exactly like a
+    model having judged the command."""
+    adapter = _Buttons()
+    reason = "RuntimeError: Synchronous Relay LLM execution cannot run on an event-loop thread"
+
+    await adapter.send_exec_approval(
+        "chat", "rm -rf /tmp/x", "sess", description="cleanup", smart_unavailable=reason)
+
+    (prompt,) = adapter.prompts
+    assert prompt.smart_unavailable == reason
+    assert "why you're being asked" in prompt.text
+    assert reason in prompt.text
+    # Announcement only: the choice set is untouched by a degraded guardian.
+    assert prompt.choices == ["once", "session", "always", "deny"]
+
+
+@pytest.mark.asyncio
+async def test_button_card_stays_silent_when_the_guardian_ran():
+    adapter = _Buttons()
+
+    await adapter.send_exec_approval("chat", "rm -rf /tmp/x", "sess", description="cleanup")
+
+    (prompt,) = adapter.prompts
+    assert prompt.smart_unavailable is None
+    assert "why you're being asked" not in prompt.text

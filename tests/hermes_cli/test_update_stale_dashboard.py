@@ -110,13 +110,24 @@ def test_update_cleanup_spares_backend_owned_by_valid_ssh_lock(tmp_path, monkeyp
         assert pid in exclude_pids
         return []
 
-    with patch(
+    # ``restart_managed`` first probes for a managed hermes-dashboard unit; unstubbed, that
+    # probe found the developer's real unit and restarted it.
+    calls: list[list[str]] = []
+
+    def fake_run(args, *a, **kw):
+        calls.append(list(args))
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run), patch(
         "hermes_cli.main_dashboard._find_stale_dashboard_pids",
         side_effect=assert_owned_pid_is_excluded,
     ):
         result = _kill_stale_dashboard_processes(restart_managed=True)
 
     assert result == {"matched": [], "killed": [], "failed": []}
+    assert all(call[:1] == ["systemctl"] and "list-unit-files" in call for call in calls)
+    # Windows has no systemd: the managed-unit probe returns before running anything.
+    assert bool(calls) == (sys.platform != "win32")
 
 
 def test_explicit_stop_does_not_spare_backend_owned_by_valid_ssh_lock(
@@ -941,3 +952,165 @@ class TestLaunchdSupervisedBackends:
         assert owning(9999, serve_argv[:-1] + ["8643"], jobs) is None
         assert owning(9999, None, jobs) is None
         assert owning(4242, None, []) is None
+
+
+# ── Windows: the win32 respawn gap (#68934) ──────────────────────────────────────────────────
+# Windows has neither systemd nor launchd, so a killed dashboard used to fall through every
+# restart branch and be booked ``unrecovered`` → ``failed_respawn_pids`` → ``restart.incomplete``
+# → a ``gateway_restart`` follow-up no launch method on Windows could ever discharge. These tests
+# pin the two halves of the fix: a restart that was never ATTEMPTED is a manual relaunch, and the
+# argv IS readable on Windows (psutil), so the normal case is attempted like any other platform.
+#
+# ``sys`` is stubbed rather than the global ``sys.platform`` so the rest of the test process (and
+# pytest's own platform checks) keep seeing the host platform.
+
+import types
+
+_WIN32_SYS = types.SimpleNamespace(platform="win32")
+_WIN32_ARGV = [
+    r"C:\Users\ama\AppData\Local\Programs\Python\Python311\python.exe",
+    r"C:\Users\ama\.hermes\bin\hermes",
+    "dashboard", "--port", "9119",
+]
+
+
+def test_win32_killed_dashboard_is_booked_manual_relaunch_not_failed(capsys):
+    """A PID Windows cannot restart must not come back as ``unrecovered`` (which sets
+    ``restart.incomplete`` and arms an unmeetable obligation)."""
+    with patch.object(dashboard_procs, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
+         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
+         patch.object(dashboard_procs, "_kill_pids_windows",
+                      side_effect=lambda pids, killed, failed: killed.extend(pids)):
+        result = _kill_stale_dashboard_processes(restart_managed=True)
+
+    assert result["killed"] == [4242]
+    assert result["unrecovered"] == []
+    assert result["manual_relaunch"] == [4242]
+    assert "relaunch by hand" in capsys.readouterr().out
+
+
+def test_win32_manual_relaunch_reconciles_as_manual_and_never_escalates(capsys):
+    """The reconciled row reads ``manual`` — surfaced to the operator, never a tripwire value."""
+    from hermes_cli.update_inventory import (
+        RuntimeRecord, UpdatePlan, match_runtime_outcomes, report_unaccounted_runtimes)
+
+    plan = UpdatePlan()
+    plan.runtimes = [RuntimeRecord(kind="dashboard", profile="default", pid=4242,
+                                   supervisor="manual-serve", restart_via="respawn-argv")]
+    outcomes = match_runtime_outcomes(
+        plan, restarted_services=[], relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[], stale_serve_pids=set(), manual_relaunch_pids={4242},
+    )
+
+    assert outcomes[0]["outcome"] == "manual"
+    assert report_unaccounted_runtimes(outcomes) is False
+    assert "relaunch by hand" in capsys.readouterr().out
+
+
+def test_dashboard_cleanup_records_manual_relaunch_as_skip(capsys):
+    """The receipt records a skip with the PIDs, and the update does not claim a failed respawn."""
+    stub = MagicMock()
+    stub._kill_stale_dashboard_processes.return_value = {
+        "matched": [4242], "killed": [4242], "failed": [], "unrecovered": [],
+        "manual_relaunch": [4242]}
+    skips: list[tuple[str, str]] = []
+    out: list[int] = []
+    with patch("hermes_cli.update_cmd._m", return_value=stub), \
+         patch("hermes_cli.update_cmd._record_update_skip",
+               side_effect=lambda step, reason: skips.append((step, reason))):
+        unrecovered = update_cmd_maint._refresh_dashboard_after_update(manual_relaunch_out=out)
+
+    assert unrecovered == set()
+    assert out == [4242]
+    assert [s[0] for s in skips] == ["dashboard_cleanup"]
+    assert "4242" in skips[0][1]
+    assert "could not be auto-restarted" not in capsys.readouterr().out
+def test_dashboard_cmdline_for_pid_reads_psutil_on_windows():
+    """Windows has no /proc and no ps; psutil hands over the same argv /proc records."""
+    import psutil
+
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(psutil, "Process") as proc:
+        proc.return_value.cmdline.return_value = _WIN32_ARGV
+        assert main_dashboard._dashboard_cmdline_for_pid(4242) == _WIN32_ARGV
+
+        # An elevated / other-user process must fail closed, never guess an argv.
+        proc.side_effect = psutil.AccessDenied(4242)
+        assert main_dashboard._dashboard_cmdline_for_pid(4242) is None
+
+
+def test_win32_snapshot_captures_argv_and_respawns(capsys):
+    """The normal Windows case is auto-restarted like POSIX: snapshot, kill, replay argv."""
+    with patch.object(dashboard_procs, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
+         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
+         patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=_WIN32_ARGV), \
+         patch.object(dashboard_procs, "_hermes_home_for_pid", return_value=r"C:\Users\ama\.hermes"), \
+         patch.object(dashboard_procs, "_filter_dashboard_respawn_candidates",
+                      side_effect=lambda candidates: [argv for _pid, argv, _home in candidates]), \
+         patch.object(dashboard_procs, "_kill_pids_windows",
+                      side_effect=lambda pids, killed, failed: killed.extend(pids)), \
+         patch.object(dashboard_procs, "_wait_gone", return_value=[]) as wait, \
+         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn:
+        result = _kill_stale_dashboard_processes(restart_managed=True)
+
+    wait.assert_called_once()               # taskkill returns before the socket is released
+    respawn.assert_called_once_with([_WIN32_ARGV])
+    assert result["unrecovered"] == []
+    assert result["manual_relaunch"] == []
+
+
+class _AliveProc:
+    """Enough of ``subprocess.Popen`` for the respawn liveness check."""
+
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+def test_win32_respawn_uses_detach_flags(tmp_path, monkeypatch):
+    """``start_new_session`` is POSIX-only; Windows detaches with creation flags."""
+    spawned: dict = {}
+
+    def fake_popen(command, **kwargs):
+        spawned["command"] = command
+        spawned["kwargs"] = kwargs
+        return _AliveProc()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard.subprocess, "Popen", side_effect=fake_popen), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags", return_value=0x8000000), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags_without_breakaway",
+               return_value=0x4000000), \
+         patch.object(main_dashboard.time, "sleep"):
+        failed = main_dashboard._respawn_dashboard_processes([list(_WIN32_ARGV)])
+
+    assert failed == []
+    assert spawned["kwargs"]["creationflags"] == 0x8000000
+    assert spawned["kwargs"]["start_new_session"] is False
+
+
+def test_win32_respawn_falls_back_without_breakaway(tmp_path, monkeypatch):
+    """A job object that forbids CREATE_BREAKAWAY_FROM_JOB must not lose the respawn."""
+    flags: list[int] = []
+
+    def fake_popen(command, **kwargs):
+        flags.append(kwargs["creationflags"])
+        if len(flags) == 1:
+            raise PermissionError("job object forbids breakaway")
+        return _AliveProc()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard.subprocess, "Popen", side_effect=fake_popen), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags", return_value=0x8000000), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags_without_breakaway",
+               return_value=0x4000000), \
+         patch.object(main_dashboard.time, "sleep"):
+        failed = main_dashboard._respawn_dashboard_processes([list(_WIN32_ARGV)])
+
+    assert flags == [0x8000000, 0x4000000]
+    assert failed == []

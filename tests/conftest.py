@@ -39,7 +39,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # get_version_info() shells out to git 7 times (~0.55 s per process in a large local
 # clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow
 # CI checkout resolves to; tests of version resolution call _reset_version_info_cache().
-from hermes_cli import version_info as _version_info  # noqa: E402
+from hermes_cli import version_info as _version_info
 
 _version_info._cached_version_info = _version_info.VersionInfo(
     "unknown", "git.0000000", None, "0" * 40, "main", "git")
@@ -245,11 +245,12 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
-from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
+from tests._fixtures.live_system_guard import (
     _GATEWAY_LOOKALIKE_MARK,
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
     _live_system_guard,
 )
+from tests._fixtures.model_peer import model_peer  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 
 
@@ -309,6 +310,17 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
         monkeypatch.setattr(_hc, "_PINNED_PROCESS_HERMES_HOME", None, raising=False)
     except Exception:
         pass
+    # The install probe looks past HERMES_HOME (other roots, gateway services, the launcher on
+    # PATH) and writes a marker at a fixed per-user path: confine it to this test's directory.
+    from hermes_cli import install_state
+
+    isolated_places = install_state.Places(markers=(tmp_path / "machine-marker",),
+                                           sources=(install_state._active_root,))
+    monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
+    install_state.probe.cache_clear()
+    from hermes_cli import onboarding_due
+
+    onboarding_due.reset_for_tests()
     # Per-TEST host-rendezvous dir (see the session-level block at the top): the
     # host gateway/serve record is shared per OS user by design, so without this
     # one test's published owner makes the next test's lifecycle code attach to it.
@@ -319,13 +331,17 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway-locks"))
-    # Relay 0.9 normally discovers the user's XDG plugins.toml. Select an empty
-    # per-test user file instead so tests cannot activate a developer's plugins,
+    # Relay normally discovers the user's XDG plugins.toml and merges the machine
+    # policy above it. Select a per-test user file with a deny-by-default dynamic
+    # plugin policy so ordinary tests do not activate ambient worker/native plugins,
     # without changing XDG_CONFIG_HOME for unrelated Hermes code under test.
     # Outside tmp_path: tests that list or git-status their tmp dir must not see it.
     relay_plugins = tmp_path_factory.getbasetemp() / "relay-plugins.toml"
     if not relay_plugins.exists():
-        relay_plugins.write_text("version = 1\n", encoding="utf-8")
+        relay_plugins.write_text(
+            "version = 1\n\n[plugins.policy.defaults]\nallowed = false\n",
+            encoding="utf-8",
+        )
     monkeypatch.setenv("HERMES_NEMO_RELAY_PLUGINS_TOML", str(relay_plugins))
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
@@ -381,10 +397,6 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
-    # Tirith auto-installs from GitHub when enabled and missing. Unit tests
-    # should never perform that implicit network/bootstrap path; Tirith-specific
-    # tests opt back in by patching the security config directly.
-    monkeypatch.setenv("TIRITH_ENABLED", "false")
     # On-demand extras (pm.sync_venv) install mid-test-run by design —
     # _allow_lazy_installs() fails open for users. Unit tests must never reach
     # pip/the network: with the SDK absent, any agent init whose tool checks
@@ -421,7 +433,7 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
-    return None
+    return
 
 
 @pytest.fixture(autouse=True)
@@ -451,7 +463,7 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
         from hermes_cli import kanban_db_dispatch as _kbd_mod
     except Exception:
         return
-    monkeypatch.setattr(_kbd_mod, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -568,12 +580,12 @@ def _neutralize_webbrowser(monkeypatch):
 def _neutralize_macos_keychain_creds(request, monkeypatch):
     """Default Anthropic credential resolution away from the real macOS Keychain."""
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
-        return None
+        return
 
     try:
         _mod = importlib.import_module("agent.anthropic_credentials")
     except Exception:
-        return None
+        return
     monkeypatch.setattr(
         _mod,
         "_read_claude_code_credentials_from_keychain",
@@ -588,7 +600,7 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
         lambda *_args, **_kwargs: None,
         raising=False,
     )
-    return None
+    return
 
 
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
@@ -600,6 +612,10 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 # allow-list because test-level fixtures legitimately move HERMES_HOME to
 # sibling directories — an allow-list captured at setup time would see the
 # stale autouse-set value and falsely reject hermetic tests (#69385 review).
+#
+# The guard is armed on every ``kanban_db_connect`` module OBJECT this process
+# has imported, not merely on the one findable via ``sys.modules`` — see
+# ``_KANBAN_CONNECT_MODULES`` for the purge that made that distinction matter.
 
 
 def _capture_real_kanban_root() -> Path:
@@ -632,6 +648,91 @@ def _capture_real_kanban_root() -> Path:
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
+# Every ``hermes_cli.kanban_db_connect`` module OBJECT this session has imported.
+#
+# Patching only the object in ``sys.modules`` is not enough. A suite that purges
+# ``hermes_cli*`` / ``hermes_state*`` / ``hermes_constants`` out of
+# ``sys.modules`` and re-imports them to reset a memo
+# (``test_kanban_assignee_namespaces.fleet``) REPLACES the module object that
+# every already-imported test file still holds a reference to. The patch then
+# sits on an object nobody calls any more, and the guard is silently inert for
+# every test running after that suite in the same session — an order-dependent
+# RED in ``test_kanban_write_guard.py`` (2 failed with the namespace suite
+# first, 25 passed reversed), i.e. root cause 2 of the 2026-09-30 leak where 37
+# fixture cards reached the live boards. Every generation ever seen is kept here
+# and re-armed on each test; ``pytest_collection_modifyitems`` seeds this with
+# the object in ``sys.modules`` once all test modules are imported; the fixture
+# below re-seeds it each test.
+_KANBAN_CONNECT_MODULES: "list[object]" = []
+
+
+def _remember_kanban_connect_module() -> None:
+    """Register the connector module currently in ``sys.modules``, if any.
+
+    A ``sys.modules`` probe, never an import: the guard must not drag the kanban
+    stack into a test process that never touched it.
+    """
+    module = sys.modules.get("hermes_cli.kanban_db_connect")
+    if module is not None and module not in _KANBAN_CONNECT_MODULES:
+        _KANBAN_CONNECT_MODULES.append(module)
+
+
+def _kanban_guard_targets() -> "list[tuple[object, object, object]]":
+    """``(connector_module, its_kanban_db_module, connect)`` for each armed target.
+
+    ``kanban_db`` is resolved from the connector itself
+    (``connect.__globals__["_kb"]`` is the late-bound origin module), not from
+    ``sys.modules``: a test that monkeypatches ``kanban_db.kanban_db_path`` on
+    the object IT imported must have that honoured even when the connector it
+    calls belongs to a different generation than the live ``sys.modules`` entry.
+    """
+    _remember_kanban_connect_module()
+    targets = []
+    for module in _KANBAN_CONNECT_MODULES:
+        connect = getattr(module, "connect", None)
+        if connect is None:
+            # Observed MID-IMPORT: a half-initialized module has no callers yet
+            # (the AttributeError flake this probe used to raise on); the next
+            # round patches the completed module.
+            continue
+        kb_module = (getattr(connect, "__globals__", None) or {}).get("_kb")
+        if kb_module is None or getattr(kb_module, "kanban_db_path", None) is None:
+            continue
+        targets.append((module, kb_module, connect))
+    return targets
+
+
+def _arm_kanban_write_guard(monkeypatch, connector, kb_module, orig_connect) -> None:
+    """Patch ``connect`` on ONE connector module object with the deny-list guard."""
+
+    def _guarded_connect(db_path=None, *args, **kwargs):
+        if db_path is not None:
+            resolved = Path(db_path).expanduser().resolve()
+        else:
+            resolved = (
+                kb_module.kanban_db_path(board=kwargs.get("board"))
+                .expanduser()
+                .resolve()
+            )
+        try:
+            resolved.relative_to(_REAL_KANBAN_ROOT)
+        except ValueError:
+            # Resolved path is NOT under the real root — safe to write.
+            return orig_connect(db_path, *args, **kwargs)
+        raise RuntimeError(
+            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
+            f"Hermetic isolation has been bypassed — refusing to write "
+            f"to the real ~/.hermes. See #69283."
+        )
+
+    # Identity marker: lets a regression test assert the guard is ARMED on a
+    # given module object WITHOUT opening a database (see
+    # tests/hermes_cli/test_kanban_write_guard_purge_survival.py).
+    setattr(_guarded_connect, "__kanban_write_guard__", True)
+    monkeypatch.setattr(connector, "connect", _guarded_connect)
+
+
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
@@ -641,50 +742,19 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     ``~/.hermes`` captured at import time. Hermetic tests that legitimately
     move HERMES_HOME to sibling tempdirs are unaffected.
 
-    Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
-    — a ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
+    Armed on every ``kanban_db_connect`` module object the session has imported
+    (``_KANBAN_CONNECT_MODULES``), so a suite that purges and re-imports the
+    module cannot leave a still-referenced generation unguarded.
+
+    Only patches modules that are *already imported* — a ``sys.modules`` probe,
+    not an import — so the guard never drags the kanban module into unrelated
+    test processes.
 
     Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
     after each test (no stacked wrappers or state leakage across tests).
     """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
-    if _kdb is None or _kdbc is None:
-        return
-
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
-    _orig_connect = getattr(_kdbc, "connect", None)
-    if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
-        return
-
-    def _guarded_connect(db_path=None, *args, **kwargs):
-        if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
-        else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
-
-    monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+    for connector, kb_module, orig_connect in _kanban_guard_targets():
+        _arm_kanban_write_guard(monkeypatch, connector, kb_module, orig_connect)
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────
@@ -1060,6 +1130,59 @@ def _remove_relocated_basetemp(config) -> None:
         shutil.rmtree(safe, ignore_errors=True)
 
 
+def _processes_with_hermes_home_under(roots) -> list[int]:
+    """PIDs (never this process) whose environment names a ``HERMES_HOME`` inside one of *roots*.
+
+    Linux only (``/proc/<pid>/environ``; unreadable entries are another user's and skipped).
+    Elsewhere the scan is empty: a test-spawned daemon there is the per-test guard's problem.
+    """
+    if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
+        return []
+    resolved = [Path(r).resolve() for r in roots if r]
+    found = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/environ", "rb") as handle:
+                environ = handle.read().split(b"\0")
+        except OSError:
+            continue
+        home = next((item[12:] for item in environ if item.startswith(b"HERMES_HOME=")), None)
+        if not home:
+            continue
+        try:
+            path = Path(os.fsdecode(home)).resolve()
+        except (OSError, ValueError):
+            continue
+        if any(path == root or path.is_relative_to(root) for root in resolved):
+            found.append(int(entry.name))
+    return found
+
+
+def _reap_session_hermes_processes(config) -> list[int]:
+    """SIGTERM every process still running against a Hermes home this session created.
+
+    Tests that run a real ``hermes chat -q`` child get a grandchild ``gateway run`` (detached, own
+    session) that no per-test subprocess patch can see, and pytest's tmp cleanup removes only
+    directories: each one used to outlive the run at ~250 MB. The session basetemp and the session
+    sandbox home bound exactly what this run created, so nothing else is ever signalled.
+    """
+    import signal
+
+    factory = getattr(config, "_tmp_path_factory", None)
+    # The basetemp pytest already created (never create one at teardown just to scan it).
+    roots = [getattr(config, "_hermes_relocated_basetemp", None), os.environ.get("HERMES_TEST_SANDBOX_HOME"),
+             getattr(factory, "_basetemp", None)]
+    pids = _processes_with_hermes_home_under(roots)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return pids
+
+
 def _pinned_mcp_sdk_version() -> str:
     """The ``mcp==X`` pin carried by the ``[mcp]`` extra in pyproject.toml."""
     import tomllib
@@ -1094,12 +1217,13 @@ def require_mcp_2_sdk():
         pytest.skip(f"requires mcp=={pinned} (found {found}); install the [mcp] extra")
 
 
-def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+def pytest_unconfigure(config):
+    _reap_session_hermes_processes(config)
     _remove_relocated_basetemp(config)
 
 
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
-def pytest_configure(config):  # noqa: D401 — pytest hook
+def pytest_configure(config):
     """Register markers used by hermetic conftest."""
     _relocate_basetemp_outside_operator_home(config)
     config.addinivalue_line(
@@ -1229,7 +1353,7 @@ def pytest_runtest_setup(item):
             )
 
 
-def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
+def pytest_collection_modifyitems(config, items):
     """Apply host-OS gating, then skip ``requires_wal`` where WAL is unusable.
 
     OS gating: a test marked ``platforms(...)`` runs only on hosts its
@@ -1241,6 +1365,13 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     skip is diagnosable rather than mysterious.
     """
     _reject_contradictory_platform_marks(items)
+
+    # Seed the kanban write guard's module-object registry: collection has now
+    # imported every test module, so the connector in ``sys.modules`` is the
+    # object their import-time references point at. A later ``sys.modules``
+    # purge replaces that object without invalidating those references (see
+    # ``_KANBAN_CONNECT_MODULES``), and the guard must still cover it.
+    _remember_kanban_connect_module()
 
     # platforms() gating: skip items whose specs exclude this host. The skip
     # markers (not -m expressions) are the authoritative host filter on
@@ -1409,11 +1540,29 @@ _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
 # Captured before any test can patch sys.platform, HOME or XDG_*: a test that runs the real
 # GUI uninstall or update swap would otherwise delete the developer's own Hermes app. Only the
 # ones present (none on CI runners, so the guard costs nothing there), each literal and resolved.
-from hermes_cli.gui_uninstall import packaged_gui_app_paths  # noqa: E402
+from hermes_cli.gui_uninstall import packaged_gui_app_paths
 
 _REAL_INSTALLED_GUI_APPS = sorted({
     os.path.normcase(form) for app in packaged_gui_app_paths() if os.path.lexists(app)
     for form in (os.path.abspath(app), os.path.realpath(app))})
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_user_path_writes(monkeypatch):
+    """Fail a test that would add an entry to the real Windows User PATH.
+
+    The registry has no temporary-home equivalent: a test home that reached
+    these writers stayed on the developer's PATH after the run. Tests of the
+    writers' callers inject fakes (``write_user_path=``) or stub them.
+    """
+    if sys.platform != "win32":
+        return
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("TEST BUG: write to the real Windows User PATH (HKCU\\Environment)")
+
+    monkeypatch.setattr("hermes_cli._launchers._register_windows_user_path", refuse)
+    monkeypatch.setattr("hermes_cli._install_repair._write_user_path_raw", refuse)
 
 
 @pytest.fixture(autouse=True)

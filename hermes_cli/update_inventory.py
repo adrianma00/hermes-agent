@@ -48,7 +48,7 @@ class UpdatePlan:
         return asdict(self)  # recursive: RuntimeRecord entries become dicts
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "UpdatePlan":
+    def from_dict(cls, data: dict[str, Any]) -> UpdatePlan:
         """Inverse of :meth:`to_dict` (the plan crosses the post-swap hand-off as JSON)."""
         fields_ = {f.name for f in dataclass_fields(cls)}
         plan = cls(**{k: v for k, v in data.items() if k in fields_ and k != "runtimes"})
@@ -202,8 +202,11 @@ def _collect_gateway_runtimes(plan: UpdatePlan, profile_homes: list, seen: set[i
                 if pid in seen:
                     continue  # one multiplex gateway answers identify for several homes — one record per process
                 seen.add(pid)
-                declared = record.get("supervisor")
-                sup = str(declared) if declared else supervisor(pid)
+                from gateway.control_socket import launch_supervisor
+
+                # The protocol's "none" (manual or desktop) is no answer: classify it outside-in.
+                declared = launch_supervisor(record)
+                sup = declared if declared else supervisor(pid)
             else:
                 # Verified identity, not bare PID existence: a ``stopped`` record whose PID was recycled
                 # by an unrelated process fabricated a phantom gateway the restart phase could never
@@ -237,7 +240,7 @@ def _loaded_backend_launchd_jobs() -> list:
     return []
 
 
-def _launchd_owner_for_ledger_entry(entry: dict, pid: int, jobs: list) -> "tuple[str, str, int | None] | None":
+def _launchd_owner_for_ledger_entry(entry: dict, pid: int, jobs: list) -> tuple[str, str, int | None] | None:
     """``(domain, label, live_pid)`` of the loaded launchd job owning this ledger row, if any.
 
     A KeepAlive LaunchAgent backend's recorded spawner (the bootstrap shell) is long dead, so the
@@ -385,11 +388,12 @@ def _gateway_named_in(r: RuntimeRecord, names: set) -> bool:
 
 
 def match_runtime_outcomes(
-    plan: "UpdatePlan", *, restarted_services: list, relaunched_profiles: list,
+    plan: UpdatePlan, *, restarted_services: list, relaunched_profiles: list,
     externally_supervised_profiles: list, killed_pids: set, failed_units: list,
-    stale_serve_pids: "set | None" = None, failed_respawn_pids: "set | None" = None,
-    external_gateway_pids: "set | None" = None,
-    live_gateway_pids: "dict[str, set[int]] | None" = None,
+    stale_serve_pids: set | None = None, failed_respawn_pids: set | None = None,
+    manual_relaunch_pids: set | None = None,
+    external_gateway_pids: set | None = None,
+    live_gateway_pids: dict[str, set[int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Reconcile the plan's runtimes against what the restart phase DID.
 
@@ -406,7 +410,10 @@ def match_runtime_outcomes(
     probe result it remains ``unaccounted``, rather than claiming the app owns an unknown
     incarnation. ``failed_respawn_pids`` (serves the dashboard cleanup stopped and could not bring
     back) read ``failed`` before the probe, whose "gone" is exactly what a failed respawn looks like
-    (#109290). The probe itself fails closed (unreadable ledger -> every planned serve is listed as
+    (#109290). ``manual_relaunch_pids`` (serves the cleanup stopped but never ATTEMPTED to bring
+    back — Windows has no supervisor and no readable argv) read ``manual`` instead: surfaced to
+    the operator, never escalated, because no launch method on that platform could discharge the
+    obligation (#68934). The probe itself fails closed (unreadable ledger -> every planned serve is listed as
     surviving), so ``deferred`` means "not shown to be gone", not "observed alive". See #111494.
 
     ``live_gateway_pids`` (profile -> gateway PIDs alive for that profile AFTER the restart phase:
@@ -449,6 +456,7 @@ def match_runtime_outcomes(
         killed = {int(p) for p in (killed_pids or set())}
         stale_serves = {int(p) for p in stale_serve_pids} if stale_serve_pids is not None else None
         failed_respawns = {int(p) for p in (failed_respawn_pids or set())}
+        manual_relaunch = {int(p) for p in (manual_relaunch_pids or set())}
         external = {p for p in (external_gateway_pids or ()) if isinstance(p, int)}
         successors = (
             {str(profile): {p for p in pids if isinstance(p, int)} for profile, pids in live_gateway_pids.items()}
@@ -479,6 +487,10 @@ def match_runtime_outcomes(
             if r.kind in _SERVE_KINDS:
                 if killed_here:
                     return "stopped"
+                if r.pid in manual_relaunch:
+                    # Handed to the operator, not attempted: this platform has no supervisor for
+                    # it and no readable argv to replay (#68934). Never escalated.
+                    return "manual"
                 if r.pid in failed_respawns or any(_serve_unit_matches_profile(r.profile, u) for u in failed_set):
                     return "failed"
                 if stale_serves is not None and r.pid not in stale_serves:
@@ -542,10 +554,18 @@ def report_unaccounted_runtimes(outcomes: list[dict[str, Any]]) -> bool:
     """Print a loud warning for runtimes the restart phase never touched.
 
     Returns True when at least one planned runtime is unaccounted; the caller escalates like a
-    STALE/DOWN fleet row (exit 1) — a promised restart silently missed is the class this phase
+    STALE/DOWN fleet row (an owed ``gateway_restart`` follow-up) — a promised restart silently missed is the class this phase
     exists to kill.
     """
     manual = [o for o in outcomes if o.get("outcome") == "deferred" and o.get("mechanism") == "respawn-argv"]
+    # A relaunch this platform cannot perform (Windows: no supervisor, no captured argv) is a
+    # hand-off to the operator, not a retained reminder (#68934).
+    hand = [o for o in outcomes if o.get("outcome") == "manual"]
+    if hand:
+        print()
+        print("  ⚠ No managed supervisor on this platform — relaunch by hand to pick up the update:")
+        for o in hand:
+            print(f"    • {o['kind']} [{o['profile']}] pid {o['pid']}: relaunch `hermes dashboard` / `hermes serve`")
     if manual:
         print()
         print("  ⚠ Manual serve restarts deferred to their owner (reminders retained until the old processes exit):")

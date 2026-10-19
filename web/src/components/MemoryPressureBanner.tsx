@@ -16,7 +16,12 @@ import { useI18n } from "@/i18n";
  * 3. Post-mortem — the previous gateway life died uncleanly and its last
  *    heartbeat showed near-exhausted memory (`last_boot_suspected_oom`).
  *    This is a heuristic, not proof the OOM killer acted — copy says so.
- * 4. Disk elevated / 5. memory elevated — early warnings.
+ * 4. Post-mortem — the previous gateway life ACCEPTED a stop and was then
+ *    killed or died inside teardown (`last_boot_incomplete_stop`). Ranked
+ *    below the OOM notice because it is a shutdown that did not finish
+ *    rather than a kill of a running gateway; the copy says so, because
+ *    misreporting this as a crash is the defect the field exists to fix.
+ * 5. Disk elevated / 6. memory elevated — early warnings.
  *
  * All of this previously died in server-side log files; a hosted agent
  * could be OOM-killed hourly or fill its disk completely while the
@@ -116,6 +121,7 @@ export function MemoryPressureBanner({
   if (diskPressure === "critical") activeTriggers.push("disk_critical");
   if (memory?.pressure === "critical") activeTriggers.push("critical");
   if (memory?.last_boot_suspected_oom) activeTriggers.push("oom_restart");
+  if (memory?.last_boot_incomplete_stop) activeTriggers.push("incomplete_stop");
   if (diskPressure === "elevated") activeTriggers.push("disk_elevated");
   if (memory?.pressure === "elevated") activeTriggers.push("elevated");
 
@@ -141,6 +147,13 @@ export function MemoryPressureBanner({
   const critical = trigger === "critical" || trigger === "disk_critical";
   const diskFreeLabel =
     disk?.free_mb != null ? ` (${Math.round(disk.free_mb)} MB free)` : "";
+  // The stop reason is a closed set (`planned_stop` / `planned_restart` /
+  // `signal_stop`) written by the lifecycle ledger; it is shown because the
+  // operator's next question after "it did not finish shutting down" is
+  // always "who asked it to stop".
+  const stopReasonLabel = memory?.last_boot_stop_reason
+    ? ` (stop reason: ${memory.last_boot_stop_reason})`
+    : "";
   const message =
     trigger === "disk_critical"
       ? `${
@@ -155,11 +168,13 @@ export function MemoryPressureBanner({
         : trigger === "oom_restart"
           ? (t.app.memoryOomRestartBanner ??
             "Your agent restarted unexpectedly, most likely because it ran out of memory. Long sessions and many concurrent tasks increase memory use.")
-          : critical
-            ? (t.app.memoryCriticalBanner ??
-              "Your agent is almost out of memory and may restart. Consider closing idle sessions or upgrading its memory.")
-            : (t.app.memoryElevatedBanner ??
-              "Your agent is running low on memory.");
+          : trigger === "incomplete_stop"
+            ? `${t.app.memoryIncompleteStopBanner ?? "Your agent accepted a stop request and did not finish shutting down. That is an interrupted shutdown, not a crash, and no action is needed unless it keeps happening."}${stopReasonLabel}`
+            : critical
+              ? (t.app.memoryCriticalBanner ??
+                "Your agent is almost out of memory and may restart. Consider closing idle sessions or upgrading its memory.")
+              : (t.app.memoryElevatedBanner ??
+                "Your agent is running low on memory.");
 
   return (
     <div
