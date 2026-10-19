@@ -1547,6 +1547,37 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(recycleBackend).toHaveBeenCalledWith('default')
   })
 
+  it('the lost-connection toast clears itself once the gateway comes back', async () => {
+    // Sticky (durationMs: 0) so it survives until the user acts — but it must
+    // NOT outlive the outage. A gateway that recovers on its own used to leave
+    // "Hermes lost its connection" on screen until the app was restarted, which
+    // is the "I keep seeing this message" report.
+    const desktop = fakeDesktop()
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    // Outage long enough to escalate.
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+    expect($notifications.get().some(entry => entry.title?.includes('em'))).toBe(true)
+
+    // The backend recovers on its own — no user action.
+    FakeWebSocket.mode = 'open'
+    await advanceBackoff()
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect($notifications.get().some(entry => entry.title?.includes('em'))).toBe(false)
+  })
+
   it('#83134: a proxy that accepts then immediately closes every socket does not reset the backoff to attempt 0', async () => {
     render(<Harness />)
     await flushAsync()

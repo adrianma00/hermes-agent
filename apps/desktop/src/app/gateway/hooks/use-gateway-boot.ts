@@ -66,7 +66,7 @@ import {
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
 import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
-import { notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
+import { dismissNotification, notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   normalizeProfileKey,
@@ -411,11 +411,26 @@ export function useGatewayBoot({
     // Reset together with the backoff counters: on a STABLE open (isStableOpen)
     // or a manual/wake-driven reconnect — never on a bare 'open' that dies.
     let escalated = false
+    // The escalation toast is created with durationMs: 0 (sticky) so it survives
+    // until the user acts. That means it also survives the recovery: a gateway
+    // that comes back on its own would leave "lost its connection" on screen
+    // indefinitely, which is exactly the "I keep seeing this message" report.
+    // Track the id and dismiss it once the socket is stably open again.
+    let escalationToastId: string | null = null
+
+    const dismissEscalationToast = () => {
+      if (escalationToastId === null) {
+        return
+      }
+      dismissNotification(escalationToastId)
+      escalationToastId = null
+    }
 
     const resetReconnectBackoff = () => {
       reconnectAttempt = 0
       reconnectFailingSince = null
       escalated = false
+      dismissEscalationToast()
     }
 
     // Bounded automatic boot retry for transient REMOTE failures (#82679).
@@ -632,7 +647,7 @@ export function useGatewayBoot({
             // down but the HTTP health endpoint may still answer — a stale
             // gateway after `hermes update` returns a boot/disk commit mismatch.
             const isSkewed = await detectCodeSkew()
-            notify({
+            escalationToastId = notify({
               kind: isSkewed ? 'error' : 'warning',
               // Name the connection either way: with several backends
               // configured, "Hermes lost its connection" leaves the user
@@ -1160,6 +1175,12 @@ export function useGatewayBoot({
         if (bootCompleted) {
           completeDesktopBoot()
         }
+        // The escalation toast says the connection is lost. We are connected
+        // again, so it is now false — clear it instead of leaving it up until
+        // the app is restarted. Safe against flapping: a toast only ever exists
+        // after RECONNECT_ESCALATE_AFTER_MS of continuous failure, so it cannot
+        // be re-raised by a socket that drops again straight away.
+        dismissEscalationToast()
       } else if (st === 'closed' || st === 'error') {
         if (isStableOpen(openedAt)) {
           resetReconnectBackoff()
