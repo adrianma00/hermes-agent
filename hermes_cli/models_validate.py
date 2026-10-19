@@ -665,19 +665,6 @@ def _validate_live_listing(req: _Request) -> Optional[dict[str, Any]]:
     ):
         return _accept_with_note(f"Note: `{req.requested}` was not found in the live /v1/models listing "
                                  "but exists in the curated catalog — accepted.")
-    # Plugin provider fallback: profiles register models via fallback_models but
-    # _PROVIDER_MODELS may not have an entry for them. Check the profile's own
-    # fallback list when the curated catalog had no answer.
-    if not listing_authoritative:
-        from providers import get_provider_profile
-        profile = get_provider_profile(req.normalized)
-        if profile and profile.fallback_models:
-            fallback_lower = {m.lower() for m in profile.fallback_models}
-            if (variant_base or req.lookup).lower() in fallback_lower:
-                return _accept_with_note(
-                    f"Note: `{req.requested}` was not found in the live /v1/models listing "
-                    "but exists in this provider's model catalog — accepted."
-                )
     # Nous: the Portal's recommended-models feed can list a model before the curated list or the
     # docs-hosted manifest catches up; `hermes chat` already accepts those at model-list build
     # time, so mirror that source of truth for per-message /model validation.
