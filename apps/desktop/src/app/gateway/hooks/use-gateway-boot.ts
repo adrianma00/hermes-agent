@@ -10,7 +10,7 @@ import {
 import { useEffect, useRef } from 'react'
 
 import { canonicalOwnerProfile } from '@/api/canonical-protocol'
-import { restartGateway } from '@/api/system'
+import { hermesApi } from '@/api/client'
 import { createGatewayEventDedupe } from '@/app/gateway/gateway-event-dedupe'
 import { reportStartupLatency } from '@/app/gateway/report-startup-latency'
 import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
@@ -151,26 +151,24 @@ const BOOT_RETRY_BASE_DELAY_MS = 2_000
  * Probe a gateway's health endpoint for code skew. Returns true when the
  * gateway reports a boot-revision that differs from the on-disk checkout,
  * meaning the process needs a restart to pick up a code update.
- * Tries both `/api/health` (serve/dashboard) and `/health` (gateway).
- * Uses a short timeout so it never delays the reconnect loop.
+ *
+ * Goes through the app's own REST path (main process, ticket-authed) rather
+ * than a renderer fetch: the gateway's CORS middleware 403s any request
+ * carrying a browser Origin, and a file://-backed renderer always sends one.
+ * Tries `/api/health` (serve/dashboard) and `/health` (gateway). Bounded so
+ * it can never delay the reconnect loop.
  */
-async function detectCodeSkew(baseUrl?: string): Promise<boolean> {
-  if (!baseUrl) {
-    return false
-  }
-
-  const base = baseUrl.replace(/\/+$/, '')
-
+async function detectCodeSkew(): Promise<boolean> {
   for (const path of ['/api/health', '/health']) {
     try {
-      const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(5_000) })
+      const body = await hermesApi<{ code_skew?: unknown }>({
+        method: 'GET',
+        path,
+        timeoutMs: 5_000
+      })
 
-      if (res.ok) {
-        const body: Record<string, unknown> = await res.json()
-
-        if ((body as { code_skew?: unknown }).code_skew) {
-          return true
-        }
+      if (body && typeof body === 'object' && body.code_skew) {
+        return true
       }
     } catch {
       // fall through to the next path
@@ -633,7 +631,7 @@ export function useGatewayBoot({
             // Probe the gateway REST endpoint for code skew. The WebSocket is
             // down but the HTTP health endpoint may still answer — a stale
             // gateway after `hermes update` returns a boot/disk commit mismatch.
-            const isSkewed = await detectCodeSkew(primaryConnection?.baseUrl)
+            const isSkewed = await detectCodeSkew()
             notify({
               kind: isSkewed ? 'error' : 'warning',
               title: isSkewed
@@ -645,10 +643,8 @@ export function useGatewayBoot({
               durationMs: 0,
               action: isSkewed
                 ? {
-                    label: translateNow('notifications.actions.restartGateway'),
-                    onClick: () => void restartGateway(primaryConnection?.profile).then(
-                      () => reconnectGateway({ source: 'restart-followthrough' })
-                    ).catch(() => undefined)
+                    label: translateNow('settings.models.restartBackend'),
+                    onClick: requestBackendRestart
                   }
                 : {
                     label: translateNow('boot.errors.reconnectNow'),
