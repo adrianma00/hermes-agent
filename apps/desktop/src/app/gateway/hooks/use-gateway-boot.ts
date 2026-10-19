@@ -66,6 +66,7 @@ import {
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
 import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
+import { $connectionsRegistry } from '@/store/connections'
 import { dismissNotification, notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -642,7 +643,19 @@ export function useGatewayBoot({
             // Non-blocking: chat stays readable/draftable while we keep retrying.
             // Settings / Gateway menu remain reachable without a modal lockout.
             // Name the connection so the user knows which backend dropped.
-            const connLabel = primaryConnection?.connectionId ?? primaryConnection?.profile ?? 'default'
+            // Prefer the registry LABEL ("Em") the user named it with; the raw
+            // connectionId is a slug like `antigravity-taile8bd43-ts-net` and
+            // naming a drop with it is barely better than naming nothing.
+            const connectionId = primaryConnection?.connectionId
+            const connLabel =
+              (connectionId
+                ? $connectionsRegistry
+                    .get()
+                    ?.connections.find(entry => entry.id === connectionId)?.label
+                : undefined)?.trim() ||
+              connectionId ||
+              primaryConnection?.profile ||
+              'default'
             // Probe the gateway REST endpoint for code skew. The WebSocket is
             // down but the HTTP health endpoint may still answer — a stale
             // gateway after `hermes update` returns a boot/disk commit mismatch.

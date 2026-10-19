@@ -1547,6 +1547,51 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(recycleBackend).toHaveBeenCalledWith('default')
   })
 
+  it('names the connection by its registry LABEL, not the raw slug', async () => {
+    // connectionId is a slug ("antigravity-taile8bd43-ts-net"); the user named
+    // it "Em". A toast that says the slug is barely better than saying nothing.
+    setConnectionsRegistry({
+      version: 2,
+      primary: 'antigravity-taile8bd43-ts-net',
+      encrypted: false,
+      connections: [
+        {
+          id: 'antigravity-taile8bd43-ts-net',
+          kind: 'ssh',
+          label: 'Em',
+          host: 'antigravity.taile8bd43.ts.net',
+          user: 'ama',
+          tokenSet: true,
+          tokenPreview: null
+        }
+      ]
+    } as never)
+
+    const desktop = fakeDesktop()
+    desktop.getConnection.mockResolvedValue({
+      ...primaryConn,
+      connectionId: 'antigravity-taile8bd43-ts-net',
+      profile: 'default'
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+
+    const toast = $notifications.get().find(entry => entry.title?.includes('Em'))
+    expect(toast?.title).toBe('Lost connection to “Em”')
+    // The slug must NOT leak into the copy.
+    expect($notifications.get().some(entry => entry.title?.includes('antigravity'))).toBe(false)
+  })
+
   it('the lost-connection toast clears itself once the gateway comes back', async () => {
     // Sticky (durationMs: 0) so it survives until the user acts — but it must
     // NOT outlive the outage. A gateway that recovers on its own used to leave
