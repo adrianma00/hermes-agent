@@ -647,6 +647,12 @@ export function useGatewayBoot({
             // down but the HTTP health endpoint may still answer — a stale
             // gateway after `hermes update` returns a boot/disk commit mismatch.
             const isSkewed = await detectCodeSkew()
+            // detectCodeSkew() is async: the socket can come back while the probe
+            // is in flight. Raising the toast then would announce an outage that
+            // is already over, and — being sticky — it would never clear itself.
+            if (cancelled || gatewayOpen() || $gatewaySwitching.get()) {
+              return
+            }
             escalationToastId = notify({
               kind: isSkewed ? 'error' : 'warning',
               // Name the connection either way: with several backends
