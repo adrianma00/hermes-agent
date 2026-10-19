@@ -1026,3 +1026,91 @@ def test_dashboard_cleanup_records_manual_relaunch_as_skip(capsys):
     assert [s[0] for s in skips] == ["dashboard_cleanup"]
     assert "4242" in skips[0][1]
     assert "could not be auto-restarted" not in capsys.readouterr().out
+def test_dashboard_cmdline_for_pid_reads_psutil_on_windows():
+    """Windows has no /proc and no ps; psutil hands over the same argv /proc records."""
+    import psutil
+
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(psutil, "Process") as proc:
+        proc.return_value.cmdline.return_value = _WIN32_ARGV
+        assert main_dashboard._dashboard_cmdline_for_pid(4242) == _WIN32_ARGV
+
+        # An elevated / other-user process must fail closed, never guess an argv.
+        proc.side_effect = psutil.AccessDenied(4242)
+        assert main_dashboard._dashboard_cmdline_for_pid(4242) is None
+
+
+def test_win32_snapshot_captures_argv_and_respawns(capsys):
+    """The normal Windows case is auto-restarted like POSIX: snapshot, kill, replay argv."""
+    with patch.object(dashboard_procs, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
+         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
+         patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=_WIN32_ARGV), \
+         patch.object(dashboard_procs, "_hermes_home_for_pid", return_value=r"C:\Users\ama\.hermes"), \
+         patch.object(dashboard_procs, "_filter_dashboard_respawn_candidates",
+                      side_effect=lambda candidates: [argv for _pid, argv, _home in candidates]), \
+         patch.object(dashboard_procs, "_kill_pids_windows",
+                      side_effect=lambda pids, killed, failed: killed.extend(pids)), \
+         patch.object(dashboard_procs, "_wait_gone", return_value=[]) as wait, \
+         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn:
+        result = _kill_stale_dashboard_processes(restart_managed=True)
+
+    wait.assert_called_once()               # taskkill returns before the socket is released
+    respawn.assert_called_once_with([_WIN32_ARGV])
+    assert result["unrecovered"] == []
+    assert result["manual_relaunch"] == []
+
+
+class _AliveProc:
+    """Enough of ``subprocess.Popen`` for the respawn liveness check."""
+
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+def test_win32_respawn_uses_detach_flags(tmp_path, monkeypatch):
+    """``start_new_session`` is POSIX-only; Windows detaches with creation flags."""
+    spawned: dict = {}
+
+    def fake_popen(command, **kwargs):
+        spawned["command"] = command
+        spawned["kwargs"] = kwargs
+        return _AliveProc()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard.subprocess, "Popen", side_effect=fake_popen), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags", return_value=0x8000000), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags_without_breakaway",
+               return_value=0x4000000), \
+         patch.object(main_dashboard.time, "sleep"):
+        failed = main_dashboard._respawn_dashboard_processes([list(_WIN32_ARGV)])
+
+    assert failed == []
+    assert spawned["kwargs"]["creationflags"] == 0x8000000
+    assert spawned["kwargs"]["start_new_session"] is False
+
+
+def test_win32_respawn_falls_back_without_breakaway(tmp_path, monkeypatch):
+    """A job object that forbids CREATE_BREAKAWAY_FROM_JOB must not lose the respawn."""
+    flags: list[int] = []
+
+    def fake_popen(command, **kwargs):
+        flags.append(kwargs["creationflags"])
+        if len(flags) == 1:
+            raise PermissionError("job object forbids breakaway")
+        return _AliveProc()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch.object(main_dashboard, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard.subprocess, "Popen", side_effect=fake_popen), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags", return_value=0x8000000), \
+         patch("hermes_cli._subprocess_compat.windows_detach_flags_without_breakaway",
+               return_value=0x4000000), \
+         patch.object(main_dashboard.time, "sleep"):
+        failed = main_dashboard._respawn_dashboard_processes([list(_WIN32_ARGV)])
+
+    assert flags == [0x8000000, 0x4000000]
+    assert failed == []

@@ -352,9 +352,19 @@ def _restart_launchd_job(domain: str, label: str, old_pid: int | None, *, timeou
 
 def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
     """Exact argv of a running process: ``/proc/<pid>/cmdline`` (Linux), ``ps -o command=`` + shlex
-    (macOS), None on Windows (no graceful taskkill window; Desktop manages its backend)."""
+    (macOS), ``psutil`` (Windows — no ``/proc`` and no ``ps``; its ``cmdline()`` reads the PEB and
+    fails closed to None for a process this user cannot open, e.g. an elevated one)."""
     if sys.platform == "win32":
-        return None
+        # Fails closed on purpose: an unreadable argv must never become a guessed respawn, and a
+        # PID whose argv cannot be read comes back to the caller as "relaunch by hand" (#68934).
+        try:
+            import psutil
+        except ImportError:
+            return None
+        try:
+            return list(psutil.Process(pid).cmdline()) or None
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            return None
     try:
         cmdline_path = f"/proc/{pid}/cmdline"
         if os.path.exists(cmdline_path):
@@ -412,20 +422,56 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     with contextlib.suppress(OSError):
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if sys.platform == "win32":
+        # POSIX detaches with ``start_new_session``; Windows needs creation flags instead, and a
+        # job object that forbids breakaway refuses the spawn outright (PermissionError) — the
+        # documented fallback is the same flags minus CREATE_BREAKAWAY_FROM_JOB.
+        from hermes_cli._subprocess_compat import (
+            windows_detach_flags, windows_detach_flags_without_breakaway)
+
+        def _spawn(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                close_fds=True, start_new_session=False,
+                creationflags=windows_detach_flags())
+
+        def _spawn_without_breakaway(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                close_fds=True, start_new_session=False,
+                creationflags=windows_detach_flags_without_breakaway())
+
+        spawn_attempts = [_spawn, _spawn_without_breakaway]
+    else:
+        def _spawn_posix(command: list[str], log_f):
+            return subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True)
+
+        spawn_attempts = [_spawn_posix]
+
     for original in commands:
         command = _respawnable_command_for_current_install(original)
         # Keep restarted dashboards headless; reopening a browser after a
         # background update is noisy and fails in SSH/headless sessions.
         if "dashboard" in command and "--no-open" not in command:
             command = [*command, "--no-open"]
-        try:
-            with open(log_path, "ab") as log_f:
-                proc = subprocess.Popen(
-                    command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
-                    start_new_session=True, close_fds=True)
+        proc = None
+        last_exc: Exception | None = None
+        for attempt in spawn_attempts:
+            try:
+                with open(log_path, "ab") as log_f:
+                    proc = attempt(command, log_f)
+                break
+            except PermissionError as exc:  # Windows job object forbids breakaway
+                last_exc = exc
+            except (OSError, ValueError) as exc:
+                last_exc = exc
+                break  # not a detach-flag problem; retrying the flags cannot help
+        if proc is None:
+            failed.append((original, command, str(last_exc)))
+        else:
             spawned.append((original, command, proc))
-        except (OSError, ValueError) as exc:
-            failed.append((original, command, str(exc)))
 
     # A respawned backend is a resident server: one that exits within the grace
     # window died at startup (SyntaxError on a stale argv, port already bound,

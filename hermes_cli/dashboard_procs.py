@@ -462,6 +462,10 @@ _POSIX_TERM_GRACE_SECONDS = 10.0
 # wedged ui-tui keeps the deleted state.db-wal inode open until the next start refuses with
 # DeletedWalGenerationError (#112631) — no finite root grace can cover an unbounded teardown.
 _POSIX_DESCENDANT_GRACE_SECONDS = 2.0
+# How long to wait for ``taskkill /F`` victims to actually disappear on Windows before replaying
+# their argv. taskkill returns as soon as the termination is requested; a dashboard that has not
+# released its fixed --port yet makes the respawn die at startup (EADDRINUSE).
+_WIN32_KILL_SETTLE_SECONDS = 5.0
 _NO_TTY = ("?", "??", "-")  # Linux / macOS / BSD spellings of "no controlling terminal"
 
 
@@ -602,11 +606,12 @@ def _kill_stale_dashboard_processes(
     ``HERMES_HOME`` are candidates; unknown ownership fails closed. This is
     used by ``dashboard --stop`` and the per-profile update cleanup.
 
-    On POSIX, manually-started dashboards ARE auto-restarted: their argv
-    (--host, --port, --insecure, --tui, --no-open) is captured below and replayed.
-    On Windows they are not — not because the launch args are unknown, but because
-    the restart-managed branch is gated on win32: ``_dashboard_cmdline_for_pid``
-    returns None there by design. #68934 tracks that win32 respawn gap itself.
+    Manually-started dashboards ARE auto-restarted on every platform: their argv
+    (--host, --port, --insecure, --tui, --no-open) is captured below and replayed on POSIX and
+    on Windows (``psutil``). The only case that cannot be replayed is an argv the platform
+    refuses to hand over — an elevated or other-user process — and those PIDs come back under
+    ``manual_relaunch``, never ``unrecovered``: a restart this code never attempted must not
+    read as a failed one (#68934).
     *already_restarted_units* names units (no ``.service`` suffix) the caller already restarted directly —
     e.g. ``hermes update``'s systemd fleet-restart loop, which restarts ``hermes-serve*`` units before this
     function runs. Without excluding them, a Serve-only install's freshly restarted process is found again
@@ -644,12 +649,14 @@ def _kill_stale_dashboard_processes(
     def _launchd_owner(pid: int, cmdline: list[str] | None):
         return _dash._launchd_job_owning_backend(pid, cmdline, launchd_jobs, ancestors=_process_ancestors(pid))
 
-    if restart_managed and sys.platform != "win32":
+    if restart_managed:
         for pid in pids:
-            pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
-            pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
-            if pid_service[pid]:
-                continue
+            if sys.platform != "win32":
+                # systemd/cgroup ownership is Linux-only; both fail closed elsewhere.
+                pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
+                pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
+                if pid_service[pid]:
+                    continue
             cmdline = _dash._dashboard_cmdline_for_pid(pid)
             if launchd_jobs and (job := _launchd_owner(pid, cmdline)):
                 pid_launchd[pid] = job
@@ -673,6 +680,11 @@ def _kill_stale_dashboard_processes(
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
     (_kill_pids_windows if sys.platform == "win32" else _kill_pids_posix)(pids, killed, failed)
+    if sys.platform == "win32" and killed:
+        # ``taskkill /F`` returns before the process is fully gone and its listening socket
+        # released: a respawn replaying a fixed --port would bind nothing and die on startup.
+        # Wait for the PIDs to actually disappear before the argv replay below.
+        _wait_gone(killed, _WIN32_KILL_SETTLE_SECONDS)
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
     for pid, err_msg in failed:
