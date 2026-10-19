@@ -32,6 +32,21 @@ export const REMOTE_LIVENESS_FAILURE_WINDOW_MS = 60_000
 // streak via recordSuccess(), so a wide window cannot produce false drops.
 export const REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS = 15 * 60_000
 
+// A dispatch-probe miss is per-profile evidence, but the cause is often not.
+// When one remote host is briefly saturated, MANY pooled profiles on the SAME
+// connection miss their probe inside the same tick (measured: 21 profiles
+// within 40ms). Treating each miss independently retires and re-dials all of
+// them at once, which lands N SSH handshakes + N remote backend boots on the
+// host that was already too busy to answer — the misses cause the stampede
+// that causes the next round of misses. These constants classify that shape:
+// distinct PROFILES (never one profile failing repeatedly) failing on one
+// connection inside a short window is a host event, not N dead backends.
+export const HOST_EVENT_DISTINCT_PROFILE_THRESHOLD = 3
+export const HOST_EVENT_WINDOW_MS = 2_000
+// Long enough for a load spike to drain, short enough that a genuinely dead
+// backend still reconnects well inside the user's patience for one click.
+export const HOST_EVENT_BACKOFF_MS = 5_000
+
 export interface RemoteLivenessFailure {
   failures: number
   shouldReset: boolean
@@ -40,6 +55,21 @@ export interface RemoteLivenessFailure {
 interface RemoteConnectionDescriptor {
   baseUrl?: null | string
   mode?: null | string
+}
+
+/**
+ * Last look before the primary connection is dropped.
+ *
+ * The pooled path can recognise a busy host because many profiles miss at
+ * once. The primary connection is alone on its gateway, so it has no siblings
+ * to vote with — its only evidence is its own streak, and on a saturated host
+ * that streak expires in a few seconds of quick probes. Dropping it is a
+ * visible whole-app reload, so it is worth one pause plus one recheck first.
+ */
+export interface RemoteDropConfirmation {
+  backoff: () => Promise<void>
+  /** Cheap transport-level check (SSH master liveness), when one applies. */
+  transportAlive?: () => Promise<boolean>
 }
 
 /**
@@ -79,6 +109,7 @@ export function probeFailureDescription(...errors: unknown[]): string {
 }
 
 export interface RevalidateRemoteConnectionOptions<TConnection extends RemoteConnectionDescriptor> {
+  confirmDrop?: RemoteDropConfirmation
   connectionPromise: Promise<TConnection>
   currentConnectionPromise: () => null | Promise<TConnection>
   log: (message: string) => void
@@ -126,6 +157,180 @@ export class RemoteRevalidationCoordinator {
   }
 }
 
+/**
+ * Classifies correlated dispatch-probe failures on one connection as a HOST
+ * EVENT (the host is busy) rather than N independent dead backends.
+ *
+ * Keyed per connection id, counting DISTINCT pool keys inside a rolling
+ * window: one profile failing three times in a row is still one dead backend
+ * and must keep the existing fast retire path. Failures age out of the window
+ * on their own, so the classification is self-clearing — there is no latch to
+ * reset and no timer to own.
+ */
+export class RemoteHostEventTracker {
+  readonly #failuresByConnection = new Map<string, Map<string, number>>()
+  readonly #now: () => number
+  readonly #threshold: number
+  readonly #windowMs: number
+
+  constructor(
+    threshold = HOST_EVENT_DISTINCT_PROFILE_THRESHOLD,
+    windowMs = HOST_EVENT_WINDOW_MS,
+    now: () => number = Date.now
+  ) {
+    if (!Number.isInteger(threshold) || threshold < 2) {
+      throw new Error('Host event threshold must be an integer of at least 2.')
+    }
+
+    if (!Number.isFinite(windowMs) || windowMs < 1) {
+      throw new Error('Host event window must be positive.')
+    }
+
+    this.#threshold = threshold
+    this.#windowMs = windowMs
+    this.#now = now
+  }
+
+  /**
+   * Record one dispatch-probe failure. Returns true once enough DISTINCT pool
+   * keys on this connection have failed inside the window — including for the
+   * failure that crosses the threshold and every later one while it holds.
+   */
+  recordProbeFailure(connectionId: string, poolKey: string): boolean {
+    const now = this.#now()
+    let recent = this.#failuresByConnection.get(connectionId)
+
+    if (!recent) {
+      recent = new Map()
+      this.#failuresByConnection.set(connectionId, recent)
+    }
+
+    recent.set(poolKey, now)
+
+    for (const [key, at] of recent) {
+      if (now - at > this.#windowMs) {
+        recent.delete(key)
+      }
+    }
+
+    if (recent.size === 0) {
+      this.#failuresByConnection.delete(connectionId)
+    }
+
+    return recent.size >= this.#threshold
+  }
+
+  clear(connectionId?: string): void {
+    if (connectionId === undefined) {
+      this.#failuresByConnection.clear()
+
+      return
+    }
+
+    this.#failuresByConnection.delete(connectionId)
+  }
+}
+
+// Recovery must not become the next stampede: three in flight keeps a busy
+// host making progress without handing it 20+ handshakes at once, and a small
+// jitter stops each released batch from landing on the same millisecond.
+export const POOLED_REMOTE_DIAL_CONCURRENCY = 3
+export const POOLED_REMOTE_DIAL_JITTER_MS = 250
+
+export interface PooledRemoteDialGateOptions {
+  delay?: (ms: number) => Promise<void>
+  jitterMs?: number
+  limit?: number
+  random?: () => number
+}
+
+/**
+ * Caps how many pooled remote dials for ONE connection id may be in flight.
+ *
+ * BackendDialClaims already coalesces concurrent dials of a single pool key;
+ * this is the orthogonal bound across the keys that share a host. A caller
+ * that finds a free slot runs immediately and pays nothing, so single-profile
+ * reconnect stays as fast as it was; only callers that would have exceeded the
+ * cap wait, and they are admitted one at a time with jitter as slots free.
+ */
+export class PooledRemoteDialGate {
+  readonly #delay: (ms: number) => Promise<void>
+  readonly #jitterMs: number
+  readonly #lanes = new Map<string, { active: number; queue: Array<() => void> }>()
+  readonly #limit: number
+  readonly #random: () => number
+
+  constructor({
+    delay = ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
+    jitterMs = POOLED_REMOTE_DIAL_JITTER_MS,
+    limit = POOLED_REMOTE_DIAL_CONCURRENCY,
+    random = Math.random
+  }: PooledRemoteDialGateOptions = {}) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error('Pooled remote dial concurrency must be a positive integer.')
+    }
+
+    if (!Number.isFinite(jitterMs) || jitterMs < 0) {
+      throw new Error('Pooled remote dial jitter must be zero or positive.')
+    }
+
+    this.#delay = delay
+    this.#jitterMs = jitterMs
+    this.#limit = limit
+    this.#random = random
+  }
+
+  /** In-flight dials for this connection id (test/diagnostic seam). */
+  active(connectionId: string): number {
+    return this.#lanes.get(connectionId)?.active || 0
+  }
+
+  async run<T>(connectionId: string, dial: () => Promise<T> | T): Promise<T> {
+    let lane = this.#lanes.get(connectionId)
+
+    if (!lane) {
+      lane = { active: 0, queue: [] }
+      this.#lanes.set(connectionId, lane)
+    }
+
+    if (lane.active >= this.#limit) {
+      await new Promise<void>(resolve => {
+        lane.queue.push(resolve)
+      })
+    } else {
+      lane.active += 1
+    }
+
+    try {
+      return await dial()
+    } finally {
+      const next = lane.queue.shift()
+
+      if (next) {
+        // Hand the slot straight to the next waiter rather than releasing it:
+        // a released slot could be claimed by a fresh caller, letting the
+        // waiter's own admission push the lane past the cap.
+        void this.#delay(this.#random() * this.#jitterMs).then(next)
+      } else {
+        lane.active -= 1
+
+        if (lane.active === 0 && this.#lanes.get(connectionId) === lane) {
+          this.#lanes.delete(connectionId)
+        }
+      }
+    }
+  }
+}
+
+export interface DispatchHostEventPolicy {
+  /** Sleep out the host-event backoff before revalidating the descriptor. */
+  backoff: () => Promise<void>
+  /** Record this failure; true when the connection is inside a host event. */
+  classify: () => boolean
+  /** Cheap host-level liveness (`ssh -O check`); false skips to teardown. */
+  hostAlive: () => Promise<boolean>
+}
+
 export interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection extends RemoteConnectionDescriptor> {
   connectionPromise: Promise<TConnection>
   currentConnectionPromise: () => null | Promise<TConnection>
@@ -147,6 +352,12 @@ export interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection 
    * "alive or unprovable" and leave the streak policy in charge.
    */
   remoteDashboardAlive?: () => Promise<boolean> | boolean
+  /**
+   * Correlated probe-failure policy: when the tracker classifies this failure
+   * as one of many across the connection, teardown is deferred and the host is
+   * re-probed after a backoff. See DispatchHostEventPolicy.
+   */
+  hostEvent?: DispatchHostEventPolicy
   /** Sleep between the first failed probe and the confirmation probe; default 750ms. */
   retryDelayMs?: number
   /**
@@ -207,6 +418,7 @@ async function probePooledRemoteBackend<TConnection extends RemoteConnectionDesc
 export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection extends RemoteConnectionDescriptor>({
   connectionPromise,
   currentConnectionPromise,
+  hostEvent,
   probe,
   reconnect,
   retire,
@@ -216,9 +428,11 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
   tracker
 }: EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection>): Promise<TConnection> {
   let connection: TConnection
+  let descriptorResolved = false
 
   try {
     connection = await connectionPromise
+    descriptorResolved = true
 
     if (currentConnectionPromise() !== connectionPromise) {
       return reconnect()
@@ -315,6 +529,25 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
       )
     }
   } catch (error) {
+    // A descriptor whose boot never resolved has nothing to revalidate, so the
+    // host-event path only applies once a probe of a real descriptor failed.
+    if (descriptorResolved && hostEvent && currentConnectionPromise() === connectionPromise && hostEvent.classify()) {
+      log?.(
+        `Pooled remote backend failed its dispatch probe during a host event; deferring teardown for ${HOST_EVENT_BACKOFF_MS}ms before revalidating.`
+      )
+      await hostEvent.backoff()
+
+      if (currentConnectionPromise() !== connectionPromise) {
+        return reconnect()
+      }
+
+      if (await pooledRemoteBackendSurvivedHostEvent(connection!, hostEvent, probe)) {
+        log?.('Pooled remote backend answered after the host-event backoff; keeping the descriptor.')
+
+        return connection!
+      }
+    }
+
     if (currentConnectionPromise() === connectionPromise) {
       await retire(error)
     }
@@ -327,6 +560,31 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
   }
 
   return connection
+}
+
+/**
+ * Second chance for one descriptor after the host-event backoff: the transport
+ * must be up AND the backend must answer. Either miss means this really is a
+ * dead backend, so the caller retires it exactly as before.
+ */
+async function pooledRemoteBackendSurvivedHostEvent<TConnection extends RemoteConnectionDescriptor>(
+  connection: TConnection,
+  hostEvent: DispatchHostEventPolicy,
+  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+): Promise<boolean> {
+  try {
+    if (!(await hostEvent.hostAlive())) {
+      return false
+    }
+
+    await probe(connection, '/api/status', {
+      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
+    })
+
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -609,6 +867,7 @@ export function attachPowerResumeRemoteRevalidation({
  * old async result cannot mutate or reset a replacement connection.
  */
 export async function revalidateRemoteConnection<TConnection extends RemoteConnectionDescriptor>({
+  confirmDrop,
   connectionPromise,
   currentConnectionPromise,
   log,
@@ -660,9 +919,48 @@ export async function revalidateRemoteConnection<TConnection extends RemoteConne
       return { ok: true, rebuilt: false }
     }
 
+    if (confirmDrop) {
+      log(
+        `Cached remote Hermes backend hit its liveness failure limit; confirming with a transport check and one re-probe after ${HOST_EVENT_BACKOFF_MS}ms before dropping.`
+      )
+      await confirmDrop.backoff()
+
+      if (currentConnectionPromise() !== connectionPromise) {
+        return { ok: true, rebuilt: false }
+      }
+
+      if (await cachedRemoteConnectionSurvivedBackoff(connection, confirmDrop, probe)) {
+        // recordFailure already consumed the streak when it tripped the limit,
+        // so the kept connection restarts from a clean slate.
+        tracker.recordSuccess(baseUrl)
+        log('Cached remote Hermes backend answered after the confirmation backoff; keeping the connection.')
+
+        return { ok: true, rebuilt: false }
+      }
+    }
+
     log('Cached remote Hermes backend failed liveness probe; dropping stale connection.')
     resetConnection()
 
     return { ok: true, rebuilt: true }
+  }
+}
+
+/** Transport first (cheap), then one real re-probe. Either failure drops. */
+async function cachedRemoteConnectionSurvivedBackoff<TConnection extends RemoteConnectionDescriptor>(
+  connection: TConnection,
+  confirmDrop: RemoteDropConfirmation,
+  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+): Promise<boolean> {
+  try {
+    if (confirmDrop.transportAlive && !(await confirmDrop.transportAlive())) {
+      return false
+    }
+
+    await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+
+    return true
+  } catch {
+    return false
   }
 }
