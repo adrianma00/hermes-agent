@@ -411,6 +411,7 @@ import {
   withoutInteractiveOauthLogin
 } from './oauth-rest-request'
 import { wireOauthSessionResponse } from './oauth-session-response'
+import { createCoalescingInterval } from './timer-coalesce'
 import { listWindowsProcesses, reapPackageRootedProcesses } from './package-process-reap'
 import { createParentStartMarkerResolver } from './parent-process-identity'
 import { bundledPayload, installIdForRoot, type PayloadInfo, payloadPythonPath } from './payload-backend'
@@ -2068,7 +2069,7 @@ function startChromiumLogWatcher(file) {
     truncate: f => fs.truncateSync(f, 0)
   }
 
-  const timer = setInterval(() => {
+  const timer = coalescedInterval(() => {
     try {
       if (reclaimActiveLogIfOversized(file, io)) {
         rememberLog(`[diagnostics] truncated oversized Chromium log ${file}`)
@@ -2078,7 +2079,7 @@ function startChromiumLogWatcher(file) {
     }
   }, ACTIVE_LOG_POLL_MS)
 
-  timer.unref?.()
+  timer.unref()
 }
 
 function rotateLogIfNeededSync(base) {
@@ -2207,6 +2208,23 @@ function rememberLog(chunk) {
   scheduleDesktopLogFlush()
 }
 
+// Shared event-loop lag signal: the watchdog writes it on every detected freeze,
+// and timer consumers read it to coalesce their backlog on thaw.  Stored as a
+// module-level variable so any consumer in main.ts can capture the getter.
+let lastLagMs = 0
+
+function getLastLagMs(): number {
+  return lastLagMs
+}
+
+/** Coalescing timer factory pre-configured with the shared lag signal. */
+function coalescedInterval(callback: () => void, delayMs: number) {
+  return createCoalescingInterval(callback, delayMs, {
+    getLastLagMs,
+    thresholdMs: 2_000
+  })
+}
+
 // Main-process stalls leave renderer-scoped lifecycle logging unable to run.
 // When the loop resumes, retain the delayed timer's timing in desktop.log so a
 // Windows AppHang report can be correlated without changing tray semantics.
@@ -2216,7 +2234,10 @@ const mainProcessLagWatchdog = createMainProcessLagWatchdog({
   now: Date.now,
   log: rememberLog,
   setInterval,
-  clearInterval
+  clearInterval,
+  onLag: lagMs => {
+    lastLagMs = lagMs
+  }
 })
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
