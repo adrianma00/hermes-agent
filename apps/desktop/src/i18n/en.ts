@@ -440,6 +440,7 @@ export const en: Translations = {
     },
     actions: {
       restartHermes: 'Restart Hermes',
+      restartGateway: 'Restart gateway',
       openKeys: 'Open Keys',
       openGateways: 'Open Gateways',
       openMaintenance: 'Open Maintenance'

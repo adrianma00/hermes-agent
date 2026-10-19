@@ -469,6 +469,7 @@ export interface Translations extends NoticeTranslations {
     }
     actions: {
       restartHermes: string
+      restartGateway: string
       openKeys: string
       openGateways: string
       openMaintenance: string

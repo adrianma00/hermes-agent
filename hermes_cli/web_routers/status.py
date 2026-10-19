@@ -125,9 +125,17 @@ async def get_health():
     its checkout, so a serve that outlived ``hermes update`` is never re-adopted.
     """
     info = get_version_info()
-    return {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
+    body: dict[str, object] = {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
             "commit": info.commit,
             "auth_required": bool(getattr(app.state, "auth_required", False))}
+    try:
+        from gateway.code_skew import detect_code_skew
+        skew = detect_code_skew()
+        if skew is not None:
+            body["code_skew"] = {"boot_rev": skew[0], "disk_rev": skew[1]}
+    except Exception:
+        pass
+    return body
 
 
 @router.get("/api/host/identity")

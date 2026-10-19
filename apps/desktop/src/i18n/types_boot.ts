@@ -19,6 +19,8 @@ export interface BootTranslations {
     desktopBootFailed: string
     gatewayConnectionLost: string
     gatewayConnectionLostDetail: string
+    gatewayStaleCode: string | ((opts: { connection: string }) => string)
+    gatewayStaleCodeDetail: string
     reconnectNow: string
     connectionSettings: string
     gatewaySignInRequired: string

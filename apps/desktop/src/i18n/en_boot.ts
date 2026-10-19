@@ -24,6 +24,9 @@ export const enBoot = {
       gatewayConnectionLost: 'Hermes lost its connection',
       gatewayConnectionLostDetail:
         'Still trying to reconnect. You can keep reading and drafting. If this keeps up, reconnect now or check your connection settings.',
+      gatewayStaleCode: ({ connection }) => `“${connection}” backend was updated — restart required`,
+      gatewayStaleCodeDetail:
+        'The backend for this connection is running stale code after an update. Restart it to pick up the latest changes.',
       reconnectNow: 'Reconnect now',
       connectionSettings: 'Connection settings',
       gatewaySignInRequired: 'Your remote Hermes signed you out',

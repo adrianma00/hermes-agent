@@ -10,6 +10,7 @@ import {
 import { useEffect, useRef } from 'react'
 
 import { canonicalOwnerProfile } from '@/api/canonical-protocol'
+import { restartGateway } from '@/api/system'
 import { createGatewayEventDedupe } from '@/app/gateway/gateway-event-dedupe'
 import { reportStartupLatency } from '@/app/gateway/report-startup-latency'
 import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
@@ -145,6 +146,39 @@ const BOOT_RETRY_MAX_ATTEMPTS = 5
 // Base delay for boot retries. Deliberately slower than the socket reconnect
 // loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
 const BOOT_RETRY_BASE_DELAY_MS = 2_000
+
+/**
+ * Probe a gateway's health endpoint for code skew. Returns true when the
+ * gateway reports a boot-revision that differs from the on-disk checkout,
+ * meaning the process needs a restart to pick up a code update.
+ * Tries both `/api/health` (serve/dashboard) and `/health` (gateway).
+ * Uses a short timeout so it never delays the reconnect loop.
+ */
+async function detectCodeSkew(baseUrl?: string): Promise<boolean> {
+  if (!baseUrl) {
+    return false
+  }
+
+  const base = baseUrl.replace(/\/+$/, '')
+
+  for (const path of ['/api/health', '/health']) {
+    try {
+      const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(5_000) })
+
+      if (res.ok) {
+        const body: Record<string, unknown> = await res.json()
+
+        if ((body as { code_skew?: unknown }).code_skew) {
+          return true
+        }
+      }
+    } catch {
+      // fall through to the next path
+    }
+  }
+
+  return false
+}
 
 // While any of the RECONNECT_ATTEMPT_TIMEOUT_MS-bounded awaits below is
 // pending, `reconnecting` never clears, so scheduleReconnect()/
@@ -594,15 +628,32 @@ export function useGatewayBoot({
             escalated = true
             // Non-blocking: chat stays readable/draftable while we keep retrying.
             // Settings / Gateway menu remain reachable without a modal lockout.
+            // Name the connection so the user knows which backend dropped.
+            const connLabel = primaryConnection?.connectionId ?? primaryConnection?.profile ?? 'default'
+            // Probe the gateway REST endpoint for code skew. The WebSocket is
+            // down but the HTTP health endpoint may still answer — a stale
+            // gateway after `hermes update` returns a boot/disk commit mismatch.
+            const isSkewed = await detectCodeSkew(primaryConnection?.baseUrl)
             notify({
-              kind: 'warning',
-              title: translateNow('boot.errors.gatewayConnectionLost'),
-              message: translateNow('boot.errors.gatewayConnectionLostDetail'),
+              kind: isSkewed ? 'error' : 'warning',
+              title: isSkewed
+                ? translateNow('boot.errors.gatewayStaleCode', { connection: connLabel })
+                : translateNow('boot.errors.gatewayConnectionLost'),
+              message: isSkewed
+                ? translateNow('boot.errors.gatewayStaleCodeDetail')
+                : translateNow('boot.errors.gatewayConnectionLostDetail'),
               durationMs: 0,
-              action: {
-                label: translateNow('boot.errors.reconnectNow'),
-                onClick: () => void reconnectGateway().catch(() => undefined)
-              },
+              action: isSkewed
+                ? {
+                    label: translateNow('notifications.actions.restartGateway'),
+                    onClick: () => void restartGateway(primaryConnection?.profile).then(
+                      () => reconnectGateway({ source: 'restart-followthrough' })
+                    ).catch(() => undefined)
+                  }
+                : {
+                    label: translateNow('boot.errors.reconnectNow'),
+                    onClick: () => void reconnectGateway().catch(() => undefined)
+                  },
               secondaryAction: RECOVERY_ACTIONS.openGateways()
             })
           }
