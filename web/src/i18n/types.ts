@@ -122,6 +122,8 @@ export interface Translations {
     managingProfileBanner?: string;
     /** NS-656 memory-pressure banner — optional, English fallback. */
     memoryOomRestartBanner?: string;
+    /** Previous life accepted a stop and died inside teardown — not a crash. */
+    memoryIncompleteStopBanner?: string;
     memoryCriticalBanner?: string;
     memoryElevatedBanner?: string;
     /** NS-656 disk-usage banner — optional, English fallback. */

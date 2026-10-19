@@ -85,6 +85,115 @@ describe("MemoryPressureBanner", () => {
     expect(banner()?.textContent).toContain("almost out of memory");
   });
 
+  it("surfaces an interrupted planned stop without calling it a restart", async () => {
+    await render(
+      <MemoryPressureBanner
+        status={statusWith({
+          pressure: "ok",
+          last_boot_incomplete_stop: true,
+          last_boot_stop_reason: "planned_stop",
+          boot_id: "2026-10-18T15:41:59+00:00",
+        })}
+      />,
+    );
+    const text = banner()?.textContent ?? "";
+    expect(text).toContain("accepted a stop request");
+    expect(text).toContain("(stop reason: planned_stop)");
+    // The whole point of the field: this is NOT the OOM-restart story.
+    expect(text).not.toContain("restarted unexpectedly");
+  });
+
+  it("omits the stop-reason suffix when the ledger recorded no reason", async () => {
+    await render(
+      <MemoryPressureBanner
+        status={statusWith({
+          pressure: "ok",
+          last_boot_incomplete_stop: true,
+        })}
+      />,
+    );
+    const text = banner()?.textContent ?? "";
+    expect(text).toContain("accepted a stop request");
+    expect(text).not.toContain("(stop reason:");
+  });
+
+  it("the OOM notice outranks an interrupted stop when both are set", async () => {
+    // An OOM inside teardown sets both flags; the memory signal is the more
+    // actionable one, so it keeps the banner and the interrupted-stop copy
+    // waits behind it.
+    await render(
+      <MemoryPressureBanner
+        status={statusWith({
+          pressure: "ok",
+          last_boot_suspected_oom: true,
+          last_boot_incomplete_stop: true,
+          last_boot_stop_reason: "planned_stop",
+        })}
+      />,
+    );
+    expect(banner()?.textContent).toContain("restarted unexpectedly");
+  });
+
+  it("an interrupted stop outranks disk elevated", async () => {
+    // Both are advisory. The stop notice is the newer, rarer signal and the
+    // disk warning is still one dismissal away, so the post-mortem wins.
+    await render(
+      <MemoryPressureBanner
+        status={statusWithDisk(
+          { pressure: "elevated", free_mb: 900 },
+          {
+            pressure: "ok",
+            last_boot_incomplete_stop: true,
+            last_boot_stop_reason: "planned_stop",
+          },
+        )}
+      />,
+    );
+    expect(banner()?.textContent).toContain("accepted a stop request");
+    expect(banner()?.textContent).toContain("(stop reason: planned_stop)");
+  });
+
+  it("an interrupted stop re-opens after dismissal on a new boot", async () => {
+    const bootA = {
+      pressure: "ok" as const,
+      last_boot_incomplete_stop: true,
+      last_boot_stop_reason: "planned_stop",
+      boot_id: "2026-10-18T15:41:59+00:00",
+    };
+    await render(<MemoryPressureBanner status={statusWith(bootA)} />);
+    const dismiss = container.querySelector(
+      '[data-testid="memory-pressure-banner"] button',
+    ) as HTMLButtonElement;
+    await act(async () => dismiss.click());
+    expect(banner()).toBeNull();
+    // Same boot: stays dismissed.
+    await rerender(<MemoryPressureBanner status={statusWith(bootA)} />);
+    expect(banner()).toBeNull();
+    // The gateway stops again and boots: a new incident, so it surfaces.
+    await rerender(
+      <MemoryPressureBanner
+        status={statusWith({
+          ...bootA,
+          boot_id: "2026-10-18T16:02:00+00:00",
+        })}
+      />,
+    );
+    expect(banner()?.textContent).toContain("accepted a stop request");
+  });
+
+  it("renders nothing when the previous life was not an interrupted stop", async () => {
+    await render(
+      <MemoryPressureBanner
+        status={statusWith({
+          pressure: "ok",
+          last_boot_incomplete_stop: false,
+          last_boot_stop_reason: null,
+        })}
+      />,
+    );
+    expect(banner()).toBeNull();
+  });
+
   it("dismissal hides the banner and persists across re-renders", async () => {
     await render(
       <MemoryPressureBanner status={statusWith({ pressure: "elevated" })} />,
