@@ -202,7 +202,11 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     # a systemd-owned PID reads as clean stop and leaves the Cloudflare origin dead).
     # Already-restarted units aren't redone.
     # A dashboard it stopped and could not bring back is a promised restart that did not happen.
-    _dashboards_down = _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
+    _manual_relaunch: list[int] = []
+    _dashboards_down = _refresh_dashboard_after_update(
+        already_restarted_units=set(restart.restarted_services),
+        manual_relaunch_out=_manual_relaunch,
+    )
     if _dashboards_down:
         restart.incomplete = True
 
@@ -295,6 +299,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
                     else None
                 ),
                 failed_respawn_pids=_dashboards_down,
+                manual_relaunch_pids=set(_manual_relaunch),
                 # A symlinked profile served by another install's checkout (#120240).
                 external_gateway_pids={row.get("pid") for row in _fleet_snapshot if row_is_external(row)},
                 live_gateway_pids=_live_gateway_pids,

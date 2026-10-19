@@ -391,6 +391,7 @@ def match_runtime_outcomes(
     plan: UpdatePlan, *, restarted_services: list, relaunched_profiles: list,
     externally_supervised_profiles: list, killed_pids: set, failed_units: list,
     stale_serve_pids: set | None = None, failed_respawn_pids: set | None = None,
+    manual_relaunch_pids: set | None = None,
     external_gateway_pids: set | None = None,
     live_gateway_pids: dict[str, set[int]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -409,7 +410,10 @@ def match_runtime_outcomes(
     probe result it remains ``unaccounted``, rather than claiming the app owns an unknown
     incarnation. ``failed_respawn_pids`` (serves the dashboard cleanup stopped and could not bring
     back) read ``failed`` before the probe, whose "gone" is exactly what a failed respawn looks like
-    (#109290). The probe itself fails closed (unreadable ledger -> every planned serve is listed as
+    (#109290). ``manual_relaunch_pids`` (serves the cleanup stopped but never ATTEMPTED to bring
+    back — Windows has no supervisor and no readable argv) read ``manual`` instead: surfaced to
+    the operator, never escalated, because no launch method on that platform could discharge the
+    obligation (#68934). The probe itself fails closed (unreadable ledger -> every planned serve is listed as
     surviving), so ``deferred`` means "not shown to be gone", not "observed alive". See #111494.
 
     ``live_gateway_pids`` (profile -> gateway PIDs alive for that profile AFTER the restart phase:
@@ -452,6 +456,7 @@ def match_runtime_outcomes(
         killed = {int(p) for p in (killed_pids or set())}
         stale_serves = {int(p) for p in stale_serve_pids} if stale_serve_pids is not None else None
         failed_respawns = {int(p) for p in (failed_respawn_pids or set())}
+        manual_relaunch = {int(p) for p in (manual_relaunch_pids or set())}
         external = {p for p in (external_gateway_pids or ()) if isinstance(p, int)}
         successors = (
             {str(profile): {p for p in pids if isinstance(p, int)} for profile, pids in live_gateway_pids.items()}
@@ -482,6 +487,10 @@ def match_runtime_outcomes(
             if r.kind in _SERVE_KINDS:
                 if killed_here:
                     return "stopped"
+                if r.pid in manual_relaunch:
+                    # Handed to the operator, not attempted: this platform has no supervisor for
+                    # it and no readable argv to replay (#68934). Never escalated.
+                    return "manual"
                 if r.pid in failed_respawns or any(_serve_unit_matches_profile(r.profile, u) for u in failed_set):
                     return "failed"
                 if stale_serves is not None and r.pid not in stale_serves:
@@ -549,6 +558,14 @@ def report_unaccounted_runtimes(outcomes: list[dict[str, Any]]) -> bool:
     exists to kill.
     """
     manual = [o for o in outcomes if o.get("outcome") == "deferred" and o.get("mechanism") == "respawn-argv"]
+    # A relaunch this platform cannot perform (Windows: no supervisor, no captured argv) is a
+    # hand-off to the operator, not a retained reminder (#68934).
+    hand = [o for o in outcomes if o.get("outcome") == "manual"]
+    if hand:
+        print()
+        print("  ⚠ No managed supervisor on this platform — relaunch by hand to pick up the update:")
+        for o in hand:
+            print(f"    • {o['kind']} [{o['profile']}] pid {o['pid']}: relaunch `hermes dashboard` / `hermes serve`")
     if manual:
         print()
         print("  ⚠ Manual serve restarts deferred to their owner (reminders retained until the old processes exit):")

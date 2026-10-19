@@ -952,3 +952,77 @@ class TestLaunchdSupervisedBackends:
         assert owning(9999, serve_argv[:-1] + ["8643"], jobs) is None
         assert owning(9999, None, jobs) is None
         assert owning(4242, None, []) is None
+
+
+# ── Windows: the win32 respawn gap (#68934) ──────────────────────────────────────────────────
+# Windows has neither systemd nor launchd, so a killed dashboard used to fall through every
+# restart branch and be booked ``unrecovered`` → ``failed_respawn_pids`` → ``restart.incomplete``
+# → a ``gateway_restart`` follow-up no launch method on Windows could ever discharge. These tests
+# pin the two halves of the fix: a restart that was never ATTEMPTED is a manual relaunch, and the
+# argv IS readable on Windows (psutil), so the normal case is attempted like any other platform.
+#
+# ``sys`` is stubbed rather than the global ``sys.platform`` so the rest of the test process (and
+# pytest's own platform checks) keep seeing the host platform.
+
+import types
+
+_WIN32_SYS = types.SimpleNamespace(platform="win32")
+_WIN32_ARGV = [
+    r"C:\Users\ama\AppData\Local\Programs\Python\Python311\python.exe",
+    r"C:\Users\ama\.hermes\bin\hermes",
+    "dashboard", "--port", "9119",
+]
+
+
+def test_win32_killed_dashboard_is_booked_manual_relaunch_not_failed(capsys):
+    """A PID Windows cannot restart must not come back as ``unrecovered`` (which sets
+    ``restart.incomplete`` and arms an unmeetable obligation)."""
+    with patch.object(dashboard_procs, "sys", _WIN32_SYS), \
+         patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
+         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
+         patch.object(dashboard_procs, "_kill_pids_windows",
+                      side_effect=lambda pids, killed, failed: killed.extend(pids)):
+        result = _kill_stale_dashboard_processes(restart_managed=True)
+
+    assert result["killed"] == [4242]
+    assert result["unrecovered"] == []
+    assert result["manual_relaunch"] == [4242]
+    assert "relaunch by hand" in capsys.readouterr().out
+
+
+def test_win32_manual_relaunch_reconciles_as_manual_and_never_escalates(capsys):
+    """The reconciled row reads ``manual`` — surfaced to the operator, never a tripwire value."""
+    from hermes_cli.update_inventory import (
+        RuntimeRecord, UpdatePlan, match_runtime_outcomes, report_unaccounted_runtimes)
+
+    plan = UpdatePlan()
+    plan.runtimes = [RuntimeRecord(kind="dashboard", profile="default", pid=4242,
+                                   supervisor="manual-serve", restart_via="respawn-argv")]
+    outcomes = match_runtime_outcomes(
+        plan, restarted_services=[], relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[], stale_serve_pids=set(), manual_relaunch_pids={4242},
+    )
+
+    assert outcomes[0]["outcome"] == "manual"
+    assert report_unaccounted_runtimes(outcomes) is False
+    assert "relaunch by hand" in capsys.readouterr().out
+
+
+def test_dashboard_cleanup_records_manual_relaunch_as_skip(capsys):
+    """The receipt records a skip with the PIDs, and the update does not claim a failed respawn."""
+    stub = MagicMock()
+    stub._kill_stale_dashboard_processes.return_value = {
+        "matched": [4242], "killed": [4242], "failed": [], "unrecovered": [],
+        "manual_relaunch": [4242]}
+    skips: list[tuple[str, str]] = []
+    out: list[int] = []
+    with patch("hermes_cli.update_cmd._m", return_value=stub), \
+         patch("hermes_cli.update_cmd._record_update_skip",
+               side_effect=lambda step, reason: skips.append((step, reason))):
+        unrecovered = update_cmd_maint._refresh_dashboard_after_update(manual_relaunch_out=out)
+
+    assert unrecovered == set()
+    assert out == [4242]
+    assert [s[0] for s in skips] == ["dashboard_cleanup"]
+    assert "4242" in skips[0][1]
+    assert "could not be auto-restarted" not in capsys.readouterr().out

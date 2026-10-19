@@ -268,16 +268,25 @@ def _finish_dashboard_update_cleanup(
     stop_for_relaunch()
 
 
-def _refresh_dashboard_after_update(*, already_restarted_units: set[str] | None = None) -> set[int]:
+def _refresh_dashboard_after_update(
+    *, already_restarted_units: set[str] | None = None,
+    manual_relaunch_out: list[int] | None = None,
+) -> set[int]:
     """Refresh managed dashboards or stop stale manual ones after an update; returns the PIDs it
     stopped and could not bring back, so the receipt records them ``failed`` (#109290).
 
     *already_restarted_units*: systemd unit names (no ``.service``) the fleet-restart loop
     already restarted, so a Serve-only install isn't restarted a second time here.
 
+    *manual_relaunch_out*: when supplied, filled with the PIDs this platform has no way to
+    restart (Windows: no supervisor, no captured argv) and therefore never ATTEMPTED. Those are
+    recorded as a receipt skip and reconciled as ``deferred`` — never as a failed respawn, which
+    armed a ``gateway_restart`` obligation no launch method on that platform could discharge
+    (#68934). They are deliberately absent from the return value.
+
     See #83595.
     """
-    from hermes_cli.update_cmd import _m, _record_update_step
+    from hermes_cli.update_cmd import _m, _record_update_skip, _record_update_step
     from hermes_constants import get_hermes_home
 
     try:
@@ -298,6 +307,17 @@ def _refresh_dashboard_after_update(*, already_restarted_units: set[str] | None 
         print("    hermes dashboard --port <port>   (or: systemctl --user restart hermes-dashboard)")
         return set()
     unrecovered = {int(pid) for pid in stop_result.get("unrecovered") or ()}
+    manual_relaunch = {int(pid) for pid in stop_result.get("manual_relaunch") or ()}
+    if manual_relaunch:
+        if manual_relaunch_out is not None:
+            manual_relaunch_out.extend(sorted(manual_relaunch))
+        # Visible in the receipt, but never a failed step: this platform never attempted the
+        # restart, so treating it as a failure made every Windows update report one (#68934).
+        _record_update_skip(
+            "dashboard_cleanup",
+            "no managed supervisor on this platform; relaunch "
+            + ", ".join(str(pid) for pid in sorted(manual_relaunch)) + " by hand",
+        )
     if not unrecovered:
         return unrecovered
 

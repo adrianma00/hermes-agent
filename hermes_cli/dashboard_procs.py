@@ -678,10 +678,11 @@ def _kill_stale_dashboard_processes(
     for pid, err_msg in failed:
         print(f"    ✗ failed to stop PID {pid}: {err_msg}")
     if killed and restart_managed:
-        unrecovered = _restart_killed_backends(
+        unrecovered, manual_relaunch = _restart_killed_backends(
             killed, pid_service, pid_cgroup, pid_cmdline, pid_home, pid_launchd=pid_launchd)
     else:
         unrecovered = list(killed)
+        manual_relaunch = []
         # A stopped launchd job with KeepAlive restarts itself: say so instead of a misleading
         # "restart it yourself" hint, and give the command that actually keeps it down.
         for target in sorted({f"{d}/{l}" for p in killed if (j := pid_launchd.get(p)) for d, l, _ in (j,)}):
@@ -690,22 +691,29 @@ def _kill_stale_dashboard_processes(
         if any(p not in pid_launchd for p in killed):
             print("  Restart the dashboard when you're ready:\n    hermes dashboard --port <port>")
     return {"matched": list(pids), "killed": list(killed), "failed": list(failed),
-            "unrecovered": list(unrecovered)}
+            "unrecovered": list(unrecovered), "manual_relaunch": list(manual_relaunch)}
 
 
 def _restart_killed_backends(
     killed: list[int], pid_service: dict[int, str | None], pid_cgroup: dict[int, str | None],
     pid_cmdline: dict[int, list[str]], pid_home: dict[int, str | None], *,
-    pid_launchd: dict[int, tuple[str, str, int | None]] | None = None) -> list[int]:
+    pid_launchd: dict[int, tuple[str, str, int | None]] | None = None) -> tuple[list[int], list[int]]:
     """Update path: restart systemd units, kickstart launchd jobs (macOS), respawn manual argv
     (detached, headless, logged to logs/dashboard-restart.log; one per profile, no ``--port 0``).
-    Returns PIDs not brought back."""
+
+    Returns ``(unrecovered, manual_relaunch)``: PIDs a restart was ATTEMPTED for and failed, and
+    PIDs this platform has no way to bring back (Windows, no supervisor, no captured argv) that an
+    operator must relaunch by hand. The two are deliberately separate — booking the second as the
+    first armed a ``gateway_restart`` obligation no launch method on Windows could discharge
+    (#68934).
+    """
     # Two categories: Without this, a remote backend (hermes serve) under Restart=on-failure never comes
     # back after our clean SIGTERM, and the Desktop can't reconnect (#68934). Filtered so Desktop
     # ``serve|dashboard --port 0`` backends are not resurrected and duplicates collapse to one per profile
     # (#78821).
     from hermes_cli import main_dashboard as _dash
     unrecovered: list[int] = []
+    manual_relaunch: list[int] = []
     failed_restarts: list[tuple[str, str]] = []
     seen_services: set[str] = set()
     respawn_candidates: list[tuple[int, list[str], str | None]] = []
@@ -741,6 +749,12 @@ def _restart_killed_backends(
                 unrecovered.append(pid)
         elif pid in pid_cmdline:
             respawn_candidates.append((pid, pid_cmdline[pid], pid_home.get(pid)))
+        elif sys.platform == "win32":
+            # Nothing to hand this PID back to: Windows has neither systemd nor launchd, and no
+            # argv was captured (the process was elevated, owned by another user, or already
+            # gone). An operator relaunches it; that is a manual step, not a failed restart
+            # (#68934).
+            manual_relaunch.append(pid)
         else:
             unrecovered.append(pid)
     for svc, err in failed_restarts:
@@ -751,7 +765,10 @@ def _restart_killed_backends(
         unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
     if failed_restarts or unrecovered:
         print("  Restart anything not auto-restarted when you're ready:\n    hermes dashboard --port <port>")
-    return unrecovered
+    if manual_relaunch:
+        print("  ⚠ No managed supervisor on this platform — relaunch by hand to pick up the update:\n"
+              "    hermes dashboard --port <port>")
+    return unrecovered, manual_relaunch
 
 
 def _norm_exe(path) -> str:
