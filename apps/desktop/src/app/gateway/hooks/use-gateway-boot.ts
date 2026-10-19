@@ -644,7 +644,16 @@ export function useGatewayBoot({
               action: isSkewed
                 ? {
                     label: translateNow('settings.models.restartBackend'),
-                    onClick: requestBackendRestart
+                    // Call recycleBackend directly, the way the Models page does
+                    // (#97067). requestBackendRestart branches on
+                    // `$connection.mode === 'remote'` and would only reconnect —
+                    // an SSH serve is 'remote' but IS desktop-owned, so it needs
+                    // the real recycle (teardown SSH serve + respawn).
+                    onClick: () => {
+                      void window.hermesDesktop
+                        ?.recycleBackend?.(primaryConnection?.profile)
+                        .catch(() => undefined)
+                    }
                   }
                 : {
                     label: translateNow('boot.errors.reconnectNow'),
