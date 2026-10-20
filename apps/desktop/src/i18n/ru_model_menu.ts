@@ -3,6 +3,7 @@ export const ruModelMenu = {
   noModels: 'Модели не найдены',
   editModels: 'Изменить модели…',
   staleBackend: 'Устаревший бэкенд — перезапустить',
+  restartingBackend: 'Перезапуск…',
   followDefault: 'Использовать модель по умолчанию из настроек',
   refreshModels: 'Обновить модели',
   favorites: 'Избранное',

@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
+import { clearCodeSkew } from '@/store/code-skew'
 import { $freshSessionRequest, refreshActiveProfile } from '@/store/profile'
 
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
@@ -95,5 +96,13 @@ export function useGatewayScopeRefresh(
     void refreshHermesConfig(true)
     void refreshActiveProfile()
     resetProjectTreeState()
+    // A skew verdict describes ONE backend's process, so it cannot outlive the
+    // scope it came from. Without this, switching from a skewed gateway to
+    // another connection left the pill and the model menu painting "stale code"
+    // for a backend no longer in view — and the probe cannot correct it, because
+    // it reads the connection you are NOW attached to, which has a different
+    // (and possibly clean) revision. `null` = not asked yet, which renders the
+    // ordinary state until this scope's own probe answers.
+    clearCodeSkew()
   }, [gatewayScope, refreshCurrentModel, refreshHermesConfig])
 }

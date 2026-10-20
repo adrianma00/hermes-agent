@@ -3,6 +3,7 @@ export const jaModelMenu = {
   noModels: 'モデルが見つかりません',
   editModels: 'モデルを編集…',
   staleBackend: '古いバックエンド — 再起動',
+  restartingBackend: '再起動中…',
   followDefault: '設定のデフォルトを使用',
   refreshModels: 'モデルを更新',
   favorites: 'お気に入り',

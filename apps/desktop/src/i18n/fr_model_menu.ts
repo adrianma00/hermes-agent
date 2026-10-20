@@ -3,6 +3,7 @@ export const frModelMenu = {
   noModels: 'Aucun modèle trouvé',
   editModels: 'Modifier les modèles…',
   staleBackend: 'Backend obsolète – redémarrer',
+  restartingBackend: 'Redémarrage…',
   followDefault: 'Utiliser le modèle par défaut des Réglages',
   refreshModels: 'Actualiser les modèles',
   favorites: 'Favoris',

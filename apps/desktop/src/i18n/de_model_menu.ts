@@ -3,6 +3,7 @@ export const deModelMenu = {
   noModels: 'Keine Modelle gefunden',
   editModels: 'Modelle bearbeiten…',
   staleBackend: 'Veralteter Backend – neu starten',
+  restartingBackend: 'Neustart…',
   followDefault: 'Standard aus den Einstellungen verwenden',
   refreshModels: 'Modelle aktualisieren',
   favorites: 'Favoriten',
