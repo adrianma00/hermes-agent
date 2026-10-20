@@ -52,6 +52,10 @@ const KITTY_FLAGS_RE = /^\x1b\[\?(\d+)u$/
 // without the ? marker fall through to parseKeypress to preserve F3.
 // eslint-disable-next-line no-control-regex
 const CURSOR_POSITION_RE = /^\x1b\[(\??)(\d+);(\d+)R$/
+// Host color scheme report: CSI ? 997 ; 1 n (dark) / CSI ? 997 ; 2 n (light).
+// Sent unsolicited when DEC 2031 is enabled and the host appearance changes.
+// eslint-disable-next-line no-control-regex
+const APPEARANCE_RE = /^\x1b\[\?997;([12])n$/
 // OSC response: OSC code ; data (BEL|ST)
 // eslint-disable-next-line no-control-regex
 const OSC_RESPONSE_RE = /^\x1b\](\d+);(.*?)(?:\x07|\x1b\\)$/s
@@ -112,6 +116,9 @@ export type TerminalResponse =
   /** XTVERSION: terminal name/version string (answer to CSI > 0 q).
    *  Example values: "xterm.js(5.5.0)", "ghostty 1.2.0", "iTerm2 3.6". */
   | { type: 'xtversion'; name: string }
+  /** Host color scheme report (DEC 2031): sent unsolicited when the
+   *  terminal detects a light/dark mode change. */
+  | { type: 'appearance'; scheme: 'dark' | 'light' }
 
 /**
  * Try to recognize a sequence token as a terminal response.
@@ -141,6 +148,13 @@ function parseTerminalResponse(s: string): TerminalResponse | null {
 
     if ((m = DA2_RE.exec(s))) {
       return { type: 'da2', params: splitNumericParams(m[1]!) }
+    }
+
+    if ((m = APPEARANCE_RE.exec(s))) {
+      return {
+        type: 'appearance',
+        scheme: m[1] === '1' ? 'dark' : 'light'
+      }
     }
 
     if ((m = KITTY_FLAGS_RE.exec(s))) {

@@ -21,10 +21,11 @@ import {
 import reconciler from '../reconciler.js'
 import { clearSelection, finishSelection, hasSelection, type SelectionState, startSelection } from '../selection.js'
 import { getTerminalFocused, setTerminalFocused } from '../terminal-focus-state.js'
-import { decrqm, oscColor, TerminalQuerier, xtversion } from '../terminal-querier.js'
+import { decrqm, enableMode2031, oscColor, TerminalQuerier, xtversion } from '../terminal-querier.js'
 import {
   isXtermJs,
   parseOscColor,
+  setHostAppearance,
   setTerminalBackgroundHex,
   setTerminalForegroundHex,
   setXtversionName,
@@ -354,6 +355,11 @@ export default class App extends PureComponent<Props, State> {
         // init sequence completes — avoids interleaving with alt-screen/mouse
         // tracking enable writes that may happen in the same render cycle.
         setImmediate(() => {
+          // Enable DEC 2031 so the terminal pushes unsolicited CSI ? 997
+          // appearance reports on light/dark mode switches. Harmless no-op
+          // on terminals that don't support it.
+          this.props.stdout.write(enableMode2031())
+
           // OSC 11 + OSC 10 ride the same batch: the terminal's actual
           // background drives light/dark theme detection where env heuristics
           // (COLORFGBG, TERM_PROGRAM) are blind — notably xterm.js hosts. The
@@ -708,7 +714,14 @@ function processKeysInBatch(app: App, items: ParsedInput[], _unused1: undefined,
     // Terminal responses (DECRPM, DA1, OSC replies, etc.) are not user
     // input — route them to the querier to resolve pending promises.
     if (item.kind === 'response') {
-      app.querier.onResponse(item.response)
+      // Unsolicited host appearance reports (CSI ? 997 ; n) must be
+      // handled BEFORE the querier — they have no matching pending query,
+      // so the querier would silently drop them.
+      if (item.response.type === 'appearance') {
+        setHostAppearance(item.response.scheme)
+      } else {
+        app.querier.onResponse(item.response)
+      }
 
       continue
     }

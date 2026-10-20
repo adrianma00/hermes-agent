@@ -32,6 +32,7 @@ export {
   isXtermJs,
   onTerminalBackground,
   onTerminalForeground,
+  onHostAppearance,
   parseOscColor,
   terminalBackgroundHex,
   terminalForegroundHex

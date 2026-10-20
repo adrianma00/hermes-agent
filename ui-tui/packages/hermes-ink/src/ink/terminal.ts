@@ -237,6 +237,30 @@ function reportedColorSlot(): ReportedColorSlot {
 const background = reportedColorSlot()
 const foreground = reportedColorSlot()
 
+// -- Host appearance (DEC 2031) --
+// Unsolicited CSI ? 997 ; n reports fire whenever the terminal detects
+// a light/dark mode switch. Unlike the color slots, this is NOT
+// first-writer-wins — appearance can change any number of times.
+
+type AppearanceListener = (scheme: 'dark' | 'light') => void
+
+const appearanceListeners = new Set<AppearanceListener>()
+
+/** Notify listeners of a host appearance change. Called by App.tsx when
+ *  it parses an unsolicited CSI ? 997 ; n response from the terminal. */
+export const setHostAppearance = (scheme: 'dark' | 'light'): void => {
+  for (const listener of appearanceListeners) {
+    listener(scheme)
+  }
+}
+
+/** Subscribe to host appearance changes. The listener fires immediately
+ *  for every unsolicited CSI ? 997 report the terminal sends — no startup
+ *  query, no one-shot semantics. */
+export const onHostAppearance = (listener: AppearanceListener): void => {
+  appearanceListeners.add(listener)
+}
+
 /** Record the OSC 11 response. */
 export const setTerminalBackgroundHex = (hex: string): void => background.set(hex)
 
