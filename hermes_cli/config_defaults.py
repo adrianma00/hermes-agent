@@ -838,6 +838,10 @@ DEFAULT_CONFIG = {
         # Interface bare `hermes`/`hermes chat` launches: "cli" (prompt_toolkit REPL) | "tui" (Ink).
         # Flags win: `--cli` forces the REPL, `--tui` / HERMES_TUI=1 forces the TUI.
         "interface": "cli",
+        # TUI light/dark mode pin: "auto" (auto-detect) | "light" | "dark". Read by the TUI's
+        # /theme command and now also by the classic CLI's light-mode detection. A non-auto value
+        # is bridged into HERMES_TUI_THEME at CLI startup so every surface sees it.
+        "tui_theme": "auto",
         # Native TUI uses the terminal's primary buffer and scrollback instead of the custom
         # alternate-screen viewport. Flags win: `--native` / `--tui-native` and `--cli`.
         "tui_native": False,
