@@ -19,7 +19,7 @@ import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { runGatewayRestart } from '@/store/system-actions'
+import { $gatewayRestarting, runGatewayRestart } from '@/store/system-actions'
 import {
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -271,9 +271,11 @@ export function ModelCatalogMenu({
   // owner of the connection the skew verdict came from, so this scopes the
   // restart to the backend that actually reported the stale code.
   const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
-  // Guards the row against a second click while the restart is in flight: the
-  // restart takes seconds, and a menu left open read as "nothing happened".
-  const [restartingBackend, setRestartingBackend] = useState(false)
+  const [restartInFlight, setRestartInFlight] = useState(false)
+  // `$gatewayRestarting` covers restarts started anywhere — the pill's own power
+  // button, messaging — so the row also shows it is working for those, instead of
+  // sitting there looking clickable while the backend it names is already down.
+  const restartingBackend = useStore($gatewayRestarting) || restartInFlight
   const customModels = useStore($customModels)
   // Favorite models, same reasoning as the shortlist above: one global
   // preference owned by the catalog, so the composer pill, session tiles and
@@ -959,16 +961,16 @@ export function ModelCatalogMenu({
               return
             }
 
-            setRestartingBackend(true)
+            setRestartInFlight(true)
             // Close on click: the action is taken, and a menu left open looks
             // like nothing happened (this is how the row got clicked three times
             // before the restart was noticed).
             closeMenu()
-            void runGatewayRestart(activeProfile).finally(() => setRestartingBackend(false))
+            void runGatewayRestart(activeProfile).finally(() => setRestartInFlight(false))
           }}
         >
           <Codicon name="warning" size="0.75rem" />
-          {copy.staleBackend}
+          {restartingBackend ? copy.restartingBackend : copy.staleBackend}
         </DropdownMenuItem>
       ) : null}
     </>

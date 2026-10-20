@@ -1,9 +1,18 @@
 const mocks = vi.hoisted(() => ({
   recycleBackend: vi.fn(async () => ({ ok: true })),
-  runGatewayRestart: vi.fn(async () => true)
+  runGatewayRestart: vi.fn(async () => true),
+  gatewayRestarting: null as null | { get: () => boolean; set: (v: boolean) => void }
 }))
 
-vi.mock('@/store/system-actions', () => ({ runGatewayRestart: mocks.runGatewayRestart }))
+vi.mock('@/store/system-actions', async (): Promise<object> => {
+  const { atom } = await import('nanostores')
+
+  // One atom, created once and kept on `mocks` — the component and the tests
+  // must read the SAME instance, or a test sets an atom nothing renders from.
+  mocks.gatewayRestarting ??= atom(false)
+
+  return { $gatewayRestarting: mocks.gatewayRestarting, runGatewayRestart: mocks.runGatewayRestart }
+})
 
 vi.mock('@/store/profile', async (): Promise<object> => {
   const { atom } = await import('nanostores')
@@ -98,6 +107,7 @@ afterEach(() => {
   queryClient.setQueryData(localModelsKey(localModelsOwner(), 'jobs'), [])
   $defaultReasoningEffort.set('')
   $codeSkewed.set(null)
+  mocks.gatewayRestarting?.set(false)
   closeMenu.mockClear()
   vi.clearAllMocks()
 })
@@ -836,5 +846,35 @@ describe('the stale-backend row', () => {
     await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalledTimes(1))
 
     release(true)
+  })
+
+  it('shows it is working while the restart runs, instead of looking inert', async () => {
+    // The row used to sit unchanged for the seconds the restart takes, which
+    // read as a dead click. It now relabels itself for the in-flight window.
+    let release = (_ok: boolean) => {}
+    mocks.runGatewayRestart.mockImplementation(() => new Promise<boolean>(resolve => { release = resolve }))
+    $codeSkewed.set(true)
+
+    renderMenu()
+
+    fireEvent.click(await screen.findByText(staleLabel))
+
+    expect(await screen.findByText('Restarting…')).toBeTruthy()
+    expect(screen.queryByText(staleLabel)).toBeNull()
+
+    release(true)
+  })
+
+  it('reflects a restart started elsewhere, not just its own click', async () => {
+    // The pill's power button and messaging also restart the gateway. The row
+    // names that backend, so it must not look actionable while it is down.
+    mocks.runGatewayRestart.mockClear()
+    $codeSkewed.set(true)
+    mocks.gatewayRestarting?.set(true)
+
+    renderMenu()
+
+    expect(await screen.findByText('Restarting…')).toBeTruthy()
+    expect(screen.queryByText(staleLabel)).toBeNull()
   })
 })

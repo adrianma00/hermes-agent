@@ -3,6 +3,7 @@ export const zhModelMenu = {
   noModels: '未找到模型',
   editModels: '编辑模型…',
   staleBackend: '后端代码陈旧 — 重启',
+  restartingBackend: '重启中…',
   followDefault: '使用设置中的默认模型',
   refreshModels: '刷新模型',
   favorites: '收藏',

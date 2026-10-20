@@ -3,6 +3,7 @@ export interface ModelMenuTranslations {
   noModels: string
   editModels: string
   staleBackend: string
+  restartingBackend: string
   followDefault: string
   refreshModels: string
   favorites: string
