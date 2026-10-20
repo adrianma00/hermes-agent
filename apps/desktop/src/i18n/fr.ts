@@ -4663,6 +4663,7 @@ export const frOverrides = {
       gatewayConnecting: 'connexion',
       gatewayOffline: 'hors ligne',
       gatewayRestarting: 'redémarrage…',
+      staleCode: 'code obsolète – redémarrer',
       gatewayTitle: 'Gateway',
       customizeTitle: "Afficher dans la barre d'état",
       hideStatusbar: "Masquer la barre d'état",

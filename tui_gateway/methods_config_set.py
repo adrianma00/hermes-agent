@@ -105,6 +105,38 @@ def _cfgset_guarded(fn):
     return setter
 
 
+def _skew_switch_confirm(rid, key, value, confirmed: bool, session) -> dict | None:
+    """Refuse-with-confirm when this process is serving stale code, else None.
+
+    ``config.set model`` was the ONE model-switch entry point with no skew guard:
+    the dashboard's picker (``_dashboard_code_skew_guard``), the typed ``/model``
+    command (``_model_switch_skew_guard``) and the ``model.options`` /
+    ``model.save_key`` RPCs (``_model_skew_err``) all refuse, while the Desktop's
+    bottom-bar picker dispatched straight into ``switch_model()`` — the exact
+    post-``hermes update`` lazy-import hazard the other three exist to prevent.
+    The symptom is a switch that appears to do nothing and then reverts.
+
+    Shape mirrors the selection guards rather than ``_model_skew_err``: a
+    ``confirm_required`` envelope, so the user gets a real choice. They may take
+    the restart, or continue anyway — the same "resend with
+    ``confirm_expensive_model``" round-trip the expensive-model prompt uses, so
+    there is no new client contract to learn.
+    """
+    if confirmed:
+        return None
+    from gateway.code_skew import detect_code_skew
+
+    skew = detect_code_skew()
+    if not skew:
+        return None
+    boot_rev, disk_rev = skew
+    from agent.i18n import t
+
+    message = t("gateway.model.error_prefix", error=t(
+        "gateway.model.err_skew", boot_rev=boot_rev, disk_rev=disk_rev))
+    return _cfgset_model_ok(rid, key, value, message, message, deferred=False)
+
+
 # ── per-key handlers
 
 @_cfgset_guarded
@@ -113,6 +145,8 @@ def _set_model(rid, params, key, value, session):
     if not value:
         return _err(rid, 4002, "model value required")
     confirmed = bool(params.get("confirm_expensive_model", False))
+    if skew_reply := _skew_switch_confirm(rid, key, value, confirmed, session):
+        return skew_reply
     if session:
         from hermes_cli.model_switch import parse_model_switch_args
         sid = params.get("session_id", "")

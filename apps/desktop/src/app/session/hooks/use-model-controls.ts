@@ -7,6 +7,7 @@ import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
+import { isModelSwitchSkewConfirm } from '@/lib/code-skew-error'
 import {
   customDefaultSupersedesPick,
   moaPickRemoved,
@@ -435,7 +436,22 @@ export function useModelControls({
               if (repaint && !(touchesPrimary && $activeSessionId.get() !== liveSessionId)) {
                 restoreSnapshot(repaint)
               }
-            }
+            },
+            // The backend reporting code skew here is the same condition the
+            // status-bar pill paints. Offer the restart IN this dialog rather
+            // than sending the user to Settings → Models: the pick they just
+            // made is the reason they are being asked. Engaged ONLY for the
+            // skew message — every other guard keeps its apply/cancel pair.
+            skew: isModelSwitchSkewConfirm(result.confirm_message)
+              ? {
+                  continueLabel: copy.modelSwitchConfirmLabel,
+                  onRestart: () => {
+                    restoreSnapshot(restored)
+                    void window.hermesDesktop?.recycleBackend?.(touchesPrimary ? null : liveSessionId)
+                  },
+                  restartLabel: t.settings.model.restartBackend
+                }
+              : undefined
           })
 
           return false

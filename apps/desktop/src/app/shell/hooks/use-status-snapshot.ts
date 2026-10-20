@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { getStatus } from '@/hermes'
 import { type I18nContextValue, useI18n } from '@/i18n'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { refreshCodeSkew } from '@/store/code-skew'
 import { $freeTierStatus, refreshFreeTierStatus, setFreeTierRoute } from '@/store/free-tier'
 import { $setupReadyTick } from '@/store/live-sync'
 import { dismissNotification, notify } from '@/store/notifications'
@@ -148,8 +149,14 @@ export function useStatusSnapshot(
         // allowed a slow runtime check to overlap with later polls, which
         // multiplied load on an already-busy gateway and let stale failures
         // race newer healthy results.
+        //
+        // The skew probe rides EVERY round, not only the readiness ones: a
+        // `hermes update` can land at any moment while the app stays connected,
+        // and the pill is the one surface that must not keep saying "ready" for
+        // it. It is a bounded read of a field the server already computes.
         const [statusResult] = await Promise.allSettled([
           getStatus(),
+          refreshCodeSkew(),
           readiness ? refreshReadiness() : Promise.resolve()
         ])
 

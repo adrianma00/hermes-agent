@@ -3660,6 +3660,7 @@ export interface Translations extends NoticeTranslations {
       gatewayConnecting: string
       gatewayOffline: string
       gatewayRestarting: string
+      staleCode: string
       gatewayTitle: string
       customizeTitle: string
       hideStatusbar: string

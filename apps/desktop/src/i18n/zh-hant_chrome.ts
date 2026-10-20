@@ -365,6 +365,7 @@ export const zhHantChrome = {
       gatewayConnecting: '連線中',
       gatewayOffline: '離線',
       gatewayRestarting: '重新啟動中…',
+      staleCode: '程式碼過舊，需重新啟動',
       gatewayTitle: '閘道',
       agents: '代理',
       closeAgents: '關閉代理',

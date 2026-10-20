@@ -23,6 +23,20 @@ export function ReasoningMenuPanel(props: ModelMenuHostProps) {
   const { model, provider } = controller.current
   const caps = currentModelCapabilities(modelOptions.data, provider, model)
 
+  // The catalog read is what discovers a backend running stale code (its
+  // `model.options` refuses with the skew message). Surface it here too: the
+  // effort menu shares the same fetch, and silently showing effort rows for a
+  // backend that cannot apply them is the same trap the model menu fixes.
+  const error = modelOptions.error ? modelOptions.error.message : null
+
+  if (error) {
+    return (
+      <DropdownMenuItem className={dropdownMenuRow} disabled>
+        {error}
+      </DropdownMenuItem>
+    )
+  }
+
   if (!model) {
     return (
       <DropdownMenuItem className={dropdownMenuRow} disabled>

@@ -448,6 +448,7 @@ export const arChrome = {
       gatewayConnecting: 'جار اتصال البوابة',
       gatewayOffline: 'البوابة غير متصلة',
       gatewayRestarting: 'جار إعادة التشغيل...',
+      staleCode: 'كود قديم — يلزم إعادة التشغيل',
       gatewayTitle: 'البوابة',
       agents: 'الوكلاء',
       closeAgents: 'إغلاق الوكلاء',

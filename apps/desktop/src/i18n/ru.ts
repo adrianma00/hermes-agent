@@ -3332,6 +3332,7 @@ export const ruOverrides = {
       gatewayConnecting: 'подключение',
       gatewayOffline: 'недоступен',
       gatewayRestarting: 'перезапуск…',
+      staleCode: 'старый код — нужен перезапуск',
       gatewayTitle: 'Шлюз',
       customizeTitle: 'Показывать в статус-баре',
       hideStatusbar: 'Скрыть статус-бар',

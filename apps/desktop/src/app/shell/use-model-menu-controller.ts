@@ -87,7 +87,15 @@ export function useModelMenuController({
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, activeSessionId, ownerConnectionId),
     queryFn: (): Promise<ModelOptionsResult> =>
-      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId }),
+    // The menu opens to DISCOVER the backend's state, so a cached success must
+    // not answer for it: with the app-wide 60s `staleTime`, a menu opened inside
+    // that window reuses a pre-skew catalog and never sees the refusal — the
+    // guard runs and shows nothing, which is how "the menu said nothing about
+    // the skew" happens even though the refusal is implemented. Revalidate on
+    // open (React Query dedupes concurrent mounts, so this is one fetch).
+    refetchOnMount: 'always',
+    staleTime: 0
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
