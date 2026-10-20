@@ -1,7 +1,7 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'
-import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedTicketEndpoint, runGatewayEnsure } from './local-gateway'
+import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, localGatewayRestartTarget, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedTicketEndpoint, runGatewayEnsure } from './local-gateway'
 import { closeGatewayTicketBridges, createGatewayTicketResolver } from './local-gateway-python'
 const localGatewayDials = createLocalGatewayDials()
 configurePythonGatewayTicketClient(createGatewayTicketResolver(
@@ -11927,6 +11927,20 @@ async function restartAttachedLocalGateway(profile: string): Promise<void> {
 
   if (endpoint) {
     await restartLocalGatewayOwner(gatewayOwnerProfile(endpoint))
+
+    return
+  }
+
+  // No descriptor to name the owner from. This is the state a dropped connection
+  // leaves behind — the descriptor that would have answered was invalidated by the
+  // very failure the user is trying to recover from — so falling through here made
+  // "Restart backend" a silent no-op exactly when it was offered. Fall back to the
+  // profile name: `gateway restart` resolves a served secondary to its host
+  // multiplexer on its own, and a remote backend has no local gateway to restart.
+  const target = localGatewayRestartTarget(profile, primaryProfileKey(), p => profileHasRemoteOverride(p) || globalRemoteActive())
+
+  if (target) {
+    await restartLocalGatewayOwner(target)
   }
 }
 

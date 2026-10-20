@@ -82,6 +82,28 @@ export function gatewayOwnerProfile(endpoint: GatewayEndpoint): string {
   return path.basename(path.dirname(home)) === 'profiles' ? path.basename(home) : 'default'
 }
 
+/**
+ * The profile whose local gateway a recycle should restart when there is no cached descriptor to
+ * read the owner from, or null when this profile has no local gateway at all.
+ *
+ * A dropped connection invalidates its descriptor, so the endpoint that normally names the owner is
+ * gone precisely when a restart is most needed: without this fallback "Restart backend" (Models page
+ * and the connection-lost toast) read no endpoint and silently did nothing. Naming the profile is
+ * enough — `hermes gateway restart` resolves a served secondary to its host multiplexer itself
+ * (`hermes_cli/gateway_profile_lifecycle.profile_lifecycle`), so the CLI is the better owner lookup.
+ * A remote/SSH backend must keep returning null: it has no local gateway to restart.
+ */
+export function localGatewayRestartTarget(
+  profile: string,
+  primaryProfile: string,
+  isRemote: (profile: string) => boolean
+): null | string {
+  const key = String(profile ?? '').trim()
+  const target = !key || key === primaryProfile ? primaryProfile : key
+
+  return isRemote(target) ? null : target
+}
+
 /** One restart per (owner process, stale gateway, client) per Desktop process. An owner a restart cannot move
  *  (a service unit pinned to another checkout) is then attached as-is instead of being restarted
  *  on every dial. */
