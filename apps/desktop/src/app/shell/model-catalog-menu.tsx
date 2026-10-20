@@ -18,8 +18,8 @@ import { ProviderStatusChip } from '@/components/provider-status-chip'
 import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
-import { reconnectGateway } from '@/store/gateway-reconnect'
-import { $connection } from '@/store/session'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { runGatewayRestart } from '@/store/system-actions'
 import {
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -267,6 +267,13 @@ export function ModelCatalogMenu({
   // Read here rather than fetched: the condition is already known app-wide, and
   // the picker never sends a switch RPC for a server-side guard to catch.
   const skewed = useStore($codeSkewed) === true
+  // The profile whose gateway would be restarted. `$activeGatewayProfile` is the
+  // owner of the connection the skew verdict came from, so this scopes the
+  // restart to the backend that actually reported the stale code.
+  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  // Guards the row against a second click while the restart is in flight: the
+  // restart takes seconds, and a menu left open read as "nothing happened".
+  const [restartingBackend, setRestartingBackend] = useState(false)
   const customModels = useStore($customModels)
   // Favorite models, same reasoning as the shortlist above: one global
   // preference owned by the catalog, so the composer pill, session tiles and
@@ -936,21 +943,28 @@ export function ModelCatalogMenu({
       {skewed ? (
         <DropdownMenuItem
           className={cn(dropdownMenuRow, 'text-destructive focus:text-destructive')}
+          disabled={restartingBackend}
           onSelect={event => {
             event.preventDefault()
 
-            // A remote connection (Em, an SSH box) has no local backend to
-            // recycle — recycling here would restart THIS machine's gateway
-            // while the user is pointed somewhere else, which is worse than
-            // doing nothing. Reconnect the remote instead, the way the
-            // backend-restart request already does it.
-            if ($connection.get()?.mode === 'remote') {
-              void reconnectGateway()
-
+            // Scoped restart, not a whole-backend recycle. `runGatewayRestart`
+            // takes down only the gateway that owns this profile — the same
+            // primitive the backend-status menu's power button uses — and it
+            // reconnects through a socket probe afterwards, so a restart that
+            // never touched another profile's backend leaves its connection up.
+            // recycleBackend tears down the app-wide primary connection slot
+            // instead, which drags every other profile down with it and can
+            // surface "Gateway starting (deadline)" once the app re-dials.
+            if (restartingBackend) {
               return
             }
 
-            void window.hermesDesktop?.recycleBackend?.()
+            setRestartingBackend(true)
+            // Close on click: the action is taken, and a menu left open looks
+            // like nothing happened (this is how the row got clicked three times
+            // before the restart was noticed).
+            closeMenu()
+            void runGatewayRestart(activeProfile).finally(() => setRestartingBackend(false))
           }}
         >
           <Codicon name="warning" size="0.75rem" />

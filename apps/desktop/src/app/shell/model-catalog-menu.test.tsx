@@ -1,11 +1,18 @@
-const mocks = vi.hoisted(() => ({ reconnectGateway: vi.fn(async () => {}) }))
+const mocks = vi.hoisted(() => ({
+  recycleBackend: vi.fn(async () => ({ ok: true })),
+  runGatewayRestart: vi.fn(async () => true)
+}))
 
-vi.mock('@/store/gateway-reconnect', () => ({ reconnectGateway: mocks.reconnectGateway }))
+vi.mock('@/store/system-actions', () => ({ runGatewayRestart: mocks.runGatewayRestart }))
 
 vi.mock('@/store/profile', async (): Promise<object> => {
   const { atom } = await import('nanostores')
 
-  return { $activeGatewayProfile: atom<string>('default') }
+  return {
+    $activeGatewayProfile: atom<string>('default'),
+    // Mirrors the real helper: a profile key is trimmed, '' for absent.
+    normalizeProfileKey: (value: null | string | undefined) => String(value ?? '').trim()
+  }
 })
 vi.mock('@/store/session', async (): Promise<object> => {
   const { atom } = await import('nanostores')
@@ -26,7 +33,6 @@ import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { localModelsKey, localModelsOwner } from '@/store/local-runtime-jobs'
 import { setShowModelPricing } from '@/store/model-pricing'
-import { $connection } from '@/store/session'
 import {
   $modelVisibilityOpen,
   $visibleModels,
@@ -92,7 +98,7 @@ afterEach(() => {
   queryClient.setQueryData(localModelsKey(localModelsOwner(), 'jobs'), [])
   $defaultReasoningEffort.set('')
   $codeSkewed.set(null)
-  $connection.set(null)
+  closeMenu.mockClear()
   vi.clearAllMocks()
 })
 
@@ -755,8 +761,6 @@ describe('the stale-backend row', () => {
   const staleLabel = 'Stale backend — restart'
 
   it('offers a restart when the backend is serving stale code', async () => {
-    const recycleBackend = vi.fn(async () => ({ ok: true }))
-    vi.stubGlobal('hermesDesktop', { recycleBackend })
     $codeSkewed.set(true)
 
     renderMenu()
@@ -765,7 +769,7 @@ describe('the stale-backend row', () => {
 
     fireEvent.click(row)
 
-    await waitFor(() => expect(recycleBackend).toHaveBeenCalled())
+    await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalled())
   })
 
   it('says nothing when the backend is current', async () => {
@@ -787,21 +791,50 @@ describe('the stale-backend row', () => {
     expect(screen.queryByText(staleLabel)).toBeNull()
   })
 
-  it('reconnects a remote backend instead of recycling the local one', async () => {
-    // The probe answers from whatever backend is ATTACHED, so on a remote
-    // connection the verdict can be true while the fix belongs on the other
-    // machine. Recycling here would bounce this machine's gateway while the
-    // user is pointed at Em — worse than doing nothing.
-    const recycleBackend = vi.fn(async () => ({ ok: true }))
-    vi.stubGlobal('hermesDesktop', { recycleBackend })
+  it('restarts only the profile that owns the stale backend', async () => {
+    // A scoped restart, not a whole-backend recycle: `recycleBackend` tears down
+    // the app-wide primary connection slot, which drops every other profile's
+    // connection and surfaces "Gateway starting (deadline)". The scoped verb
+    // takes down one gateway and probes the socket before reconnecting.
+    mocks.recycleBackend.mockClear()
+    vi.stubGlobal('hermesDesktop', { recycleBackend: mocks.recycleBackend })
     $codeSkewed.set(true)
-    $connection.set({ mode: 'remote' } as never)
 
     renderMenu()
 
     fireEvent.click(await screen.findByText(staleLabel))
 
-    await waitFor(() => expect(mocks.reconnectGateway).toHaveBeenCalled())
-    expect(recycleBackend).not.toHaveBeenCalled()
+    await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalled())
+    expect(mocks.recycleBackend).not.toHaveBeenCalled()
+  })
+
+  it('closes the menu on click, so the action is visibly taken', async () => {
+    // Leaving the menu open is what made a slow restart read as a dead click —
+    // and got the row clicked three times.
+    $codeSkewed.set(true)
+
+    renderMenu()
+
+    fireEvent.click(await screen.findByText(staleLabel))
+
+    await waitFor(() => expect(closeMenu).toHaveBeenCalled())
+  })
+
+  it('refuses a second restart while one is in flight', async () => {
+    let release = (_ok: boolean) => {}
+    mocks.runGatewayRestart.mockImplementation(() => new Promise<boolean>(resolve => { release = resolve }))
+    $codeSkewed.set(true)
+
+    renderMenu()
+
+    const row = await screen.findByText(staleLabel)
+
+    fireEvent.click(row)
+    fireEvent.click(row)
+    fireEvent.click(row)
+
+    await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalledTimes(1))
+
+    release(true)
   })
 })
