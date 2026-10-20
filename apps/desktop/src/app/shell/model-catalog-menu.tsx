@@ -18,6 +18,8 @@ import { ProviderStatusChip } from '@/components/provider-status-chip'
 import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { reconnectGateway } from '@/store/gateway-reconnect'
+import { $connection } from '@/store/session'
 import {
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -42,6 +44,7 @@ import { accountResetMs, formatReset, modelResetMs } from '@/lib/provider-limit'
 import { reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { foldIncludes, normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
+import { $codeSkew, $codeSkewed } from '@/store/code-skew'
 import { $customModels, addCustomModel, customModelCandidate, withCustomModels } from '@/store/custom-models'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
@@ -260,6 +263,10 @@ export function ModelCatalogMenu({
   // catalog must show the same shortlist. A per-caller opt-in is how the board
   // and the composer would end up disagreeing about what "my models" means.
   const visibleModels = useStore($visibleModels)
+  // The backend's stale-code verdict, the same atom the status-bar pill paints.
+  // Read here rather than fetched: the condition is already known app-wide, and
+  // the picker never sends a switch RPC for a server-side guard to catch.
+  const skewed = useStore($codeSkewed) === true
   const customModels = useStore($customModels)
   // Favorite models, same reasoning as the shortlist above: one global
   // preference owned by the catalog, so the composer pill, session tiles and
@@ -916,6 +923,40 @@ export function ModelCatalogMenu({
         <Codicon name="settings-gear" size="0.75rem" />
         {copy.editModels}
       </DropdownMenuItem>
+      {/*
+        The backend's stale-code flag, read straight from the store the
+        status-bar pill paints — a memory read, not a request.
+
+        This is deliberately NOT a server-side refusal: the picker never sent a
+        switch RPC, so a guard on one was unreachable from here. The condition
+        is already known app-wide ($codeSkewed is refreshed on the status
+        cadence), so the menu can state it and offer the one action that fixes
+        it without asking the backend anything.
+      */}
+      {skewed ? (
+        <DropdownMenuItem
+          className={cn(dropdownMenuRow, 'text-destructive focus:text-destructive')}
+          onSelect={event => {
+            event.preventDefault()
+
+            // A remote connection (Em, an SSH box) has no local backend to
+            // recycle — recycling here would restart THIS machine's gateway
+            // while the user is pointed somewhere else, which is worse than
+            // doing nothing. Reconnect the remote instead, the way the
+            // backend-restart request already does it.
+            if ($connection.get()?.mode === 'remote') {
+              void reconnectGateway()
+
+              return
+            }
+
+            void window.hermesDesktop?.recycleBackend?.()
+          }}
+        >
+          <Codicon name="warning" size="0.75rem" />
+          {copy.staleBackend}
+        </DropdownMenuItem>
+      ) : null}
     </>
   )
 }

@@ -252,6 +252,7 @@ export const zhHantChrome = {
       search: '搜尋模型',
       noModels: '找不到模型',
       editModels: '編輯模型…',
+      staleBackend: '後端程式碼陳舊 — 重新啟動',
       followDefault: '使用設定中的預設模型',
       refreshModels: '重新整理模型',
       favorites: '我的最愛',

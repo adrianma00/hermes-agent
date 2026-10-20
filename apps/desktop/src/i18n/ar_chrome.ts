@@ -352,6 +352,7 @@ export const arChrome = {
       search: 'البحث عن نموذج...',
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
+      staleBackend: 'الواجهة الخلفية قديمة — إعادة التشغيل',
       followDefault: 'استخدام الافتراضي من الإعدادات',
       refreshModels: 'تحديث النماذج',
       favorites: 'المفضلة',

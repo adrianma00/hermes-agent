@@ -1,3 +1,7 @@
+const mocks = vi.hoisted(() => ({ reconnectGateway: vi.fn(async () => {}) }))
+
+vi.mock('@/store/gateway-reconnect', () => ({ reconnectGateway: mocks.reconnectGateway }))
+
 vi.mock('@/store/profile', async (): Promise<object> => {
   const { atom } = await import('nanostores')
 
@@ -17,10 +21,12 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { registry } from '@/contrib/registry'
 import { queryClient } from '@/lib/query-client'
+import { $codeSkewed } from '@/store/code-skew'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { localModelsKey, localModelsOwner } from '@/store/local-runtime-jobs'
 import { setShowModelPricing } from '@/store/model-pricing'
+import { $connection } from '@/store/session'
 import {
   $modelVisibilityOpen,
   $visibleModels,
@@ -85,6 +91,8 @@ afterEach(() => {
   // disappears so an in-flight app-level poll cannot schedule another tick.
   queryClient.setQueryData(localModelsKey(localModelsOwner(), 'jobs'), [])
   $defaultReasoningEffort.set('')
+  $codeSkewed.set(null)
+  $connection.set(null)
   vi.clearAllMocks()
 })
 
@@ -733,5 +741,67 @@ describe('the catalog renders per-model pricing', () => {
     await screen.findByText('Sonnet 5')
     expect(screen.queryByText(/\/Mtok/)).toBeNull()
     expect(screen.queryByText('free')).toBeNull()
+  })
+})
+
+// The stale-backend row reads the SAME atom the status-bar pill paints.
+//
+// It is deliberately a memory read rather than a request, because the picker
+// never sent a switch RPC — so a server-side guard on one was unreachable from
+// here, and the menu could show a perfectly normal catalog for a backend that
+// cannot accept a switch. These pin that the row appears, that it offers the
+// restart itself, and that an unprobed app stays quiet.
+describe('the stale-backend row', () => {
+  const staleLabel = 'Stale backend — restart'
+
+  it('offers a restart when the backend is serving stale code', async () => {
+    const recycleBackend = vi.fn(async () => ({ ok: true }))
+    vi.stubGlobal('hermesDesktop', { recycleBackend })
+    $codeSkewed.set(true)
+
+    renderMenu()
+
+    const row = await screen.findByText(staleLabel)
+
+    fireEvent.click(row)
+
+    await waitFor(() => expect(recycleBackend).toHaveBeenCalled())
+  })
+
+  it('says nothing when the backend is current', async () => {
+    $codeSkewed.set(false)
+
+    renderMenu()
+
+    await screen.findByText('Gemini 2.5')
+    expect(screen.queryByText(staleLabel)).toBeNull()
+  })
+
+  it('says nothing before the first probe answers', async () => {
+    // `null` = not asked yet. An unprobed app must not claim a fault.
+    $codeSkewed.set(null)
+
+    renderMenu()
+
+    await screen.findByText('Gemini 2.5')
+    expect(screen.queryByText(staleLabel)).toBeNull()
+  })
+
+  it('reconnects a remote backend instead of recycling the local one', async () => {
+    // The probe answers from whatever backend is ATTACHED, so on a remote
+    // connection the verdict can be true while the fix belongs on the other
+    // machine. Recycling here would bounce this machine's gateway while the
+    // user is pointed at Em — worse than doing nothing.
+    const recycleBackend = vi.fn(async () => ({ ok: true }))
+    vi.stubGlobal('hermesDesktop', { recycleBackend })
+    $codeSkewed.set(true)
+    $connection.set({ mode: 'remote' } as never)
+
+    renderMenu()
+
+    fireEvent.click(await screen.findByText(staleLabel))
+
+    await waitFor(() => expect(mocks.reconnectGateway).toHaveBeenCalled())
+    expect(recycleBackend).not.toHaveBeenCalled()
   })
 })

@@ -2,6 +2,7 @@ export const esModelMenu = {
   search: 'Buscar modelos',
   noModels: 'No se encontraron modelos',
   editModels: 'Editar modelos…',
+  staleBackend: 'Backend obsoleto: reiniciar',
   followDefault: 'Usar el predeterminado de Ajustes',
   refreshModels: 'Actualizar modelos',
   favorites: 'Favoritos',
