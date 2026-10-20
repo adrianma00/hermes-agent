@@ -202,6 +202,13 @@ async def _mutate_session_request(request, profile, session_id, *, request_id,
         params['expected_generation'] = expected_generation
     try:
         if authority is None:
+            home = _session_db_path_for_profile(profile).parent
+            owner = await asyncio.to_thread(_live_owner, home)
+            if owner is not None:
+                # A gateway is running and owns the store: it is the only legal writer, so
+                # hand it the mutation instead of contending for the online-only lock the
+                # offline path takes (which fails by construction with 409).
+                return await _forward_mutation_to_owner(request, owner, home)
             result = await asyncio.to_thread(_mutate_offline_store, profile, actor, params)
         else:
             with _native_history_transport(request, authority, actor):
@@ -217,6 +224,65 @@ async def _mutate_session_request(request, profile, session_id, *, request_id,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail='storage_unavailable') from exc
+
+
+def _live_owner(home: Path):
+    """The ready gateway endpoint owning *home*, else None. Discovery only: never starts one."""
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+
+    try:
+        found = discover_gateway_endpoint(home)
+    except (OSError, ValueError):
+        return None
+
+    return found.endpoint if found.state == 'ready' else None
+
+
+async def _forward_mutation_to_owner(request, owner, home):
+    """Replay this mutation against the live owner, which is the store's only writer.
+
+    A standalone ``serve``/``dashboard`` composes no authority, so its mutation path is
+    the OFFLINE one — which reserves the exclusive owner lock through the write and is
+    therefore refused with ``409 Exclusive maintenance refused`` whenever a gateway is
+    running. That copy tells the caller to "drain and stop the gateway", advice no
+    Desktop client can act on, so every sidebar edit fails for as long as the gateway
+    lives (measured: 1573 refusals in one morning, on both connection routes).
+
+    The owner already holds that lock and is the correct writer, so the request is
+    replayed at it verbatim over native HTTP with a freshly minted ticket. Doing it by
+    replaying rather than by rebuilding the payload per operation keeps this correct for
+    every mutation (sidebar flags, delete, import) without duplicating route models.
+    """
+    import httpx
+    from fastapi import HTTPException
+    from hermes_cli.gateway_client import _session_ticket
+
+    ticket = await asyncio.to_thread(_session_ticket, home, owner, purpose='native-http')
+    url = owner.api_origin.rstrip('/') + request.url.path
+    if request.url.query:
+        url = f'{url}?{request.url.query}'
+    headers = {'X-Hermes-Gateway-Ticket': ticket}
+    body = await request.body()
+    if body:
+        headers['Content-Type'] = request.headers.get('content-type', 'application/json')
+
+    try:
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
+                                     timeout=30.0) as client:
+            response = await client.request(request.method, url, content=body, headers=headers)
+    except httpx.HTTPError as exc:
+        # The owner was discoverable a moment ago; a transport failure is not a 409.
+        raise HTTPException(status_code=503, detail='session_authority_unavailable') from exc
+
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get('detail')
+        except ValueError:
+            detail = None
+        raise HTTPException(status_code=response.status_code,
+                            detail=detail or 'owner_mutation_failed')
+
+    return response.json()
 
 
 def _with_session_maintenance(profile, operation, *args):
