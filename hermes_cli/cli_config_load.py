@@ -179,6 +179,14 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
         if "search_slow_ms" in sessions_config:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_config["search_slow_ms"])
 
+    # Bridge display.tui_theme into HERMES_TUI_THEME so the classic CLI's env-only detection
+    # ladder picks it up (the TUI applies it directly via applyConfiguredTuiTheme). Skip "auto"
+    # so auto-detection (OSC-11, COLORFGBG, etc.) still fires.
+    display_config = defaults.get("display", {})
+    tui_theme = str(display_config.get("tui_theme", "")).strip().lower()
+    if tui_theme in ("light", "dark") and "HERMES_TUI_THEME" not in os.environ:
+        os.environ["HERMES_TUI_THEME"] = tui_theme
+
 
 def _cli_config_defaults():
     """Built-in defaults for every config key the CLI reads (the file overlays these)."""
