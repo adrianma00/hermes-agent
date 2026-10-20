@@ -112,6 +112,16 @@ export function xtversion(): TerminalQuery<XtversionResponse> {
   }
 }
 
+/** Enable DEC mode 2031 (host color scheme reporting). Non-terminal-safe:
+ *  only emit once at startup alongside the DA1 sentinel, never re-use in
+ *  a flush() batch — the terminal sends unsolicited CSI ? 997 ; n reports
+ *  from this point forward, which the querier cannot match to a pending
+ *  query and silently drops. The enable itself is a one-shot SET, not a
+ *  query (no response expected). */
+export function enableMode2031(): string {
+  return csi('?2031h')
+}
+
 // -- Querier --
 
 /** Sentinel request sequence (DA1). Kept internal; flush() writes it. */

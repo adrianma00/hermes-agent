@@ -1,6 +1,6 @@
 import { execFile } from 'child_process'
 
-import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@hermes/ink'
+import { forceRedraw, onTerminalBackground, onTerminalForeground, onHostAppearance } from '@hermes/ink'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { relativeLuminance } from '@hermes/shared/color'
 import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/gateway-events'
@@ -414,6 +414,37 @@ export function syncThemeToTerminalBackground(): void {
   }, 1500).unref?.()
 }
 
+/**
+ * Subscribe to host appearance changes from the terminal (DEC 2031).
+ * When the terminal reports a light/dark mode switch, set the env pin
+ * and re-apply the theme so the palette flips live — no restart needed.
+ * Works in any terminal that supports mode 2031 and forwards the report
+ * through the pty (kitty, Ghostty, Alacritty, WezTerm, iTerm2, herdr, …).
+ * Harmless no-op on terminals that don't support it.
+ */
+function syncThemeToHostAppearance(): void {
+  onHostAppearance(scheme => {
+    // An explicit user pin (HERMES_TUI_LIGHT) outranks everything.
+    // HERMES_TUI_THEME is what we write — respect a shell-exported pin.
+    if (process.env.HERMES_TUI_LIGHT) {
+      return
+    }
+
+    const mode = scheme === 'light' ? 'light' : 'dark'
+
+    // Skip if already pinned to this mode — avoid a redundant reapply
+    // (the terminal may re-send the same report on re-attach).
+    if (process.env.HERMES_TUI_THEME === mode) {
+      return
+    }
+
+    process.env.HERMES_TUI_THEME = mode
+    // Mark as not config-owned so /theme auto can still clear it.
+    configPinnedTheme = false
+    reapplyTheme()
+  })
+}
+
 const dropBgTask = (taskId: string) =>
   patchUiState(state => {
     const next = new Set(state.bgTasks)
@@ -640,6 +671,7 @@ function applySessionInfo(payload: unknown, { appendMessage, setHistoryItems, se
 
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: AnyGatewayEvent) => void {
   syncThemeToTerminalBackground()
+  syncThemeToHostAppearance()
 
   const { gw, rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
