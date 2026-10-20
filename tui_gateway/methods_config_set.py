@@ -4,11 +4,14 @@ are rebound onto server.py's globals (method_ctx.bind_module) and reference them
 Keys match exactly except ``details_mode.<section>`` (prefix) and ``_DISPLAY_TOGGLE_KEYS``.
 """
 
+import logging
 import os
 
 from hermes_constants import INDICATOR_STYLES
 
 from .method_ctx import HandlerRegistry, bind_module
+
+logger = logging.getLogger(__name__)
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -121,15 +124,38 @@ def _skew_switch_confirm(rid, key, value, confirmed: bool, session) -> dict | No
     the restart, or continue anyway — the same "resend with
     ``confirm_expensive_model``" round-trip the expensive-model prompt uses, so
     there is no new client contract to learn.
+
+    Every decision is logged (both branches). This is a refusal the CLIENT turns
+    into a dialog, so without a log line there is no way to tell a guard that
+    declined to fire from one that never ran — the two look identical from the
+    app, the session DB and the config file, and a silent guard is exactly the
+    unexplained "the menu said nothing" this feature was built to fix.
     """
+    # `session` may be None (the sessionless profile-default path) and its id is
+    # what ties a log line back to a user's pick in the Desktop log.
+    sid = ""
+    if isinstance(session, dict):
+        sid = str(session.get("session_id") or "")
+
     if confirmed:
+        logger.info("config.set model: skew guard skipped (confirmed resend) sid=%s", sid)
+
         return None
+
     from gateway.code_skew import detect_code_skew
 
     skew = detect_code_skew()
+
     if not skew:
+        logger.info("config.set model: no code skew, switching normally sid=%s", sid)
+
         return None
+
     boot_rev, disk_rev = skew
+    logger.warning(
+        "config.set model refused for code skew (boot=%s disk=%s) sid=%s — asking to restart or switch anyway",
+        boot_rev, disk_rev, sid,
+    )
     from agent.i18n import t
 
     message = t("gateway.model.error_prefix", error=t(

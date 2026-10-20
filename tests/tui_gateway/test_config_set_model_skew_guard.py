@@ -115,3 +115,82 @@ def test_a_skewed_switch_with_no_session_still_asks(monkeypatch, skewed):
     answer, _called = _switch(monkeypatch, session=None)
 
     assert answer["result"]["confirm_required"] is True
+
+
+# --- observability -----------------------------------------------------------
+#
+# The guard's answer is a `confirm_required` envelope the CLIENT turns into a
+# dialog. Without a log line, a guard that declined to fire and one that never
+# ran are indistinguishable from outside — which is exactly how "the menu said
+# nothing about the skew" became undiagnosable. These pin the lines that make
+# the decision greppable in gateway.log.
+
+@pytest.fixture
+def captured(monkeypatch):
+    """Capture the guard's log records on the logger it really uses.
+
+    `_set_model` is REBOUND onto server.py's globals by `method_ctx.bind_module`,
+    so the running guard resolves `logger` in *server*'s namespace
+    (`tui_gateway.server`), not this module's. Attaching to the wrong logger
+    silently captures nothing.
+    """
+    import logging
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger("tui_gateway.server")
+    handler = Capture()
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+def _messages(records):
+    return [record.getMessage() for record in records]
+
+
+def test_a_skew_refusal_is_logged_with_both_revisions(monkeypatch, skewed, captured):
+    _switch(monkeypatch, session={"agent": None, "running": False, "session_id": "s1"})
+
+    refusal = [m for m in _messages(captured) if "refused for code skew" in m]
+
+    assert len(refusal) == 1
+    # Both revisions must be in the line, or it cannot be tied to a specific
+    # stale process without re-deriving them.
+    assert "b23bfe6c43" in refusal[0] or SKEW[0] in refusal[0]
+    assert SKEW[1] in refusal[0]
+    assert "s1" in refusal[0]
+
+
+def test_a_clean_switch_is_logged_too(monkeypatch, captured):
+    # The NEGATIVE case is the valuable one: "no skew" must be visible, or a
+    # silent guard is still indistinguishable from a guard that never ran.
+    import gateway.code_skew as code_skew
+
+    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
+
+    _switch(monkeypatch, session={"agent": None, "running": False, "session_id": "s2"})
+
+    assert any("no code skew" in m and "s2" in m for m in _messages(captured))
+
+
+def test_a_confirmed_resend_is_logged(monkeypatch, skewed, captured):
+    # The user took "switch anyway"; that decision belongs in the log beside the
+    # refusal it answered.
+    _switch(
+        monkeypatch,
+        session={"agent": None, "running": False, "session_id": "s3"},
+        confirm_expensive_model=True,
+    )
+
+    assert any("skipped (confirmed resend)" in m and "s3" in m for m in _messages(captured))
