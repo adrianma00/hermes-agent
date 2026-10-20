@@ -169,7 +169,7 @@ export function showAgentNotice(payload: AgentNoticePayload | undefined): void {
  */
 export function clearAgentNotice(key: string | undefined): void {
   if (key) {
-    dismissNotification(key)
+    dismissNotification(key, 'replaced')
   }
 }
 

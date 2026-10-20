@@ -975,7 +975,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               message
             })
           } catch (err) {
-            dismissNotification(noticeId)
+            dismissNotification(noticeId, 'superseded')
 
             // Desktop and gateway runtimes update independently. Preserve the
             // historical slash-worker path for an older gateway that has not

@@ -30,6 +30,10 @@ export interface AppNotification {
   action?: NotificationAction
   /** Second, quieter button beside `action` (e.g. "Disable" next to "Sign in"). */
   secondaryAction?: NotificationAction
+  /** Third button, quieter still. For a toast whose message names several
+   *  distinct escapes (reconnect / restart the backend / open settings) where
+   *  displacing one of them would remove a recovery the user needs. */
+  tertiaryAction?: NotificationAction
   onDismiss?: () => void
   createdAt: number
   placement?: NotificationPlacement
@@ -46,6 +50,7 @@ export interface NotificationInput {
   detail?: string
   action?: NotificationAction
   secondaryAction?: NotificationAction
+  tertiaryAction?: NotificationAction
   onDismiss?: () => void
   durationMs?: number
   placement?: NotificationPlacement
@@ -269,6 +274,7 @@ function showNotification(input: NotificationInput, errorCategory: ErrorToastCat
     detail: input.detail,
     action: input.action,
     secondaryAction: input.secondaryAction,
+    tertiaryAction: input.tertiaryAction,
     onDismiss: input.onDismiss,
     createdAt: Date.now(),
     placement: input.placement ?? defaultPlacement(kind, input.action)
@@ -281,10 +287,22 @@ function showNotification(input: NotificationInput, errorCategory: ErrorToastCat
 
   const duration = input.durationMs ?? defaultDuration(kind)
 
+  logNotification('notify', id, {
+    kind,
+    title: input.title,
+    message: notification.message,
+    detail: notification.detail,
+    action: notification.action?.label,
+    secondaryAction: notification.secondaryAction?.label,
+    tertiaryAction: notification.tertiaryAction?.label,
+    durationMs: duration,
+    placement: notification.placement
+  })
+
   if (duration > 0) {
     timers.set(
       id,
-      window.setTimeout(() => dismissNotification(id), duration)
+      window.setTimeout(() => dismissNotification(id, 'timeout'), duration)
     )
   }
 
@@ -330,12 +348,47 @@ export function notifyError(
   )
 }
 
-export function dismissNotification(id: string) {
+export function dismissNotification(id: string, reason = 'unknown') {
   window.clearTimeout(timers.get(id))
   timers.delete(id)
   const dismissed = $notifications.get().find(item => item.id === id)
   $notifications.set($notifications.get().filter(item => item.id !== id))
   dismissed?.onDismiss?.()
+
+  if (dismissed) {
+    logNotification('dismiss', id, {
+      reason,
+      kind: dismissed.kind,
+      title: dismissed.title,
+      ageMs: Math.max(0, Date.now() - dismissed.createdAt)
+    })
+  }
+}
+
+/** Persist a toast's lifecycle to desktop.log.
+ *
+ * Toasts are otherwise invisible to forensics: `notify()` returns an id and
+ * writes nothing, so "which banner appeared, and what cleared it" cannot be
+ * answered after the fact — a user report has to be taken on trust. Log both
+ * edges (created and cleared) with the fields that identify a toast, so the
+ * question becomes a grep.
+ *
+ * Best-effort: a missing/closed IPC bridge must never affect the toast itself.
+ */
+function logNotification(kind: string, id: string, fields: Record<string, string | number | undefined>) {
+  try {
+    const label: string = new URLSearchParams(window.location.search).get('win') ?? 'main'
+    const parts = Object.entries(fields)
+      .filter(([, value]) => value !== undefined && value !== '')
+      .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, ' ').slice(0, 200)}`)
+      .join(' ')
+
+    window.hermesDesktop?.logLine?.(
+      `[notification:${label}] ${kind} id=${id}${parts ? ` ${parts}` : ''}`
+    )
+  } catch {
+    // A missing or closed IPC bridge must not prevent the toast.
+  }
 }
 
 export function clearNotifications() {

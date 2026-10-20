@@ -1619,8 +1619,173 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     await advanceBackoff()
     await flushAsync()
 
+    // ...and STAYS up. The clear is gated on the same stability window the
+    // reconnect logic uses, so a socket that merely blips open no longer
+    // retracts the warning while the connection is still unusable.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+    })
+
     expect($gatewayState.get()).toBe('open')
     expect($notifications.get().some(entry => entry.title?.includes('em'))).toBe(false)
+  })
+
+  it('does NOT clear the toast on a sub-stable blip open, and re-raises on a real outage', async () => {
+    // A socket that opens for a moment and drops again is not a recovery.
+    // Clearing the warning on the raw 'open' event retracted it while the
+    // connection was still unusable: the toast vanished, the status bar stayed
+    // on "connecting", and the user had nothing left to act on.
+    //
+    // Jitter is pinned to the ceiling so each attempt's delay is its full
+    // backoff: a socket then opens at the END of an advance, exactly as a real
+    // one would, instead of partway through it.
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+
+    const desktop = fakeDesktop()
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 30; i += 1) {
+      await advanceBackoff()
+    }
+    const raised = () => $notifications.get().filter(entry => entry.title?.includes('em')).length
+    expect(raised()).toBe(1)
+
+    // The socket OPENS, then drops again well inside the 5s stability window.
+    // Step in small increments so the clock does not cross the stability window
+    // on its own — a full backoff advance would move time past 5s and make even
+    // a blip look stable.
+    FakeWebSocket.mode = 'open'
+    for (let i = 0; i < 80; i += 1) {
+      if (FakeWebSocket.instances.at(-1)?.readyState === FakeWebSocket.OPEN) {
+        break
+      }
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250)
+      })
+    }
+    expect(FakeWebSocket.instances.at(-1)?.readyState).toBe(FakeWebSocket.OPEN)
+    act(() => FakeWebSocket.instances.at(-1)?.drop())
+    await flushAsync()
+
+    // Keep failing so nothing silently re-opens and hides the assertion.
+    FakeWebSocket.mode = 'fail'
+    // The drop cancelled the pending clear, so the warning survives well past
+    // the 5s window it would otherwise have been dismissed in.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(raised()).toBe(1)
+
+    // A genuinely stable recovery DOES clear it — the socket must stay open
+    // across the stability window.
+    FakeWebSocket.mode = 'open'
+    for (let i = 0; i < 80; i += 1) {
+      if (FakeWebSocket.instances.at(-1)?.readyState === FakeWebSocket.OPEN) {
+        break
+      }
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250)
+      })
+    }
+    expect(FakeWebSocket.instances.at(-1)?.readyState).toBe(FakeWebSocket.OPEN)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+    })
+    expect(raised()).toBe(0)
+
+    // ...and the escalation state was reset with it, so a LATER outage can warn
+    // again. Clearing the toast alone left `escalated` set, and a subsequent
+    // outage longer than the escalate window could never raise a toast at all.
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances.at(-1)?.drop())
+    await flushAsync()
+    for (let i = 0; i < 30; i += 1) {
+      await advanceBackoff()
+    }
+    expect(raised()).toBe(1)
+  })
+
+  it('offers Restart backend alongside Reconnect now when the backend is not skewed', async () => {
+    // "Reconnect now" is a dead end when the backend is alive but cannot serve:
+    // a stale process, or one holding a lock that refuses this client's writes
+    // (the `Exclusive maintenance refused` 409). Skew detection covers only the
+    // stale-code case, so the recycle must be reachable without it.
+    const recycleBackend = vi.fn(async () => ({ ok: true }))
+    const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & {
+      recycleBackend: typeof recycleBackend
+    }
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    desktop.recycleBackend = recycleBackend
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+
+    const toast = $notifications.get().find(entry => entry.title?.includes('em'))
+    // Not skewed, so the PRIMARY action stays the cheap retry...
+    expect(toast?.action?.label).toBe('Reconnect now')
+    // ...and the recycle is still reachable, without displacing Open Gateways.
+    expect(toast?.tertiaryAction?.label).toBe('Restart backend')
+    expect(toast?.secondaryAction?.label).toBe('Open Gateways')
+
+    toast?.tertiaryAction?.onClick()
+    expect(recycleBackend).toHaveBeenCalledWith('default')
+  })
+
+  it('logs the notification lifecycle to desktop.log (title, actions, and clear reason)', async () => {
+    // notify() writes nothing, so a toast leaves no forensic trace at all: which
+    // banner appeared, and what cleared it, is unanswerable after the fact.
+    const logLine = vi.fn()
+    const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & { logLine: typeof logLine }
+    desktop.getConnection.mockResolvedValue({ ...primaryConn, connectionId: 'em', profile: 'default' })
+    desktop.logLine = logLine
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    FakeWebSocket.mode = 'fail'
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    for (let i = 0; i < 24; i += 1) {
+      await advanceBackoff()
+    }
+
+    const created = logLine.mock.calls.map(([line]) => line).find(line => line?.startsWith('[notification:'))
+    expect(created).toContain('notify id=')
+    expect(created).toContain('kind=warning')
+    expect(created).toContain('Lost connection to “em”')
+    expect(created).toContain('action=Reconnect now')
+
+    FakeWebSocket.mode = 'open'
+    await advanceBackoff()
+    await flushAsync()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+    })
+
+    const cleared = logLine.mock.calls
+      .map(([line]) => line)
+      .find(line => line?.startsWith('[notification:') && line.includes('dismiss'))
+    expect(cleared).toContain('reason=recovered-stable')
   })
 
   it('#83134: a proxy that accepts then immediately closes every socket does not reset the backoff to attempt 0', async () => {

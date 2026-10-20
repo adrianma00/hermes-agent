@@ -5,6 +5,7 @@ import {
   isStableOpen,
   JSON_RPC_METHOD_NOT_FOUND,
   JsonRpcGatewayError,
+  RECONNECT_STABLE_OPEN_MS,
   reconnectBackoffDelayMs
 } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
@@ -419,19 +420,46 @@ export function useGatewayBoot({
     // Track the id and dismiss it once the socket is stably open again.
     let escalationToastId: string | null = null
 
-    const dismissEscalationToast = () => {
+    const dismissEscalationToast = (reason: string) => {
       if (escalationToastId === null) {
         return
       }
-      dismissNotification(escalationToastId)
+      dismissNotification(escalationToastId, reason)
       escalationToastId = null
     }
 
-    const resetReconnectBackoff = () => {
+    // Clearing the escalation toast on a raw 'open' retracted it during a blip:
+    // a socket that opens for a few hundred ms and drops again is not a
+    // recovery, yet it cancelled the one warning the user had — leaving a
+    // vanished toast next to a status bar still stuck on "connecting". Wait out
+    // the same stability window the reconnect logic already uses before
+    // believing the recovery; a drop before then cancels the pending clear.
+    let escalationDismissTimer: ReturnType<typeof setTimeout> | null = null
+    const scheduleEscalationDismissWhenStable = () => {
+      if (escalationToastId === null) {
+        return
+      }
+      if (escalationDismissTimer !== null) {
+        clearTimeout(escalationDismissTimer)
+      }
+      escalationDismissTimer = setTimeout(() => {
+        escalationDismissTimer = null
+
+        if (!cancelled && gatewayOpen()) {
+          // Full reset, not just a dismissal: `escalated` and
+          // `reconnectFailingSince` gate whether the toast may be raised again,
+          // so clearing the toast alone left them set — a later outage longer
+          // than the escalate window could then never warn the user at all.
+          resetReconnectBackoff('recovered-stable')
+        }
+      }, RECONNECT_STABLE_OPEN_MS)
+    }
+
+    const resetReconnectBackoff = (reason: string) => {
       reconnectAttempt = 0
       reconnectFailingSince = null
       escalated = false
-      dismissEscalationToast()
+      dismissEscalationToast(reason)
     }
 
     // Bounded automatic boot retry for transient REMOTE failures (#82679).
@@ -696,7 +724,26 @@ export function useGatewayBoot({
                     label: translateNow('boot.errors.reconnectNow'),
                     onClick: () => void reconnectGateway().catch(() => undefined)
                   },
-              secondaryAction: RECOVERY_ACTIONS.openGateways()
+              secondaryAction: RECOVERY_ACTIONS.openGateways(),
+              // "Reconnect now" alone is a dead end when the backend is alive but
+              // unable to serve: a stale process, or one that holds a lock
+              // refusing this client's writes (the `Exclusive maintenance
+              // refused` 409) reconnects forever without recovering. Skew
+              // detection covers the stale-code case only, so in the non-skew
+              // branch — where the primary action is "Reconnect now" — also
+              // offer the real recycle. Parameterized so the same block serves
+              // both branches without a second widget: a third slot is added
+              // rather than displacing "Open Gateways".
+              tertiaryAction: isSkewed
+                ? undefined
+                : {
+                    label: translateNow('settings.model.restartBackend'),
+                    onClick: () => {
+                      void window.hermesDesktop
+                        ?.recycleBackend?.(primaryConnection?.profile)
+                        .catch(() => undefined)
+                    }
+                  }
             })
           }
 
@@ -735,7 +782,7 @@ export function useGatewayBoot({
       }
 
       clearReconnectTimer()
-      resetReconnectBackoff()
+      resetReconnectBackoff('reconnect-now')
       reconnectSecondaryGateways({ forceOpenSockets: forceOpenSocket })
 
       // Browser WebSocket state can remain OPEN after sleep even though the OS
@@ -898,7 +945,7 @@ export function useGatewayBoot({
         clearLivenessReprobeTimer()
         livenessProbeFailures = 0
         bootRetryAttempt = 0
-        resetReconnectBackoff()
+        resetReconnectBackoff('gateway-switch')
         reauthNotified = false
         primaryReauthError = null
         bootFailed = false
@@ -1199,10 +1246,23 @@ export function useGatewayBoot({
         // the app is restarted. Safe against flapping: a toast only ever exists
         // after RECONNECT_ESCALATE_AFTER_MS of continuous failure, so it cannot
         // be re-raised by a socket that drops again straight away.
-        dismissEscalationToast()
+        //
+        // Gated on a STABLE open. A socket that blips open for a few hundred ms
+        // and drops again is not a recovery, and clearing on the raw 'open'
+        // event silently retracted the warning while the connection was still
+        // unusable — the user then sees the toast vanish but the status bar
+        // stuck on "connecting", with no way to tell that nothing recovered.
+        scheduleEscalationDismissWhenStable()
       } else if (st === 'closed' || st === 'error') {
+        // A drop cancels any pending "recovered" clear: the socket did not stay
+        // open, so the toast's claim is still true.
+        if (escalationDismissTimer !== null) {
+          clearTimeout(escalationDismissTimer)
+          escalationDismissTimer = null
+        }
+
         if (isStableOpen(openedAt)) {
-          resetReconnectBackoff()
+          resetReconnectBackoff('stable-drop')
         }
 
         // The connected→disconnected edge after a healthy boot, not a switch or our own manual close.
@@ -1321,7 +1381,7 @@ export function useGatewayBoot({
         ownCloseReason = 'manual'
         gateway.close()
         clearReconnectTimer()
-        resetReconnectBackoff()
+        resetReconnectBackoff('manual-reconnect')
 
         await attemptReconnect({
           profile: normalizeProfileKey($activeGatewayProfile.get()),
@@ -1374,7 +1434,7 @@ export function useGatewayBoot({
       ownCloseReason = 'manual'
       gateway.close()
       clearReconnectTimer()
-      resetReconnectBackoff()
+      resetReconnectBackoff('manual-reconnect')
       await attemptReconnect({
         profile: normalizeProfileKey($activeGatewayProfile.get()),
         activationEpoch: gatewayActivationEpoch()
