@@ -5,6 +5,7 @@ programs. Manager-loaded values take precedence over filenames and disk copies.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -57,11 +58,22 @@ def verify_home(home: Path, configured: str) -> None:
 def verify_gateway_argv(argv: list[str], home: Path) -> None:
     from gateway.status import looks_like_gateway_command_line
 
-    # The installer wraps launchd stderr with this fixed, non-shell module.
-    if len(argv) > 7 and argv[1:4] == ["-m", "hermes_cli.stderr_timestamp", "--error-log"] and argv[5] == "--":
-        if not re.fullmatch(r"python(?:w|\d+(?:\.\d+)*)?(?:\.exe)?", Path(argv[0]).name.lower()):
-            _unverified()
-        argv = argv[6:]
+    # launchd's ProgramArguments wrap the real command twice over (#71206). The
+    # OUTER wrapper is JXA via osascript, used so the launchd job carries an
+    # Apple-platform identity and keeps Local Network privacy working; the INNER
+    # one is the stderr timestamp gate. Both are ours and both must be unwrapped
+    # before the gateway argv underneath can be judged — reading the JXA program
+    # as the gateway would fail every identity check on macOS, which is exactly
+    # what left `ensure` reporting service_identity_unverified for a healthy
+    # launchd gateway.
+    if Path(argv[0]).name.lower() == "osascript":
+        argv = _unwrap_jxa_program_arguments(argv)
+    # The installer wraps launchd stderr with this fixed, non-shell module. Two
+    # spellings reach it: `python -m …` from a runtime command, and the source
+    # launcher's `hermes --run-module …` (``_launchers.installation_command``)
+    # which is what launchd actually persists. Only the `-m` form was known
+    # here, so an installed shim failed identity verification outright.
+    argv = _unwrap_stderr_timestamp_argv(argv)
     if not argv or not looks_like_gateway_command_line(subprocess_command(argv)):
         _unverified()
     executable = Path(argv[0]).name.lower()
@@ -101,6 +113,83 @@ def verify_gateway_argv(argv: list[str], home: Path) -> None:
         arg not in {"--quiet", "--external-supervisor"} for arg in filtered[2:]
     ):
         _unverified()
+
+
+#: The exact shape ``gateway_launchd.launchd_program_arguments`` emits: JXA that
+#: runs one shell command through libc ``system()`` and translates the encoded
+#: wait status back into a process exit code. Anchored, not fuzzy: a program
+#: from another product must not be mistaken for ours.
+_JXA_SYSTEM_CALL = re.compile(
+    r'^ObjC\.import\("stdlib"\);\s*'
+    r'const status=\$\.system\((?P<command>"(?:[^"\\]|\\.)*")\);\s*'
+    r'const signal=status & 127;\s*'
+    r'\$\.exit\(.*\);\s*$',
+    re.DOTALL,
+)
+
+
+def _unwrap_stderr_timestamp_argv(argv: list[str]) -> list[str]:
+    """Strip the stderr-timestamp gate, in either spelling it is installed as.
+
+    ``python -m hermes_cli.stderr_timestamp --error-log X -- <gateway…>`` from a
+    runtime command, or ``hermes --run-module hermes_cli.stderr_timestamp
+    --error-log X -- <gateway…>`` from the source launcher — the latter being
+    what launchd actually persists on a store-python install. Anything that does
+    not match either shape is returned untouched, so the caller's own checks
+    decide whether it is a gateway at all.
+    """
+    if len(argv) < 7 or argv[2] != "hermes_cli.stderr_timestamp" or argv[3] != "--error-log" or argv[5] != "--":
+        return argv
+    head = argv[1]
+    if head == "-m":
+        # `-m module` needs a Python interpreter in argv[0]; a shell wrapper
+        # here would let any program claim our module name.
+        if not re.fullmatch(r"python(?:w|\d+(?:\.\d+)*)?(?:\.exe)?", Path(argv[0]).name.lower()):
+            _unverified()
+    elif head == "--run-module":
+        # The source launcher shim, which IS the entrypoint: it re-execs the
+        # interpreter itself, so argv[0] must be that launcher.
+        if Path(argv[0]).name.lower() not in {"hermes", "hermes.exe"}:
+            _unverified()
+    else:
+        return argv
+    return argv[6:]
+
+
+def _unwrap_jxa_program_arguments(argv: list[str]) -> list[str]:
+    """The gateway argv inside a launchd JXA wrapper, or a refusal.
+
+    ``ProgramArguments`` is a fixed 5-token form; anything else is not the
+    wrapper this verifier knows, and an unknown wrapper proves nothing about
+    which gateway a job would run.
+    """
+    if len(argv) != 5 or argv[1:3] != ["-l", "JavaScript"] or argv[3] != "-e":
+        _unverified()
+    match = _JXA_SYSTEM_CALL.match(argv[4].strip())
+    if not match:
+        _unverified()
+    try:
+        shell = json.loads(match.group("command"))
+    except ValueError:
+        _unverified()
+    # The shell must be our ``exec <argv> >> out 2>> err`` redirect form. Parse
+    # it with shlex rather than splitting on spaces: a path with a space is
+    # legal and must not silently truncate the command.
+    tokens = shlex.split(shell)
+    if not tokens or tokens[0] != "exec":
+        _unverified()
+    command = []
+    index = 1
+    while index < len(tokens) and tokens[index] not in {">>", "2>>"}:
+        command.append(tokens[index])
+        index += 1
+    # Both redirects must be present and nothing may follow the last target.
+    redirects = tokens[index:]
+    if len(redirects) != 4 or redirects[0] != ">>" or redirects[2] != "2>>":
+        _unverified()
+    if not command:
+        _unverified()
+    return command
 
 
 def subprocess_command(argv: list[str]) -> str:
