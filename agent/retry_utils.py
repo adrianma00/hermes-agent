@@ -23,6 +23,9 @@ _jitter_lock = threading.Lock()
 # the cap stays interactive-friendly (a TUI message should fail visibly in minutes).
 # The short count is shared by ``adaptive_rate_limit_backoff`` and
 # ``zai_coding_overload_retry_ceiling`` so the two cannot silently desync.
+# Rate-limit backoff: plain rate limits (AccountRateLimitExceeded, etc.) get a widening
+# ladder so the total window spans typical provider penalty boxes (~30-60s).
+_RATE_LIMIT_BACKOFF_LADDER = (10.0, 20.0, 40.0, 60.0)
 _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
@@ -77,6 +80,15 @@ _RESETS_IN_RE = re.compile(
 _RETRY_AFTER_SECONDS_RE = re.compile(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", re.IGNORECASE)
 # The plan usage-limit body field as it appears once stringified: ``'resets_in_seconds': 30995``.
 _RESETS_IN_SECONDS_FIELD_RE = re.compile(r"resets_in_seconds\W{1,4}(\d+(?:\.\d+)?)", re.IGNORECASE)
+# Absolute timestamp in free-text prose (ModelArk: "It will reset at 2026-10-20 13:37:59 +0800 CST").
+# The credential pool has its own copy (_extract_reset_at_from_message); this one lives here so
+# reset_delay_from_message and every caller sees it without importing credential_pool.
+_RESET_AT_ABSOLUTE_RE = re.compile(
+    r"(?:reset|resets)\s+(?:at|on)\s+"
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+    r"\s*([+-]\d{2}:?\d{2})?",
+    re.IGNORECASE,
+)
 
 
 def _quota_reset_seconds(m: re.Match[str]) -> float:
@@ -90,6 +102,25 @@ def _resets_in_seconds(m: re.Match[str]) -> Optional[float]:
     return float(m.group(1) or 0) * 3600 + float(m.group(2) or 0) * 60 + float(m.group(3) or 0)
 
 
+def _reset_at_absolute_seconds(m: re.Match[str]) -> Optional[float]:
+    """Epoch-based offset from a free-text absolute timestamp like
+    ``"reset at 2026-10-20 13:37:59 +0800 CST"``, in seconds from now, or None."""
+    date_part, time_part = m.group(1), m.group(2)
+    offset = m.group(3) or ""
+    iso_str = f"{date_part} {time_part}"
+    if offset:
+        offset = offset.replace(":", "")
+        iso_str += f" {offset[:3]}:{offset[3:]}" if len(offset) == 5 else f" {offset}"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        # Naive timestamp -> UTC (assume UTC when no offset given)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0.0, (dt - datetime.now(UTC)).total_seconds())
+    except ValueError:
+        return None
+
+
 # An explicit "retry after N s" wins over "resets in ..." (the credential pool's precedence):
 # a body carrying both describes a short throttle inside a long quota window, and the
 # shorter explicit wait is the one the provider actually asks for.
@@ -98,6 +129,7 @@ RETRY_DELAY_PATTERNS = (
     (_RETRY_AFTER_SECONDS_RE, lambda m: float(m.group(1))),
     (_RESETS_IN_SECONDS_FIELD_RE, lambda m: float(m.group(1))),
     (_RESETS_IN_RE, _resets_in_seconds),
+    (_RESET_AT_ABSOLUTE_RE, _reset_at_absolute_seconds),
 )
 
 
@@ -156,15 +188,20 @@ def adaptive_rate_limit_backoff(
     attempt: int, *, base_url: str | None, model: str | None, error: Any, default_wait: float,
     short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
 ) -> tuple[float, str | None]:
-    """``(wait_seconds, reason_label)``: ``default_wait`` for most providers; Z.AI Coding GLM-5.2 overloads keep
-    ``short_attempts`` short retries, then 30→60→90→120s with light jitter. ``attempt`` is 1-based."""
-    if not is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
-        return default_wait, None
-    if attempt <= short_attempts:
-        return default_wait, "zai_coding_overload_short"
-    idx = min(attempt - short_attempts - 1, len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) - 1)
-    base_delay = _ZAI_CODING_OVERLOAD_LONG_BACKOFF[idx]
-    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
+    """``(wait_seconds, reason_label)``: Z.AI Coding GLM-5.2 overloads keep
+    ``short_attempts`` short retries, then 30→60→90→120s with light jitter. All other rate
+    limits get a widening ladder (10→20→40→60s) so the total window spans typical provider
+    penalty boxes (~30-60s). ``attempt`` is 1-based."""
+    if is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
+        if attempt <= short_attempts:
+            return default_wait, "zai_coding_overload_short"
+        idx = min(attempt - short_attempts - 1, len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) - 1)
+        base_delay = _ZAI_CODING_OVERLOAD_LONG_BACKOFF[idx]
+        return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
+    # Plain rate-limit: use the ladder, but never go shorter than default_wait.
+    idx = min(attempt - 1, len(_RATE_LIMIT_BACKOFF_LADDER) - 1)
+    base_delay = max(default_wait, _RATE_LIMIT_BACKOFF_LADDER[idx])
+    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "rate_limit_ladder"
 
 
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
