@@ -4,6 +4,7 @@ export const enModelMenu: Translations['shell']['modelMenu'] = {
   search: 'Search models',
   noModels: 'No models found',
   editModels: 'Edit models…',
+  staleBackend: 'Stale backend — restart',
   followDefault: 'Use Settings default',
   refreshModels: 'Refresh models',
   favorites: 'Favorites',

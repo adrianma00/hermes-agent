@@ -4649,6 +4649,7 @@ export const esOverrides = {
       gatewayConnecting: 'conectando',
       gatewayOffline: 'sin conexión',
       gatewayRestarting: 'reiniciando…',
+      staleCode: 'código antiguo: reinicia',
       gatewayTitle: 'Puerta de enlace',
       customizeTitle: 'Mostrar en la barra de estado',
       hideStatusbar: 'Ocultar barra de estado',

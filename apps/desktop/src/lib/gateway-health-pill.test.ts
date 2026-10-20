@@ -14,6 +14,7 @@ const copy = {
   offline: en.shell.statusbar.gatewayOffline,
   ready: en.shell.statusbar.gatewayReady,
   restarting: en.shell.statusbar.gatewayRestarting,
+  staleCode: en.shell.statusbar.staleCode,
   unavailable: en.shell.statusbar.gatewayUnavailable
 }
 
@@ -65,5 +66,44 @@ describe('statusBarGatewayHealth', () => {
 
     expect(discordDown.detail).toBe(copy.messagingDegraded('discord'))
     expect(discordDown.degraded).toBe(true)
+  })
+
+  // The backend pill is the ONE surface always on screen, so it must not read
+  // "ready" for a process serving code older than the checkout. Reported as
+  // `code_skew` on the server's health endpoint.
+  it('names stale code instead of "ready" while the backend is skewed', () => {
+    const pill = statusBarGatewayHealth({ ...openReady, codeSkewed: true })
+
+    expect(pill.detail).toBe(copy.staleCode)
+    expect(pill.detail).not.toBe(copy.ready)
+    expect(pill.degraded).toBe(true)
+    expect(pill.title).toBe(copy.staleCode)
+  })
+
+  it('outranks the inference verdict while skewed', () => {
+    // A skewed process answers readiness fine; that is exactly the trap — the
+    // pill would otherwise paint a green "ready" over stale modules.
+    const pill = statusBarGatewayHealth({ ...openReady, codeSkewed: true, inferenceStatus: inferenceReady })
+
+    expect(pill.detail).toBe(copy.staleCode)
+  })
+
+  it('keeps the ordinary verdict when not skewed, and when unprobed', () => {
+    expect(statusBarGatewayHealth({ ...openReady, codeSkewed: false }).detail).toBe(copy.ready)
+    // `null` = never probed: an unasked question must not paint a fault.
+    expect(statusBarGatewayHealth({ ...openReady, codeSkewed: null }).detail).toBe(copy.ready)
+    expect(statusBarGatewayHealth({ ...openReady, codeSkewed: null }).degraded).toBe(false)
+  })
+
+  it('does not colour a disconnected backend with the skew verdict', () => {
+    // A down socket has no live process to describe; "connecting" is the truth.
+    const pill = statusBarGatewayHealth({
+      ...openReady,
+      codeSkewed: true,
+      connectionState: 'connecting'
+    })
+
+    expect(pill.detail).toBe(copy.connecting)
+    expect(pill.degraded).toBe(false)
   })
 })

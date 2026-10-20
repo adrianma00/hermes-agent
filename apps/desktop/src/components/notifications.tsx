@@ -30,7 +30,7 @@ function noteUserDismissed(id: string) {
 
 function userDismiss(id: string) {
   noteUserDismissed(id)
-  dismissNotification(id)
+  dismissNotification(id, 'user-dismiss')
 }
 
 const tone: Record<NotificationKind, { icon: IconComponent; iconClass: string; variant: ToneVariant }> = {
@@ -296,7 +296,7 @@ function NotificationItem({ notification, stack }: { notification: AppNotificati
           <p className="m-0 wrap-break-word">{renderMessage(notification.message, accent)}</p>
           {notification.meta && <p className="m-0 text-xs text-muted-foreground tabular-nums">{notification.meta}</p>}
           {hasDetail && <NotificationDetail detail={notification.detail || ''} />}
-          {(notification.action || notification.secondaryAction) && (
+          {(notification.action || notification.secondaryAction || notification.tertiaryAction) && (
             <div className="mt-1.5 flex flex-wrap gap-1.5">
               {notification.action && (
                 <Button
@@ -304,7 +304,7 @@ function NotificationItem({ notification, stack }: { notification: AppNotificati
                   onClick={() => {
                     void stack.depart(() => {
                       notification.action?.onClick()
-                      dismissNotification(notification.id)
+                      dismissNotification(notification.id, 'action')
                     })
                   }}
                   size="sm"
@@ -320,7 +320,7 @@ function NotificationItem({ notification, stack }: { notification: AppNotificati
                   onClick={() => {
                     void stack.depart(() => {
                       notification.secondaryAction?.onClick()
-                      dismissNotification(notification.id)
+                      dismissNotification(notification.id, 'secondary-action')
                     })
                   }}
                   size="sm"
@@ -328,6 +328,22 @@ function NotificationItem({ notification, stack }: { notification: AppNotificati
                   variant="outline"
                 >
                   {notification.secondaryAction.label}
+                </Button>
+              )}
+              {notification.tertiaryAction && (
+                <Button
+                  disabled={stack.busy || !stack.active}
+                  onClick={() => {
+                    void stack.depart(() => {
+                      notification.tertiaryAction?.onClick()
+                      dismissNotification(notification.id, 'tertiary-action')
+                    })
+                  }}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  {notification.tertiaryAction.label}
                 </Button>
               )}
             </div>

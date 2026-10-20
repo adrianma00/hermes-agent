@@ -17,7 +17,7 @@ export interface SurfaceModelSwitchConfirmOptions<T extends GuardedModelSwitchRe
   confirmMessage?: string
   /** Error-toast copy when the confirmed resend still fails. */
   failureMessage: string
-  /** Runs after the confirmed resend succeeds (cache invalidation etc.). */
+  /** Runs after the confirmed resend succeeds (cache invalidation etc). */
   finish?: (result: T | undefined) => void
   /** Staleness guard — the session/model can move on while the dialog is
    *  open. Return true to make the answered confirm a no-op (with a notice
@@ -31,6 +31,21 @@ export interface SurfaceModelSwitchConfirmOptions<T extends GuardedModelSwitchRe
   requestConfirmed: () => Promise<T | undefined>
   /** Undo the optimistic repaint when the confirmed resend fails. */
   rollback?: () => void
+  /**
+   * Opt-in "the backend is serving stale code" mode. The two real choices there
+   * are not apply/cancel but RESTART the backend or switch anyway, so both
+   * buttons are affirmatively labelled and the dismiss path means "go ahead".
+   * Omitted for every ordinary guard, which keeps the stock apply/cancel pair.
+   */
+  skew?: {
+    /** Label for the primary button: restart the backend instead of switching. */
+    restartLabel: string
+    /** Label for the secondary button: apply the switch despite the skew. */
+    continueLabel: string
+    /** Runs when the user takes the restart. The pick is NOT applied — the
+     *  restart reloads the code and the user re-picks against fresh modules. */
+    onRestart: () => Promise<void> | void
+  }
 }
 
 /**
@@ -54,9 +69,15 @@ export interface SurfaceModelSwitchConfirmOptions<T extends GuardedModelSwitchRe
 export async function surfaceModelSwitchConfirm<T extends GuardedModelSwitchResult>(
   options: SurfaceModelSwitchConfirmOptions<T>
 ): Promise<boolean> {
+  const skew = options.skew
+
+  // In skew mode the dialog is a two-way choice rather than apply/cancel: the
+  // affirmative button takes the RESTART, and the dismiss path is a deliberate
+  // "switch anyway" (never a silent abort — the pick is what the user asked
+  // for). Labels therefore come from the caller, which knows the product copy.
   const accepted = await confirm({
-    cancelLabel: translateNow('desktop.modelSwitchKeepLabel'),
-    confirmLabel: translateNow('desktop.modelSwitchConfirmLabel'),
+    cancelLabel: skew ? skew.continueLabel : translateNow('desktop.modelSwitchKeepLabel'),
+    confirmLabel: skew ? skew.restartLabel : translateNow('desktop.modelSwitchConfirmLabel'),
     description: options.confirmMessage?.trim() || translateNow('desktop.modelSwitchConfirmBody'),
     destructive: true,
     title: options.model
@@ -64,7 +85,17 @@ export async function surfaceModelSwitchConfirm<T extends GuardedModelSwitchResu
       : translateNow('desktop.modelSwitchConfirmTitleFallback')
   })
 
-  if (!accepted) {
+  if (skew && accepted) {
+    // The restart reloads the code; the switch itself is deliberately NOT
+    // applied. Re-picking against fresh modules is the point — applying now
+    // would resolve the model string against exactly the stale modules the
+    // restart exists to replace.
+    await skew.onRestart()
+
+    return false
+  }
+
+  if (!skew && !accepted) {
     return false
   }
 

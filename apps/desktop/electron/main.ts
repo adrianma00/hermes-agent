@@ -1,7 +1,7 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'
-import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedTicketEndpoint, runGatewayEnsure } from './local-gateway'
+import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, localGatewayRestartTarget, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedTicketEndpoint, runGatewayEnsure } from './local-gateway'
 import { closeGatewayTicketBridges, createGatewayTicketResolver } from './local-gateway-python'
 const localGatewayDials = createLocalGatewayDials()
 configurePythonGatewayTicketClient(createGatewayTicketResolver(
@@ -412,6 +412,7 @@ import {
 } from './oauth-rest-request'
 import { wireOauthSessionResponse } from './oauth-session-response'
 import { listWindowsProcesses, reapPackageRootedProcesses } from './package-process-reap'
+import { createCoalescingInterval } from './timer-coalesce'
 import { createParentStartMarkerResolver } from './parent-process-identity'
 import { bundledPayload, installIdForRoot, type PayloadInfo, payloadPythonPath } from './payload-backend'
 import { petOverlayClickThrough, shouldPopInOnOverlayClosed } from './pet-overlay'
@@ -506,9 +507,11 @@ import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
   ensureHealthyPooledRemoteBackendForDispatch,
-  POOLED_REMOTE_DISPATCH_PROBE_RETRY_DELAY_MS,
+  HOST_EVENT_BACKOFF_MS,
+  PooledRemoteDialGate,
   probeFailureDescription,
   REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
+  RemoteHostEventTracker,
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
   revalidatePooledRemoteBackends,
@@ -1947,6 +1950,13 @@ const pooledRemoteLiveness = new RemoteLivenessTracker(undefined, REMOTE_POOLED_
 
 const remoteRevalidation = new RemoteRevalidationCoordinator()
 const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
+// One busy host makes every profile pooled on it miss its dispatch probe at
+// once; retiring each independently re-dials the whole fleet into the host
+// that was already saturated. These two bound that: the tracker classifies the
+// correlated misses as a host event so teardown is deferred and revalidated,
+// and the gate keeps recovery from landing as one burst of SSH handshakes.
+const registryHostEvents = new RemoteHostEventTracker()
+const registryDialGate = new PooledRemoteDialGate()
 // Single-owner reconnect/dial claim (#90812): reconnectGateway()'s in-flight
 // lock is per-renderer, so two windows racing one wake can both invoke the
 // backend ensure IPC and double-dial a pooled SSH backend. Main owns backend
@@ -2068,7 +2078,7 @@ function startChromiumLogWatcher(file) {
     truncate: f => fs.truncateSync(f, 0)
   }
 
-  const timer = setInterval(() => {
+  const timer = coalescedInterval(() => {
     try {
       if (reclaimActiveLogIfOversized(file, io)) {
         rememberLog(`[diagnostics] truncated oversized Chromium log ${file}`)
@@ -2078,7 +2088,7 @@ function startChromiumLogWatcher(file) {
     }
   }, ACTIVE_LOG_POLL_MS)
 
-  timer.unref?.()
+  timer.unref()
 }
 
 function rotateLogIfNeededSync(base) {
@@ -2207,6 +2217,23 @@ function rememberLog(chunk) {
   scheduleDesktopLogFlush()
 }
 
+// Shared event-loop lag signal: the watchdog writes it on every detected freeze,
+// and timer consumers read it to coalesce their backlog on thaw.  Stored as a
+// module-level variable so any consumer in main.ts can capture the getter.
+let lastLagMs = 0
+
+function getLastLagMs(): number {
+  return lastLagMs
+}
+
+/** Coalescing timer factory pre-configured with the shared lag signal. */
+function coalescedInterval(callback: () => void, delayMs: number) {
+  return createCoalescingInterval(callback, delayMs, {
+    getLastLagMs,
+    thresholdMs: 2_000
+  })
+}
+
 // Main-process stalls leave renderer-scoped lifecycle logging unable to run.
 // When the loop resumes, retain the delayed timer's timing in desktop.log so a
 // Windows AppHang report can be correlated without changing tray semantics.
@@ -2216,7 +2243,10 @@ const mainProcessLagWatchdog = createMainProcessLagWatchdog({
   now: Date.now,
   log: rememberLog,
   setInterval,
-  clearInterval
+  clearInterval,
+  onLag: lagMs => {
+    lastLagMs = lagMs
+  }
 })
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
@@ -11080,9 +11110,27 @@ async function ensureRegistryBackend(
       ensureHealthyPooledRemoteBackendForDispatch({
         connectionPromise,
         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
+        hostEvent: {
+          backoff: async () => {
+            await sleep(HOST_EVENT_BACKOFF_MS)
+          },
+          classify: () => registryHostEvents.recordProbeFailure(String(id), key),
+          // The transport this descriptor rides. `-O check` against the live
+          // master is far cheaper than the teardown it is deciding against; a
+          // non-SSH remote has no such handle, so its re-probe alone decides.
+          hostAlive: async () => {
+            if (source.kind !== 'ssh') {
+              return true
+            }
+
+            const ssh = sshConnections.get(key)?.ssh
+
+            return ssh ? Boolean(await ssh.isAlive()) : false
+          }
+        },
+        log: message => rememberLog(message),
         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
-        log: message => rememberLog(message),
         tracker: pooledRemoteLiveness,
         // A pooled SSH entry has no child to report its far end dying, and the
         // bound local forward turns that death into a probe stall — the shape
@@ -11115,18 +11163,23 @@ async function ensureRegistryBackend(
   assertNotPassiveSpawn(passive, key)
   const entry = newPoolEntry()
 
-  entry.connectionPromise = connectRegistryBackend(
-    source,
-    profile,
-    key,
-    entry,
-    resolveRegistrySshConfig(),
-    source.kind === 'ssh' ? resolveRegistryEffectiveFingerprint() : null,
-    managedUpdateCorrelation
-  ).catch(error => {
-    forgetFailedPoolEntry(key, entry)
-    throw error
-  })
+  // Resolve the dial's inputs now, before the gate can defer it: a queued dial
+  // must use the settings that were current when it was requested.
+  const dialSshConfig = resolveRegistrySshConfig()
+  const dialFingerprint = source.kind === 'ssh' ? resolveRegistryEffectiveFingerprint() : null
+
+  // Staggered through the per-connection gate: a fleet-wide retire round would
+  // otherwise hand this host every SSH handshake + remote backend boot at once.
+  // A dial that finds a free slot is not delayed at all, so a lone reconnect
+  // stays as fast as it was.
+  entry.connectionPromise = registryDialGate
+    .run(String(id), () =>
+      connectRegistryBackend(source, profile, key, entry, dialSshConfig, dialFingerprint, managedUpdateCorrelation)
+    )
+    .catch(error => {
+      forgetFailedPoolEntry(key, entry)
+      throw error
+    })
   backendPool.set(key, entry)
 
   return entry.connectionPromise
@@ -11874,6 +11927,20 @@ async function restartAttachedLocalGateway(profile: string): Promise<void> {
 
   if (endpoint) {
     await restartLocalGatewayOwner(gatewayOwnerProfile(endpoint))
+
+    return
+  }
+
+  // No descriptor to name the owner from. This is the state a dropped connection
+  // leaves behind — the descriptor that would have answered was invalidated by the
+  // very failure the user is trying to recover from — so falling through here made
+  // "Restart backend" a silent no-op exactly when it was offered. Fall back to the
+  // profile name: `gateway restart` resolves a served secondary to its host
+  // multiplexer on its own, and a remote backend has no local gateway to restart.
+  const target = localGatewayRestartTarget(profile, primaryProfileKey(), p => profileHasRemoteOverride(p) || globalRemoteActive())
+
+  if (target) {
+    await restartLocalGatewayOwner(target)
   }
 }
 
@@ -14485,6 +14552,27 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   return remoteRevalidation.run(connectionPromise, async () => {
     const [result] = await Promise.all([
       revalidateRemoteConnection({
+        // The primary connection is alone on its gateway, so it cannot use the
+        // pooled host-event vote. Give it the same grace by other means: pause,
+        // confirm the SSH master is still up, and re-probe once. A backend that
+        // answers after the pause was busy, not dead — and keeping it avoids a
+        // whole-app reload for a load spike.
+        confirmDrop: {
+          backoff: async () => {
+            await sleep(HOST_EVENT_BACKOFF_MS)
+          },
+          transportAlive: async () => {
+            const conn = await connectionPromise.catch(() => null)
+
+            if (conn?.remoteKind !== 'ssh') {
+              return true
+            }
+
+            const state = sshConnections.get(sshScopeKey(primaryProfileKey()))
+
+            return state?.ssh ? await state.ssh.isAlive().catch(() => false) : false
+          }
+        },
         connectionPromise,
         currentConnectionPromise: () => backendConnectionState.getPromise(),
         log: rememberLog,

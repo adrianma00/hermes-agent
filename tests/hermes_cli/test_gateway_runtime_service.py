@@ -459,3 +459,89 @@ def test_task_discovery_reads_localized_schtasks_output(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "_run", run)
     found = service.discover_existing_gateway_service(home, deadline=time.monotonic() + 5)
     assert found is not None and found.start_argv == ("schtasks.exe", "/Run", "/TN", name)
+
+
+# --- launchd ProgramArguments identity ---------------------------------------
+#
+# macOS launchd persists the gateway behind a JXA/osascript wrapper (#71206) and
+# behind the stderr-timestamp gate. Identity verification has to unwrap both;
+# reading either wrapper as the gateway refused a healthy installed job, which
+# is what left `ensure` reporting service_identity_unverified and stopped the
+# desktop from restarting its own backend.
+
+
+def _installed_launcher_command(tmp_path, *, launcher="/tmp/store/.hermes/bin/hermes"):
+    """The argv an installed gateway actually persists (source-launcher shim)."""
+    return [
+        launcher,
+        "--run-module",
+        "hermes_cli.stderr_timestamp",
+        "--error-log",
+        str(tmp_path / "gateway.error.log"),
+        "--",
+        launcher,
+        "gateway",
+        "run",
+        "--external-supervisor",
+    ]
+
+
+def test_gateway_argv_accepts_the_osascript_launchd_wrapper(tmp_path):
+    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    argv = launchd_program_arguments(
+        _installed_launcher_command(tmp_path),
+        tmp_path / "gateway.log",
+        tmp_path / "gateway.error.log",
+    )
+
+    # The wrapper really is the shape the verifier is expected to unwrap.
+    assert argv[0] == "/usr/bin/osascript"
+
+    verify_gateway_argv(argv, tmp_path)
+
+
+def test_gateway_argv_accepts_the_run_module_shim_spelling(tmp_path):
+    """`hermes --run-module …` is what launchd persists; only `-m` was known."""
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    verify_gateway_argv(_installed_launcher_command(tmp_path), tmp_path)
+
+
+def test_gateway_argv_refuses_a_foreign_jxa_program(tmp_path):
+    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    argv = launchd_program_arguments(
+        ["/bin/sh", "-c", "sleep 3600"],
+        tmp_path / "gateway.log",
+        tmp_path / "gateway.error.log",
+    )
+
+    with pytest.raises(ValueError, match="service_identity_unverified"):
+        verify_gateway_argv(argv, tmp_path)
+
+
+def test_gateway_argv_refuses_a_hand_rolled_jxa_program(tmp_path):
+    """A program that merely looks like JXA must not borrow our identity."""
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    argv = [
+        "/usr/bin/osascript",
+        "-l",
+        "JavaScript",
+        "-e",
+        'ObjC.import("stdlib"); const status=$.system("exec /usr/bin/true"); '
+        "const signal=status & 127; $.exit(0);",
+    ]
+
+    with pytest.raises(ValueError, match="service_identity_unverified"):
+        verify_gateway_argv(argv, tmp_path)
+
+
+def test_gateway_argv_refuses_an_osascript_wrapper_of_the_wrong_arity(tmp_path):
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    with pytest.raises(ValueError, match="service_identity_unverified"):
+        verify_gateway_argv(["/usr/bin/osascript", "-l", "JavaScript"], tmp_path)

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { getStatus } from '@/hermes'
 import { type I18nContextValue, useI18n } from '@/i18n'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { refreshCodeSkew } from '@/store/code-skew'
 import { $freeTierStatus, refreshFreeTierStatus, setFreeTierRoute } from '@/store/free-tier'
 import { $setupReadyTick } from '@/store/live-sync'
 import { dismissNotification, notify } from '@/store/notifications'
@@ -75,7 +76,10 @@ export function useStatusSnapshot(
         // are seams this window may never cross again, so a gateway flap
         // outliving one seam would pin the chip for good. Once a verdict
         // exists the tick stays status-only, keeping the ambient poll cheap.
-        timer = window.setTimeout(() => void refresh({ readiness: !readinessAnswered }), REFRESH_MS)
+        timer = window.setTimeout(
+          () => void refresh({ readiness: !readinessAnswered, force: owesVerdict() }),
+          REFRESH_MS,
+        )
       }
     }
 
@@ -84,6 +88,17 @@ export function useStatusSnapshot(
       // the missing signal that prevents status + readiness RPCs while the
       // user is working in another app.
       document.visibilityState === 'visible' && document.hasFocus()
+
+    // The focus gate above is wrong in exactly one state: connected, but no
+    // authoritative inference verdict yet. The chip reads that as "checking"
+    // (runtimeReadinessDisplay(null)) even though the backend is demonstrably
+    // reachable, and the only events that would clear it — this run's own
+    // refresh and the focus listener — are the ones the gate just suppressed.
+    // Recovering from a drop while the user is in another app therefore left a
+    // healthy gateway looking stuck until they happened to click the window.
+    // A verdict owed for an open connection is worth one round regardless of
+    // focus; once published the flag flips and the gate applies again.
+    const owesVerdict = () => gatewayState === 'open' && !readinessAnswered
 
     // Inference readiness + the free-tier verdict. Not on the periodic tick:
     // both change only at seams the backend announces (`setup.ready` at boot)
@@ -134,8 +149,14 @@ export function useStatusSnapshot(
         // allowed a slow runtime check to overlap with later polls, which
         // multiplied load on an already-busy gateway and let stale failures
         // race newer healthy results.
+        //
+        // The skew probe rides EVERY round, not only the readiness ones: a
+        // `hermes update` can land at any moment while the app stays connected,
+        // and the pill is the one surface that must not keep saying "ready" for
+        // it. It is a bounded read of a field the server already computes.
         const [statusResult] = await Promise.allSettled([
           getStatus(),
+          refreshCodeSkew(),
           readiness ? refreshReadiness() : Promise.resolve()
         ])
 
@@ -207,7 +228,9 @@ export function useStatusSnapshot(
 
     document.addEventListener('visibilitychange', onReturn)
     window.addEventListener('focus', onReturn)
-    void refresh({ readiness: true })
+    // A run that enters already-open (boot attaching to a live gateway, or a
+    // reconnect) owes a verdict and must not wait for a click to learn it.
+    void refresh({ readiness: true, force: owesVerdict() })
 
     return () => {
       cancelled = true

@@ -4069,6 +4069,7 @@ export const zhOverrides = {
       gatewayConnecting: '连接中',
       gatewayOffline: '离线',
       gatewayRestarting: '重启中…',
+      staleCode: '代码陈旧，需重启',
       gatewayTitle: '网关',
       customizeTitle: '在状态栏中显示',
       hideStatusbar: '隐藏状态栏',

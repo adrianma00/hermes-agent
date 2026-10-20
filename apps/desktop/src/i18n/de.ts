@@ -4653,6 +4653,7 @@ export const deOverrides = {
       gatewayConnecting: 'wird verbunden',
       gatewayOffline: 'offline',
       gatewayRestarting: 'wird neu gestartet…',
+      staleCode: 'alter Code – Neustart nötig',
       gatewayTitle: 'Gateway',
       customizeTitle: 'In der Statusleiste anzeigen',
       hideStatusbar: 'Statusleiste ausblenden',

@@ -20,7 +20,7 @@ function confirmModelWarning(message: string): Promise<boolean> {
       }
 
       settled = true
-      dismissNotification(id)
+      dismissNotification(id, 'superseded')
       resolve(value)
     }
 

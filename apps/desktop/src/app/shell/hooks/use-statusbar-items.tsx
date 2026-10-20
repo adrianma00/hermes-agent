@@ -43,6 +43,7 @@ import { resolveVersionStatus } from '@/lib/version-status'
 import type { ApprovalModeRequester } from '@/store/approval-mode'
 import { copyFilePath, revealFile, shouldOfferLocalReveal } from '@/store/file-actions'
 import { $freeTierSignInOpen, $freeTierStatus, FREE_TIER_MODEL } from '@/store/free-tier'
+import { $codeSkewed } from '@/store/code-skew'
 import { openFreeTierSignIn } from '@/store/free-tier-sign-in'
 import { requestGatewayForProfile } from '@/store/gateway'
 import { revealFileInTree } from '@/store/layout'
@@ -185,6 +186,10 @@ export function useStatusbarItems({
   // Backend truth for the free-tier chip. Refreshed on the ambient status
   // cadence (use-status-snapshot), never polled from here.
   const freeTier = useStore($freeTierStatus)
+  // Stale backend code, reported by the server's own health probe. Read from the
+  // store rather than probed here so the pill, the menus and the toast all share
+  // one verdict and one refresh.
+  const codeSkewed = useStore($codeSkewed)
   // The chip is the standing invitation to sign in. It rests while a guided
   // setup is running, so the chat the user is in has no second call to action,
   // and comes back when the setup ends.
@@ -372,6 +377,7 @@ export function useStatusbarItems({
   const gatewayConnecting = gatewayState === 'connecting'
 
   const gatewayHealth = statusBarGatewayHealth({
+    codeSkewed,
     connectionState: gatewayState,
     copy: {
       backend: copy.backend,
@@ -383,6 +389,7 @@ export function useStatusbarItems({
       offline: copy.gatewayOffline,
       ready: copy.gatewayReady,
       restarting: copy.gatewayRestarting,
+      staleCode: copy.staleCode,
       unavailable: copy.gatewayUnavailable
     },
     inferenceStatus,

@@ -188,14 +188,14 @@ export function reportBackendContract(contract: number | undefined, protocol?: s
     protocol === undefined ? (contract ?? 0) : protocol === CANONICAL_GATEWAY_PROTOCOL ? REQUIRED_BACKEND_CONTRACT : 0
 
   if (reported >= REQUIRED_BACKEND_CONTRACT) {
-    dismissNotification(SKEW_TOAST_ID)
+    dismissNotification(SKEW_TOAST_ID, 'recovered')
     // Backend caught up — forget any prior snooze so a future regression warns
     // immediately rather than staying silent for the rest of the window.
     persistString(SKEW_TOAST_SNOOZE_KEY, null)
   }
 
   if (reported <= REQUIRED_BACKEND_CONTRACT) {
-    dismissNotification(GUI_SKEW_TOAST_ID)
+    dismissNotification(GUI_SKEW_TOAST_ID, 'recovered')
     // GUI caught up (or the backend rolled back) — same reset for the reverse
     // direction.
     persistString(GUI_SKEW_TOAST_SNOOZE_KEY, null)

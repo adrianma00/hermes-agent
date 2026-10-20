@@ -134,20 +134,31 @@ describe('useStatusSnapshot', () => {
     expect($freeTierStatus.get()).toBeNull()
   })
 
-  it('pauses status RPCs while visible but unfocused, then catches up on focus', async () => {
+  it('answers an owed verdict while unfocused, then pauses status RPCs until focus', async () => {
     vi.mocked(document.hasFocus).mockReturnValue(false)
-    const requestGateway = vi.fn().mockResolvedValue({}) as unknown as GatewayRequester
+    const requestGatewayMock = vi.fn(async (method: string) =>
+      method === 'setup.runtime_check' ? { ok: true } : { provider_configured: true }
+    )
+
+    const requestGateway = requestGatewayMock as unknown as GatewayRequester
 
     renderHook(() => useStatusSnapshot('open', requestGateway))
     await flushAsync()
 
-    expect(getStatus).not.toHaveBeenCalled()
-    expect(requestGateway).not.toHaveBeenCalled()
+    // Connected with no verdict yet: one round runs regardless of focus,
+    // because otherwise the chip reads "checking" for a backend that is
+    // demonstrably reachable and only a click would correct it.
+    expect(getStatus).toHaveBeenCalledOnce()
+
+    // That verdict is the only thing owed. Ambient polling stays paused.
+    vi.mocked(getStatus).mockClear()
+    const rounds = requestGatewayMock.mock.calls.length
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60_000)
     })
     expect(getStatus).not.toHaveBeenCalled()
+    expect(requestGatewayMock.mock.calls.length).toBe(rounds)
 
     vi.mocked(document.hasFocus).mockReturnValue(true)
     window.dispatchEvent(new Event('focus'))
@@ -155,7 +166,63 @@ describe('useStatusSnapshot', () => {
 
     expect(getStatus).toHaveBeenCalledOnce()
     // One refresh round = setup.status + setup.runtime_check + free_tier.status.
-    expect(requestGateway).toHaveBeenCalledTimes(3)
+    expect(requestGatewayMock.mock.calls.length - rounds).toBe(3)
+  })
+
+  it('publishes a verdict for a connection that recovers while the window is unfocused', async () => {
+    // The reported bug: the gateway drops and reconnects while the user is in
+    // another app, so the only readiness round was the focus-gated one. The
+    // chip read "checking" for a healthy backend until the user clicked the
+    // window. A connection that comes up owes a verdict whether or not anyone
+    // is looking at it.
+    vi.mocked(document.hasFocus).mockReturnValue(false)
+    const requestGatewayMock = vi.fn(async (method: string) =>
+      method === 'setup.runtime_check' ? { ok: true } : { provider_configured: true }
+    )
+
+    const requestGateway = requestGatewayMock as unknown as GatewayRequester
+
+    const { result, rerender } = renderHook(
+      ({ state }: { state: 'open' | 'closed' }) => useStatusSnapshot(state, requestGateway),
+      { initialProps: { state: 'closed' as 'open' | 'closed' } }
+    )
+
+    await flushAsync()
+    expect(result.current.inferenceStatus).toBeNull()
+
+    rerender({ state: 'open' })
+    await flushAsync()
+
+    expect(result.current.inferenceStatus).toMatchObject({ ready: true, source: 'runtime_check' })
+  })
+
+  it('un-pins a connected but unanswered chip on the tick while unfocused', async () => {
+    // A round that fails both readiness legs leaves no verdict, so the chip
+    // stays "checking". The tick is the designed retry for that case, and the
+    // focus gate must not quietly defeat it while the window is in the
+    // background.
+    vi.mocked(document.hasFocus).mockReturnValue(false)
+    let answering = false
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (!answering) {
+        throw new Error(`${method} connection closed`)
+      }
+
+      return (method === 'setup.runtime_check' ? { ok: true } : { provider_configured: true }) as never
+    }) as unknown as GatewayRequester
+
+    const { result } = renderHook(() => useStatusSnapshot('open', requestGateway))
+    await flushAsync()
+    expect(result.current.inferenceStatus).toBeNull()
+
+    answering = true
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+
+    expect(result.current.inferenceStatus).toMatchObject({ ready: true, source: 'runtime_check' })
   })
 
   it('keeps the last authoritative readiness through a transient RPC failure', async () => {
@@ -504,15 +571,20 @@ describe('useStatusSnapshot', () => {
   })
 
   it('does not force a background poll on non-success onboarding transitions while unfocused', async () => {
-    const requestGateway = vi.fn(
+    const requestGatewayMock = vi.fn(
       async (method: string) =>
         (method === 'setup.runtime_check' ? { ok: true } : { provider_configured: true }) as never
-    ) as unknown as GatewayRequester
+    )
+
+    const requestGateway = requestGatewayMock as unknown as GatewayRequester
 
     vi.mocked(document.hasFocus).mockReturnValue(false)
     renderHook(() => useStatusSnapshot('open', requestGateway))
     await flushAsync()
-    expect(requestGateway).not.toHaveBeenCalled()
+
+    // An open connection owes one verdict round even unfocused (see the
+    // owed-verdict tests); the onboarding seam is measured against that.
+    const rounds = requestGatewayMock.mock.calls.length
 
     // A non-success flow change (e.g. entering the polling state) must not
     // trigger the focus-bypassing refresh — only auth success does.
@@ -524,6 +596,6 @@ describe('useStatusSnapshot', () => {
       await vi.advanceTimersByTimeAsync(0)
     })
 
-    expect(requestGateway).not.toHaveBeenCalled()
+    expect(requestGatewayMock.mock.calls.length).toBe(rounds)
   })
 })

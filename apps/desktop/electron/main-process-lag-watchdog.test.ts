@@ -10,6 +10,7 @@ function harness({ now = 0, cadenceMs = 1_000, thresholdMs = 2_000 } = {}) {
   let callback: TimerCallback | undefined
   let cleared: unknown
   const logs: string[] = []
+  let lastOnLag: number | undefined
 
   const watchdog = createMainProcessLagWatchdog({
     cadenceMs,
@@ -23,7 +24,10 @@ function harness({ now = 0, cadenceMs = 1_000, thresholdMs = 2_000 } = {}) {
     clearInterval: timer => {
       cleared = timer
     },
-    thresholdMs
+    thresholdMs,
+    onLag: lagMs => {
+      lastOnLag = lagMs
+    }
   })
 
   return {
@@ -33,7 +37,8 @@ function harness({ now = 0, cadenceMs = 1_000, thresholdMs = 2_000 } = {}) {
       clock = at
       callback?.()
     },
-    cleared: () => cleared
+    cleared: () => cleared,
+    lastOnLag: () => lastOnLag
   }
 }
 
@@ -57,6 +62,28 @@ describe('createMainProcessLagWatchdog', () => {
     expect(subject.logs).toEqual([
       '[diagnostics] main-process event loop lagged 2500ms (expected tick at 1000ms, observed at 3500ms)'
     ])
+  })
+
+  it('fires onLag when a tick arrives late', () => {
+    const subject = harness()
+
+    subject.watchdog.start()
+    subject.tick(3_500)
+
+    expect(subject.lastOnLag()).toBe(2_500)
+  })
+
+  it('keeps onLag at the last known value after a healthy tick (not reset)', () => {
+    const subject = harness()
+
+    subject.watchdog.start()
+    subject.tick(3_500)
+    expect(subject.lastOnLag()).toBe(2_500)
+
+    // A healthy tick follows — onLag is not reset (consumers check the
+    // value and track their own coalesced state).
+    subject.tick(4_500)
+    expect(subject.lastOnLag()).toBe(2_500)
   })
 
   it('cleans up its interval and does not log after stop', () => {

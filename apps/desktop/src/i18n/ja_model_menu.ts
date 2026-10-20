@@ -2,6 +2,7 @@ export const jaModelMenu = {
   search: 'モデルを検索',
   noModels: 'モデルが見つかりません',
   editModels: 'モデルを編集…',
+  staleBackend: '古いバックエンド — 再起動',
   followDefault: '設定のデフォルトを使用',
   refreshModels: 'モデルを更新',
   favorites: 'お気に入り',

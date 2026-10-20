@@ -3033,6 +3033,7 @@ export const jaOverrides = {
       gatewayConnecting: '接続中',
       gatewayOffline: 'オフライン',
       gatewayRestarting: '再起動中…',
+      staleCode: '古いコード — 再起動が必要',
       gatewayTitle: 'ゲートウェイ',
       agents: 'エージェント',
       closeAgents: 'エージェントを閉じる',

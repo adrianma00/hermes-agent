@@ -17,6 +17,8 @@ export interface GatewayHealthPillCopy {
   ready: string
   restarting: string
   unavailable: string
+  /** Detail when the connected backend is running stale code (`code_skew`). */
+  staleCode: string
 }
 
 export interface GatewayHealthPlatform {
@@ -24,6 +26,8 @@ export interface GatewayHealthPlatform {
 }
 
 export interface GatewayHealthPillInput {
+  /** Backend health as the server reports it (`code_skew` present). `null` = not probed yet. */
+  codeSkewed?: boolean | null
   connectionState: string
   copy: GatewayHealthPillCopy
   inferenceStatus: RuntimeReadinessResult | null
@@ -86,6 +90,7 @@ function inferenceDetail(copy: GatewayHealthPillCopy, inferenceStatus: RuntimeRe
 }
 
 export function statusBarGatewayHealth({
+  codeSkewed = null,
   connectionState,
   copy,
   inferenceStatus,
@@ -107,16 +112,23 @@ export function statusBarGatewayHealth({
       ? copy.connecting
       : copy.offline
 
+  // Stale code outranks the inference verdict: the process is serving modules
+  // older than the checkout, so "ready" is the one thing this pill must not say.
+  // Only while connected — a down backend has no verdict to colour.
+  const stale = connectionOpen && codeSkewed === true
+
   const detail = restarting
     ? copy.restarting
-    : messagingDown && connectionOpen
-      ? messagingDetail(copy, downNames)
-      : connectionDetail
+    : stale
+      ? copy.staleCode
+      : messagingDown && connectionOpen
+        ? messagingDetail(copy, downNames)
+        : connectionDetail
 
   return {
-    degraded: Boolean(messagingDown && connectionOpen),
+    degraded: Boolean((messagingDown && connectionOpen) || stale),
     detail,
     label: copy.backend,
-    title: messagingDown && connectionOpen ? messagingDetail(copy, downNames) : undefined
+    title: stale ? copy.staleCode : messagingDown && connectionOpen ? messagingDetail(copy, downNames) : undefined
   }
 }

@@ -7,6 +7,12 @@ interface MainProcessLagWatchdogOptions {
   log: (message: string) => void
   setInterval: (callback: () => void, delayMs: number) => IntervalHandle
   clearInterval: (timer: IntervalHandle) => void
+  /**
+   * Fires when a tick arrives past `thresholdMs` after the expected time.
+   * `lagMs` is the observed delay (>= thresholdMs). Consumers use this to
+   * coalesce backlogged timer work after an event-loop freeze.
+   */
+  onLag?: (lagMs: number) => void
 }
 
 /**
@@ -20,7 +26,8 @@ export function createMainProcessLagWatchdog({
   now,
   log,
   setInterval,
-  clearInterval
+  clearInterval,
+  onLag
 }: MainProcessLagWatchdogOptions) {
   let timer: IntervalHandle | undefined
   let expectedAt = 0
@@ -37,6 +44,7 @@ export function createMainProcessLagWatchdog({
       log(
         `[diagnostics] main-process event loop lagged ${lagMs}ms (expected tick at ${expectedAt}ms, observed at ${observedAt}ms)`
       )
+      onLag?.(lagMs)
     }
 
     // Rebase after every callback: one late tick is evidence, not a reason to

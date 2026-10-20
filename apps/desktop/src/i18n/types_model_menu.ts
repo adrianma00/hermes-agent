@@ -2,6 +2,7 @@ export interface ModelMenuTranslations {
   search: string
   noModels: string
   editModels: string
+  staleBackend: string
   followDefault: string
   refreshModels: string
   favorites: string

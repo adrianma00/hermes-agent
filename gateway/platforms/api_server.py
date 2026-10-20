@@ -2368,7 +2368,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """GET /health — simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
+        body: dict[str, object] = {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+        try:
+            from gateway.code_skew import detect_code_skew
+            skew = detect_code_skew()
+            if skew is not None:
+                body["code_skew"] = {"boot_rev": skew[0], "disk_rev": skew[1]}
+        except Exception:
+            pass
+        return web.json_response(body)
 
     @_require_auth
     async def _handle_health_detailed(self, request: web.Request) -> web.Response:

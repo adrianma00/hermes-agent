@@ -309,13 +309,13 @@ describe('reportBackendContract', () => {
 
   it('dismisses the toast when the backend meets the contract', () => {
     reportBackendContract(REQUIRED_BACKEND_CONTRACT)
-    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
+    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew', 'recovered')
     expect(notifySpy).not.toHaveBeenCalled()
   })
 
   it('accepts only the matching canonical gateway protocol without claiming the legacy contract', () => {
     reportBackendContract(undefined, CANONICAL_GATEWAY_PROTOCOL)
-    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
+    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew', 'recovered')
     expect(notifySpy).not.toHaveBeenCalled()
 
     reportBackendContract(undefined, 'hermes-gateway-v0')
@@ -368,7 +368,7 @@ describe('reportBackendContract', () => {
   it('warns when the GUI is older than the backend (contract ahead of this build)', () => {
     reportBackendContract(REQUIRED_BACKEND_CONTRACT + 1)
     // The backend-older toast must not fire — this is the reverse direction.
-    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
+    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew', 'recovered')
     expect(notifySpy).toHaveBeenCalledTimes(1)
     expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({ id: 'gui-contract-skew', kind: 'warning' })
   })
@@ -395,7 +395,7 @@ describe('reportBackendContract', () => {
     notifySpy.mockClear()
 
     reportBackendContract(REQUIRED_BACKEND_CONTRACT) // GUI updated (or backend rolled back) → aligned
-    expect(dismissSpy).toHaveBeenCalledWith('gui-contract-skew')
+    expect(dismissSpy).toHaveBeenCalledWith('gui-contract-skew', 'recovered')
 
     reportBackendContract(REQUIRED_BACKEND_CONTRACT + 1) // a later skew must warn immediately
     expect(notifySpy).toHaveBeenCalledTimes(1)

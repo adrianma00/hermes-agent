@@ -90,10 +90,12 @@ test('notifyError posts the full error to desktop.log, not the summary', () => {
 
     notifyError(error, 'Prompt failed')
 
-    expect(logLine).toHaveBeenCalledTimes(1)
-    expect(logLine.mock.calls[0][0]).toContain('Prompt failed')
-    expect(logLine.mock.calls[0][0]).toContain('database is locked')
-    expect(logLine.mock.calls[0][0]).toContain('session.ts:12')
+    // Two lines now: the error's full stack, and the toast's own lifecycle
+    // record. The invariant this test guards is the ERROR line — the full
+    // stack must reach desktop.log, not the summarized toast copy.
+    const errorLine = logLine.mock.calls.map(([line]) => line).find(line => line?.includes('Prompt failed'))
+    expect(errorLine).toContain('database is locked')
+    expect(errorLine).toContain('session.ts:12')
   } finally {
     if (previous === undefined) {
       delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
