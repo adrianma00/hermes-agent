@@ -239,6 +239,26 @@ customization -- a deliberate, recorded divergence, not an oversight.
 
 ---
 
+## 12. Matrix extra installable on Windows
+
+- **What**: `[project.optional-dependencies] matrix` (5 pins) and `[tool.hermes.extras-platforms] matrix`
+  carry `sys_platform == 'win32'` alongside Linux and macOS, so `hermes pm install --extra matrix` works
+  on a Windows peer. `matrix-e2ee` stays Linux-only — `python-olm` ships no win/darwin build.
+- **Why**: the fleet runs a Windows peer (Surface). Upstream gates the matrix extra to Linux and macOS, so
+  the adapter can never be installed there without this edit.
+- **Where**: `pyproject.toml` (shared file, no fork-only module).
+- **Danger — the shape of the marker is load-bearing.** Write it as an OR chain:
+  `sys_platform == 'linux' or sys_platform == 'darwin' or sys_platform == 'win32'`.
+  The shorter-looking `sys_platform in ('linux', 'darwin', 'win32')` is **NOT valid PEP 508** — a tuple is
+  not a marker value — and every `pip install .[matrix]` then dies with `InvalidRequirement`. It survives
+  `tomllib`, which parses TOML only and validates no markers, so a patch that "validates" there can still
+  be broken. Check it with `packaging.requirements.Requirement("mautrix==0.21.1; <marker>")`, not with
+  `tomllib`. (This exact mistake shipped to a live peer first: the deps had been installed as an explicit
+  package list by `uv pip`, which never evaluates the extra, so nothing caught it.)
+- **Upstream-watch**: `[tool.hermes.extras-platforms]`, `matrix = `, `sys_platform`
+
+---
+
 ## Maintenance
 
 - **Adding a feature**: add a section in the same style, and add every new fork-only path to the block
