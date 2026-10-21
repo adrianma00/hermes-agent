@@ -43,6 +43,74 @@ class TestSupervisionMarker:
         assert serve_supervision.supervision_marker() == "supervisord"
 
 
+class TestLaunchdSupervision:
+    """macOS sets no environment marker, so ownership of the process is the evidence.
+
+    A plist on disk is not evidence (an unloaded job never claims a pid); the loaded job's
+    live pid must be THIS process.
+    """
+
+    @pytest.fixture
+    def darwin(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        return monkeypatch
+
+    def _jobs(self, monkeypatch, jobs):
+        import hermes_cli.main_dashboard as dash
+
+        monkeypatch.setattr(dash, "_loaded_launchd_backend_jobs", lambda *a, **k: jobs, raising=False)
+
+    def test_ownership_of_this_process_is_supervision(self, darwin):
+        import os
+
+        self._jobs(
+            darwin,
+            [("gui/501", "com.hermes.dashboard", ["hermes", "dashboard"], os.getpid())],
+        )
+
+        assert serve_supervision.launchd_supervision() == "launchd:com.hermes.dashboard"
+
+    def test_another_pid_s_job_is_not_ours(self, darwin):
+        self._jobs(
+            darwin,
+            [("gui/501", "com.hermes.dashboard", ["hermes", "dashboard"], 999999)],
+        )
+
+        assert serve_supervision.launchd_supervision() is None
+
+    def test_a_broken_probe_reads_as_no_marker(self, darwin):
+        import hermes_cli.main_dashboard as dash
+
+        def _boom(*a, **k):
+            raise RuntimeError("launchctl exploded")
+
+        darwin.setattr(dash, "_loaded_launchd_backend_jobs", _boom, raising=False)
+
+        assert serve_supervision.launchd_supervision() is None
+
+    def test_not_macos_is_never_a_marker(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        assert serve_supervision.launchd_supervision() is None
+
+    def test_it_answers_respawn_expected_before_any_proof(self, darwin, tmp_path):
+        import os
+
+        self._jobs(
+            darwin,
+            [("gui/501", "com.hermes.dashboard", ["hermes", "dashboard"], os.getpid())],
+        )
+
+        assert serve_supervision.respawn_expected(port=9119, home=tmp_path) == (
+            True,
+            "launchd:com.hermes.dashboard",
+        )
+
+
 class TestRespawnProof:
     def test_a_first_boot_proves_nothing(self, tmp_path):
         serve_supervision.note_boot(port=9120, pid=100, home=tmp_path, now=1_000.0)

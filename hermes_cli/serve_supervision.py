@@ -14,7 +14,9 @@ Two signals, cheapest first, and neither guesses per-OS:
 ``supervision_marker()`` reads what a supervisor stamped into the environment. It is
 definitive when present (systemd stamps ``INVOCATION_ID``/``SYSTEMD_EXEC_PID`` on every
 unit process) and absent for a shell-started one. launchd and the Windows service
-manager stamp nothing, so absence proves nothing — and is never read as proof.
+manager stamp nothing, so absence proves nothing — and is never read as proof. launchd is
+covered by its own probe instead (``launchd_supervision``): a loaded job whose live pid is
+this process is exactly the question the updater already asks to decide kickstart-vs-respawn.
 
 ``respawn proof`` is the OS-agnostic answer for those. Every exit writes a timestamp and
 every boot compares itself to it: a graceful exit followed by a boot on the same port
@@ -33,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -61,6 +64,36 @@ def supervision_marker() -> Optional[str]:
         return "systemd"
     if os.environ.get("SUPERVISOR_ENABLED"):
         return "supervisord"
+    return None
+
+
+def launchd_supervision() -> Optional[str]:
+    """``launchd:<label>`` when a LOADED launchd job's live pid is this process.
+
+    macOS stamps nothing into the environment, so there is no marker to read. What it does
+    have is authoritative: a job is loaded or it is not, and ``launchctl print`` names the
+    pid it is running. The fleet already asks that question at update time to decide between
+    a kickstart and a respawn (``main_dashboard._loaded_launchd_backend_jobs``), so the boot
+    path asks the same one rather than inventing a second notion of "supervised".
+
+    Ownership, not mere existence: a plist on disk proves nothing (an unloaded or stale job
+    never claims a process), so only a job whose live pid IS us answers here.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    try:
+        from hermes_cli.main_dashboard import _loaded_launchd_backend_jobs
+
+        pid = os.getpid()
+        for _domain, label, _argv, live_pid in _loaded_launchd_backend_jobs():
+            if live_pid == pid:
+                return f"launchd:{label}"
+    except Exception:
+        # A probe that cannot look is not evidence either way; the respawn proof still
+        # covers this backend, and failing closed here would only mean "no marker".
+        return None
+
     return None
 
 
@@ -174,6 +207,10 @@ def respawn_expected(*, port: Optional[int], home: Optional[Path] = None) -> tup
     if marker:
         return True, f"marker:{marker}"
 
+    supervised_by_launchd = launchd_supervision()
+    if supervised_by_launchd:
+        return True, supervised_by_launchd
+
     if port:
         proof = _load(_state_path(home)).get("proof")
         if isinstance(proof, dict) and isinstance(proof.get("at"), (int, float)):
@@ -193,6 +230,7 @@ def clear(*, home: Optional[Path] = None) -> None:
 __all__ = [
     "RESPAWN_WINDOW_S",
     "clear",
+    "launchd_supervision",
     "note_boot",
     "note_exit",
     "respawn_expected",
