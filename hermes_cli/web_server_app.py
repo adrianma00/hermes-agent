@@ -201,6 +201,18 @@ async def standalone_lifespan(app: "FastAPI"):
         if desktop_owned:
             _terminate_desktop_managed_gateway()
 
+        # Last thing before the process goes: stamp the exit so the NEXT boot can tell a
+        # supervisor's few-second respawn from a human restarting hours later. Written at
+        # the end of teardown, because the gap is measured to the new process's boot.
+        try:
+            from hermes_cli import serve_supervision
+
+            serve_supervision.note_exit(
+                port=getattr(app.state, "bound_port", None), reason="shutdown"
+            )
+        except Exception:
+            logger.debug("serve supervision exit record skipped", exc_info=True)
+
 
 @asynccontextmanager
 async def http_lifespan(app: FastAPI):

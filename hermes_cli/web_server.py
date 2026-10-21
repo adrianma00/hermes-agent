@@ -62,6 +62,7 @@ WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.enviro
 _log = logging.getLogger(__name__)
 
 
+from hermes_cli import serve_supervision
 from hermes_cli.web_server_lifecycle import (
     PORT_IN_USE_EXIT_CODE,
     _dashboard_forwarded_allow_ips,
@@ -1127,6 +1128,25 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
     hr.cleanup_on_exit(role)
 
 
+def _code_skew_watchdog_decision(app, actual_port: int) -> tuple[bool, str]:
+    """``(arm_watchdog, evidence)`` for the code-skew watchdog.
+
+    Retirement is only safe when something will bring the backend back. Precedence is
+    deliberate: ownership first (the Desktop, or the client that owns an SSH-isolated
+    serve — both known by construction), then supervision evidence, which is the case
+    that used to fall through to "no watchdog" and left a stale dashboard serving for
+    days. Unknown supervision is NOT permission: a manual ``hermes dashboard`` in a
+    terminal must not exit into nothing.
+    """
+    if getattr(app.state, "ssh_isolated_clients", None) is not None:
+        return True, "client-owned:ssh-isolated"
+
+    if is_desktop_owned_backend():
+        return True, "client-owned:desktop"
+
+    return serve_supervision.respawn_expected(port=actual_port)
+
+
 def _on_server_started(
     server,
     *,
@@ -1167,6 +1187,14 @@ def _on_server_started(
 
     # No-op for standalone `hermes serve` (no HERMES_PARENT_PID).
     _start_parent_death_watchdog()
+    actual_port = _read_bound_port(server, fallback=port)
+    app.state.bound_port = actual_port
+    # Bookkeeping for "would something respawn me?": this writes the boot record that lets
+    # the NEXT boot claim proof when it lands on the same port inside the window.
+    _best_effort(
+        "serve supervision boot record",
+        lambda: serve_supervision.note_boot(port=actual_port),
+    )
     # SSH-isolated backends are detached from any parent on purpose (#91668); their liveness signal
     # is "does a client still hold a WebSocket" (#101626).
     if getattr(app.state, "ssh_isolated_clients", None) is not None:
@@ -1176,16 +1204,32 @@ def _on_server_started(
         except (TypeError, ValueError):
             grace = DEFAULT_IDLE_GRACE_S
         start_idle_watchdog(server, app.state.ssh_isolated_clients, grace_s=grace)
-    if getattr(app.state, "ssh_isolated_clients", None) is not None or is_desktop_owned_backend():
+    # Retirement is only safe when something will bring the backend back. Three ways to know:
+    # the Desktop owns it (local serve) or its owning client does (SSH-isolated) — both handled
+    # here historically — or it is SUPERVISED, which was the gap: a systemd/launchd/task-managed
+    # dashboard is neither, the host's updater does not know the unit exists, and so a skewed one
+    # stayed up indefinitely. `respawn_expected` answers that from a supervisor's own marker or
+    # from proof accumulated across restarts, and says No when it cannot tell — a manual dashboard
+    # in a terminal must not be killed on a guess.
+    supervised, supervision_evidence = _code_skew_watchdog_decision(app, actual_port)
+    if supervised:
         # The host's updater never restarts this backend (SSH-isolated: only the remote Desktop
         # client holds its token and owner nonce, #91668/#101626; Desktop-owned local serve:
         # the updater defers to the app's ledger-verified restart and the backend otherwise
-        # outlives the handoff, #99859), so it retires itself (between turns) when the install
-        # moves on. The retirement fence closes admission process-wide before the exit, so a
-        # connected Desktop just sees its next request reconnect-respawn the backend on new code.
+        # outlives the handoff, #99859; supervised: nothing tells the updater the unit exists),
+        # so it retires itself (between turns) when the install moves on. The retirement fence
+        # closes admission process-wide before the exit, and whatever supervises it starts a
+        # fresh process on the new code.
         from hermes_cli.web_server_skew_exit import start_code_skew_watchdog
 
         start_code_skew_watchdog(server)
+        _log.info("code-skew watchdog armed (respawn evidence: %s)", supervision_evidence)
+    else:
+        _log.info(
+            "code-skew watchdog not armed: no evidence anything would respawn this backend "
+            "(port %s). It will serve stale code rather than exit into nothing; restart it "
+            "manually after an update.", actual_port,
+        )
     if getattr(app.state, "ssh_isolated_clients", None) is not None and ssh_lock_path and _SSH_OWNER_NONCE:
         # A reconnect that cannot prove this pid is its own drops the lock without signalling us
         # and spawns a new nonce (#132034); retire (between turns) once the lock names that spawn.
@@ -1193,8 +1237,9 @@ def _on_server_started(
 
         start_owner_watchdog(server, lock_path=ssh_lock_path, nonce=_SSH_OWNER_NONCE)
 
-    actual_port = _read_bound_port(server, fallback=port)
-    app.state.bound_port = actual_port
+    # `actual_port` and `app.state.bound_port` were resolved above, before the code-skew
+    # gate needed them: supervision evidence is per PORT, since a pid cannot identify a
+    # service across restarts.
     # Published by /api/host/identity: an attaching `hermes dashboard` must never be routed to a
     # headless backend (a URL with no UI behind it).
     app.state.serves_spa = not headless
