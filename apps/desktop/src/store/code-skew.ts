@@ -16,8 +16,8 @@ export interface CodeSkewDetail {
  * Whether the backend this client is attached to is running code older than the
  * checkout on disk (the post-`hermes update` skew).
  *
- * `null` = not asked yet, OR asked and unprovable. Consumers must render the
- * plain (non-skew) state for null, so an unprobed app never claims a fault.
+ * `null` = not asked yet. Consumers must render the plain (non-skew) state
+ * until an answer lands, so an unprobed app never claims a fault.
  */
 export const $codeSkewed = atom<boolean | null>(null)
 
@@ -50,7 +50,9 @@ interface HealthBody {
   disk_commit?: unknown
 }
 
-type ServiceVerdict = { detail: CodeSkewDetail; state: 'skewed' } | { state: 'clean' | 'unknown' }
+type ServiceVerdict =
+  | { detail: CodeSkewDetail; state: 'skewed' }
+  | { state: 'clean' | 'unverifiable' }
 
 /**
  * Decide ONE service from its health body.
@@ -62,14 +64,18 @@ type ServiceVerdict = { detail: CodeSkewDetail; state: 'skewed' } | { state: 'cl
  * the pair; it just cannot be the ONLY signal, since a process stale enough to
  * matter may predate the field and answer 200 without it.
  *
- * No comparable pair and no verdict is `unknown`, never `clean`. That distinction
- * is the whole point: a skewed dashboard answered exactly that way (200, and no
- * `code_skew`, which its old code could not emit) and the client read it as
- * healthy for two days while the same process refused model switches.
+ * A body with no comparable pair and no verdict is `unverifiable`: a build from
+ * before the pair existed. It is reported as unverifiable rather than skewed, and
+ * callers treat it as clean, because the honest answer is not actionable — such a
+ * build cannot start reporting the pair without an `hermes update`, so a verdict
+ * that never clears would nag forever with nothing to do about it. (This is the
+ * same trap as a skew verdict with no retire path.) The cost is explicit: during
+ * the transition, a stale pre-pair build still reads clean, exactly as it did
+ * before this change. Only the payload fix removes that class for good.
  */
 function verdictFor(body: unknown): ServiceVerdict {
   if (!body || typeof body !== 'object') {
-    return { state: 'unknown' }
+    return { state: 'unverifiable' }
   }
 
   const health = body as HealthBody
@@ -91,7 +97,7 @@ function verdictFor(body: unknown): ServiceVerdict {
   const disk = typeof health.disk_commit === 'string' ? health.disk_commit : null
 
   if (!boot || !disk) {
-    return { state: 'unknown' }
+    return { state: 'unverifiable' }
   }
 
   if (boot === disk) {
@@ -120,7 +126,6 @@ export async function refreshCodeSkew(): Promise<boolean> {
   const skewed: BackendService[] = []
   let detail: CodeSkewDetail | null = null
   let answered = false
-  let clean = false
 
   for (const probe of probes) {
     if (probe.status !== 'fulfilled') {
@@ -135,8 +140,6 @@ export async function refreshCodeSkew(): Promise<boolean> {
     if (verdict.state === 'skewed') {
       skewed.push(service)
       detail ??= { ...verdict.detail, service }
-    } else if (verdict.state === 'clean') {
-      clean = true
     }
   }
 
@@ -150,24 +153,19 @@ export async function refreshCodeSkew(): Promise<boolean> {
 
   $codeSkewServices.set([])
 
-  if (clean) {
-    $codeSkew.set(null)
-    $codeSkewed.set(false)
-
-    return false
-  }
-
   // Nothing answered: leave the last verdict alone. A probe that could not run is
   // not evidence that the code is current.
   if (!answered) {
     return $codeSkewed.get() === true
   }
 
-  // Answered, but no service could prove either way — a build older than the
-  // revision pair. Unknown is the honest verdict; calling this clean is the exact
-  // false negative that let a skewed dashboard read "ready" indefinitely.
+  // Something answered and none of it was skewed: clean. That includes a service
+  // that answered `unverifiable` (a build older than the revision pair), which is
+  // deliberate — the same "current behaviour" as before this change. Such a build
+  // cannot begin reporting the pair without an `hermes update`, so flagging it
+  // would be a warning with no remedy that only a restart cycle could not clear.
   $codeSkew.set(null)
-  $codeSkewed.set(null)
+  $codeSkewed.set(false)
 
   return false
 }

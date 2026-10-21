@@ -51,15 +51,38 @@ describe('the skew verdict reads revisions, not the backend’s own opinion', ()
     expect($codeSkewServices.get()).toEqual([])
   })
 
-  it('never reports clean when a 200 carries neither revisions nor a verdict', async () => {
-    // The regression: this is exactly what the stale dashboard answered, and
-    // "no field" must read as unknown — not as an authoritative all-clear.
+  it('treats an unverifiable build as clean, exactly as before this change', async () => {
+    // A build older than the revision pair answers 200 with nothing to compare.
+    // It reads CLEAN, deliberately: such a build cannot start reporting the pair
+    // without `hermes update`, so flagging it would be a verdict no restart can
+    // clear — the same trap as a skew verdict with no retire path. The cost is
+    // honest and temporary: a stale pre-pair build still reads clean.
     serve({ '/api/health': { commit: STALE, ok: true } })
 
-    await refreshCodeSkew()
-
-    expect($codeSkewed.get()).toBeNull()
+    expect(await refreshCodeSkew()).toBe(false)
+    expect($codeSkewed.get()).toBe(false)
+    expect($codeSkew.get()).toBeNull()
     expect($codeSkewServices.get()).toEqual([])
+  })
+
+  it('treats a body with no revision fields at all as clean too', async () => {
+    // What a pre-pair gateway answers: status/platform/version, nothing else.
+    serve({ '/health': { platform: 'hermes-agent', status: 'ok', version: '0.22.1' } })
+
+    expect(await refreshCodeSkew()).toBe(false)
+    expect($codeSkewed.get()).toBe(false)
+  })
+
+  it('still names the skewed service when another service is unverifiable', async () => {
+    // The mixed case: one service can prove skew while the other predates the
+    // pair. The proof wins; the unverifiable one never masks it.
+    serve({
+      '/api/health': { status: 'ok', version: '0.22.1' },
+      '/health': { commit: STALE, disk_commit: CURRENT }
+    })
+
+    expect(await refreshCodeSkew()).toBe(true)
+    expect($codeSkewServices.get()).toEqual(['gateway'])
   })
 
   it('still honours the older code_skew verdict for builds that predate the pair', async () => {
