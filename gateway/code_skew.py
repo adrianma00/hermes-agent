@@ -55,3 +55,28 @@ def detect_code_skew() -> tuple[str, str] | None:
     if current is None or current == _boot_fingerprint:
         return None
     return _short(_boot_fingerprint), _short(current)
+
+
+def health_revisions(boot_commit: str | None) -> dict[str, str | None]:
+    """The revision pair every health endpoint publishes.
+
+    ``commit`` is the revision this process BOOTED from — the caller passes it because
+    each server already knows its own. ``disk_commit`` is the checkout on disk NOW, read
+    at request time.
+
+    The pair exists so a client can decide "stale" by comparing two strings, instead of
+    trusting a verdict the backend had to derive. That derivation runs in the process that
+    may itself be stale: a backend old enough to be skewed can predate the ``code_skew``
+    field entirely, answer 200 without it, and a client that reads a missing verdict as
+    "clean" declares a stale process healthy — which is exactly how a dashboard served
+    ``6e4d10829c`` for two days while the checkout sat on a newer revision.
+
+    Both keys are always present and may be ``None``. ``None`` means the revision could
+    not be resolved (non-git install, IO error) — never "matches". Omitting the key would
+    be ambiguous with a build that has no such field, and that ambiguity is the bug.
+    """
+    try:
+        disk_commit = current_code_sha()
+    except Exception:
+        disk_commit = None
+    return {"commit": boot_commit, "disk_commit": disk_commit}

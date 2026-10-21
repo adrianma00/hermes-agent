@@ -123,11 +123,20 @@ async def get_health():
     ``commit`` is the code this process BOOTED from (``get_version_info`` is cached at
     ``web_server`` import): Desktop refuses to attach to a backend whose commit differs from
     its checkout, so a serve that outlived ``hermes update`` is never re-adopted.
+
+    ``disk_commit`` is the checkout on disk at request time. Publishing both lets a client
+    compare two strings and name a stale backend without relying on ``code_skew``, which
+    this process can only report if it booted from code that already knew about it.
     """
     info = get_version_info()
     body: dict[str, object] = {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
-            "commit": info.commit,
             "auth_required": bool(getattr(app.state, "auth_required", False))}
+    try:
+        from gateway.code_skew import health_revisions
+        body.update(health_revisions(info.commit))
+    except Exception:
+        # Never drop the field the Desktop's readiness probe keys on.
+        body["commit"] = info.commit
     try:
         from gateway.code_skew import detect_code_skew
         skew = detect_code_skew()

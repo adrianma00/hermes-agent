@@ -819,6 +819,50 @@ class TestHealthEndpoint:
             assert data["version"] == get_version_info().base_version
 
 
+    @pytest.mark.asyncio
+    async def test_health_reports_boot_and_disk_revisions(self, adapter):
+        """The gateway half publishes the same revision pair as the dashboard.
+
+        It had NO revision at all before this: only the dashboard's `/api/health`
+        carried `commit`, so nothing could compare the two services sharing one
+        checkout. A client now decides "stale" by comparing `commit` (booted from)
+        against `disk_commit` (checkout now) — no reliance on `code_skew`, which a
+        gateway old enough to be skewed predates.
+        """
+        from gateway import code_skew
+
+        boot = "6e4d10829c8db1b4d7d19889eb724bf4480f20ad"
+        disk = "1729888f93cba0a30ccbfc4c67146edeaf4c6071"
+        app = _create_app(adapter)
+        with patch("hermes_cli.version_info.get_version_info") as gvi, patch.object(
+            code_skew, "current_code_sha", return_value=disk
+        ):
+            gvi.return_value = types.SimpleNamespace(commit=boot, base_version="2026.10.1")
+            async with TestClient(TestServer(app)) as cli:
+                data = await (await cli.get("/health")).json()
+
+        assert data["commit"] == boot
+        assert data["disk_commit"] == disk
+
+
+    @pytest.mark.asyncio
+    async def test_health_revision_pair_survives_an_unresolvable_checkout(self, adapter):
+        """Unresolved is `null`, never a silent match with the boot revision."""
+        from gateway import code_skew
+
+        app = _create_app(adapter)
+        with patch("hermes_cli.version_info.get_version_info") as gvi, patch.object(
+            code_skew, "current_code_sha", side_effect=OSError("no git")
+        ):
+            gvi.return_value = types.SimpleNamespace(commit="0fbe50a9d88aa7e1c0b5f3d2e4a6b8c9d0e1f2a3",
+                                                      base_version="2026.10.1")
+            async with TestClient(TestServer(app)) as cli:
+                data = await (await cli.get("/health")).json()
+
+        assert data["commit"] == "0fbe50a9d88aa7e1c0b5f3d2e4a6b8c9d0e1f2a3"
+        assert data["disk_commit"] is None
+
+
 # ---------------------------------------------------------------------------
 # /health/detailed endpoint
 # ---------------------------------------------------------------------------

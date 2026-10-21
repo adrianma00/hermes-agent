@@ -2367,8 +2367,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- HTTP handlers ----------------------------------------------------------------
 
     async def _handle_health(self, request: web.Request) -> web.Response:
-        """GET /health — simple health check."""
+        """GET /health — simple health check.
+
+        Publishes the boot/disk revision pair alongside the version, so a client can decide
+        this gateway is serving stale code by comparing two strings. The gateway is the half
+        that had no revision at all: ``code_skew`` is derived here too, but a gateway old
+        enough to be skewed predates that field and would answer without it.
+        """
         body: dict[str, object] = {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+        try:
+            from hermes_cli.version_info import get_version_info
+
+            from gateway.code_skew import health_revisions
+            body.update(health_revisions(get_version_info().commit))
+        except Exception:
+            pass
         try:
             from gateway.code_skew import detect_code_skew
             skew = detect_code_skew()
