@@ -1,0 +1,129 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({ hermesApi: vi.fn() }))
+
+vi.mock('@/api/client', () => ({ hermesApi: mocks.hermesApi }))
+
+import { $codeSkew, $codeSkewed, $codeSkewServices, clearCodeSkew, refreshCodeSkew } from './code-skew'
+
+// The fault this store exists for: a dashboard served `6e4d10829c` for two days
+// while the checkout sat on `1729888f93c`. It answered /api/health 200 with no
+// `code_skew` — its code predated that field — and the client read "answered
+// without the field" as "clean", so the pill said ready while the same process
+// refused model switches with "Restart required".
+//
+// The revision pair makes that answer decidable without the process judging
+// itself: `commit` is what it booted from, `disk_commit` is the checkout now.
+const STALE = '6e4d10829c8db1b4d7d19889eb724bf4480f20ad'
+const CURRENT = '1729888f93cba0a30ccbfc4c67146edeaf4c6071'
+
+/** Answer each path differently; anything unlisted rejects (endpoint absent). */
+const serve = (byPath: Record<string, unknown>) =>
+  mocks.hermesApi.mockImplementation(async (request: { path: string }) => {
+    if (!(request.path in byPath)) {
+      throw new Error('404')
+    }
+
+    return byPath[request.path]
+  })
+
+beforeEach(() => {
+  mocks.hermesApi.mockReset()
+  clearCodeSkew()
+})
+
+describe('the skew verdict reads revisions, not the backend’s own opinion', () => {
+  it('calls a dashboard whose boot revision differs from disk skewed, and names it', async () => {
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT, ok: true } })
+
+    expect(await refreshCodeSkew()).toBe(true)
+    expect($codeSkewed.get()).toBe(true)
+    expect($codeSkewServices.get()).toEqual(['dashboard'])
+    // Full SHAs, clipped for copy — same shape the server's own code_skew used.
+    expect($codeSkew.get()).toEqual({ boot_rev: '6e4d10829c', disk_rev: '1729888f93', service: 'dashboard' })
+  })
+
+  it('calls equal revisions clean', async () => {
+    serve({ '/api/health': { commit: CURRENT, disk_commit: CURRENT, ok: true } })
+
+    expect(await refreshCodeSkew()).toBe(false)
+    expect($codeSkewed.get()).toBe(false)
+    expect($codeSkewServices.get()).toEqual([])
+  })
+
+  it('never reports clean when a 200 carries neither revisions nor a verdict', async () => {
+    // The regression: this is exactly what the stale dashboard answered, and
+    // "no field" must read as unknown — not as an authoritative all-clear.
+    serve({ '/api/health': { commit: STALE, ok: true } })
+
+    await refreshCodeSkew()
+
+    expect($codeSkewed.get()).toBeNull()
+    expect($codeSkewServices.get()).toEqual([])
+  })
+
+  it('still honours the older code_skew verdict for builds that predate the pair', async () => {
+    serve({
+      '/api/health': { commit: STALE, code_skew: { boot_rev: '6e4d10829c', disk_rev: '1729888f93' }, ok: true }
+    })
+
+    expect(await refreshCodeSkew()).toBe(true)
+    expect($codeSkew.get()).toEqual({ boot_rev: '6e4d10829c', disk_rev: '1729888f93', service: 'dashboard' })
+  })
+
+  it('keeps probing the second service instead of stopping at the first 200', async () => {
+    // A healthy dashboard used to end the round, so a skewed gateway behind it
+    // was never asked. Both are separate processes; both get a turn.
+    serve({
+      '/api/health': { commit: CURRENT, disk_commit: CURRENT },
+      '/health': { commit: STALE, disk_commit: CURRENT }
+    })
+
+    expect(await refreshCodeSkew()).toBe(true)
+    expect($codeSkewServices.get()).toEqual(['gateway'])
+  })
+
+  it('reports both services when both are stale', async () => {
+    serve({
+      '/api/health': { commit: STALE, disk_commit: CURRENT },
+      '/health': { commit: STALE, disk_commit: CURRENT }
+    })
+
+    await refreshCodeSkew()
+
+    expect($codeSkewServices.get()).toEqual(['dashboard', 'gateway'])
+  })
+
+  it('survives a service that is not listening at all', async () => {
+    // The gateway's api_server platform is optional; its absence is not a fault.
+    serve({ '/api/health': { commit: CURRENT, disk_commit: CURRENT } })
+
+    expect(await refreshCodeSkew()).toBe(false)
+    expect($codeSkewServices.get()).toEqual([])
+  })
+
+  it('leaves the last verdict alone when nothing answers', async () => {
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT } })
+    await refreshCodeSkew()
+
+    mocks.hermesApi.mockImplementation(async () => {
+      throw new Error('ECONNREFUSED')
+    })
+
+    expect(await refreshCodeSkew()).toBe(true)
+    expect($codeSkewed.get()).toBe(true)
+  })
+})
+
+describe('clearCodeSkew', () => {
+  it('drops the verdict and the service names together', async () => {
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT } })
+    await refreshCodeSkew()
+
+    clearCodeSkew()
+
+    expect($codeSkewed.get()).toBeNull()
+    expect($codeSkew.get()).toBeNull()
+    expect($codeSkewServices.get()).toEqual([])
+  })
+})
