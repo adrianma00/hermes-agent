@@ -6,6 +6,7 @@ export const enModelMenu: Translations['shell']['modelMenu'] = {
   editModels: 'Edit models…',
   staleBackend: 'Stale backend — restart',
   staleDashboard: 'Stale dashboard — restart it on the host',
+  staleDashboardSelfHealing: 'Stale dashboard — restarting itself',
   restartingBackend: 'Restarting…',
   followDefault: 'Use Settings default',
   refreshModels: 'Refresh models',

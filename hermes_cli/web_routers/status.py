@@ -127,6 +127,12 @@ async def get_health():
     ``disk_commit`` is the checkout on disk at request time. Publishing both lets a client
     compare two strings and name a stale backend without relying on ``code_skew``, which
     this process can only report if it booted from code that already knew about it.
+
+    ``respawn`` is the evidence that something will start this process again after it
+    exits — a supervisor's marker, accumulated proof, or the client that owns it. It is
+    what lets a stale-code surface tell "wait, it restarts itself" apart from "restart it
+    on the host"; without it the client can only offer the instruction that always works,
+    which for a supervised backend is needless work. ``"unknown"`` means exactly that.
     """
     info = get_version_info()
     body: dict[str, object] = {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
@@ -137,6 +143,7 @@ async def get_health():
     except Exception:
         # Never drop the field the Desktop's readiness probe keys on.
         body["commit"] = info.commit
+    body["respawn"] = str(getattr(app.state, "respawn_evidence", "unknown") or "unknown")
     try:
         from gateway.code_skew import detect_code_skew
         skew = detect_code_skew()

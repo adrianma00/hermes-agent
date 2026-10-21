@@ -4,6 +4,7 @@ export const esModelMenu = {
   editModels: 'Editar modelos…',
   staleBackend: 'Backend obsoleto: reiniciar',
   staleDashboard: 'Panel obsoleto: reiniciar en el host',
+  staleDashboardSelfHealing: 'Panel obsoleto: se reinicia solo',
   restartingBackend: 'Reiniciando…',
   followDefault: 'Usar el predeterminado de Ajustes',
   refreshModels: 'Actualizar modelos',

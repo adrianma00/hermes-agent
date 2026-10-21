@@ -4,6 +4,7 @@ export const deModelMenu = {
   editModels: 'Modelle bearbeiten…',
   staleBackend: 'Veralteter Backend – neu starten',
   staleDashboard: 'Veraltetes Dashboard – auf dem Host neu starten',
+  staleDashboardSelfHealing: 'Veraltetes Dashboard – startet sich selbst neu',
   restartingBackend: 'Neustart…',
   followDefault: 'Standard aus den Einstellungen verwenden',
   refreshModels: 'Modelle aktualisieren',

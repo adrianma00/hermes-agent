@@ -37,7 +37,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { registry } from '@/contrib/registry'
 import { queryClient } from '@/lib/query-client'
-import { $codeSkewed, $codeSkewServices } from '@/store/code-skew'
+import { $codeSkewed, $codeSkewRespawns, $codeSkewServices } from '@/store/code-skew'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { localModelsKey, localModelsOwner } from '@/store/local-runtime-jobs'
@@ -108,6 +108,7 @@ afterEach(() => {
   $defaultReasoningEffort.set('')
   $codeSkewed.set(null)
   $codeSkewServices.set([])
+  $codeSkewRespawns.set(null)
   mocks.gatewayRestarting?.set(false)
   closeMenu.mockClear()
   vi.clearAllMocks()
@@ -797,6 +798,19 @@ describe('the stale-backend row', () => {
 
     await waitFor(() => expect(mocks.runGatewayRestart).not.toHaveBeenCalled())
     expect(screen.queryByText(staleLabel)).toBeNull()
+  })
+
+  it('says the dashboard is restarting itself when a respawn is expected', async () => {
+    // A supervised dashboard retires itself on the next watchdog poll, so the operator
+    // does not need an instruction — telling them to run one would be needless work.
+    $codeSkewed.set(true)
+    $codeSkewServices.set(['dashboard'])
+    $codeSkewRespawns.set(true)
+
+    renderMenu()
+
+    expect(await screen.findByText('Stale dashboard — restarting itself')).toBeTruthy()
+    expect(screen.queryByText('Stale dashboard — restart it on the host')).toBeNull()
   })
 
   it('still offers the restart when the gateway is the stale service', async () => {

@@ -62,6 +62,33 @@ def test_health_publishes_the_disk_commit_beside_the_boot_commit(monkeypatch, di
     assert body["disk_commit"] == disk_commit
 
 
+def test_health_publishes_whether_something_would_respawn_this_process(monkeypatch):
+    """The client needs this to tell "wait" from "go restart it on the host"."""
+    from starlette.testclient import TestClient
+
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(ws.app.state, "respawn_evidence", "marker:supervised-child", raising=False)
+
+    body = TestClient(ws.app).get("/api/health").json()
+
+    assert body["respawn"] == "marker:supervised-child"
+
+
+def test_health_says_unknown_when_no_supervision_evidence_exists(monkeypatch):
+    from starlette.testclient import TestClient
+
+    import hermes_cli.web_server as ws
+
+    # Startup on a bare `hermes dashboard` sets no evidence; absence must read as unknown,
+    # never as "something will restart me".
+    monkeypatch.delattr(ws.app.state, "respawn_evidence", raising=False)
+
+    body = TestClient(ws.app).get("/api/health").json()
+
+    assert body["respawn"] == "unknown"
+
+
 def test_health_keeps_the_boot_commit_when_the_disk_revision_cannot_be_read(monkeypatch):
     """A broken git read must neither drop `commit` nor pretend the disk matches."""
     from starlette.testclient import TestClient

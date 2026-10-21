@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({ hermesApi: vi.fn() }))
 
 vi.mock('@/api/client', () => ({ hermesApi: mocks.hermesApi }))
 
-import { $codeSkew, $codeSkewed, $codeSkewServices, clearCodeSkew, refreshCodeSkew } from './code-skew'
+import { $codeSkew, $codeSkewed, $codeSkewRespawns, $codeSkewServices, clearCodeSkew, refreshCodeSkew } from './code-skew'
 
 // The fault this store exists for: a dashboard served `6e4d10829c` for two days
 // while the checkout sat on `1729888f93c`. It answered /api/health 200 with no
@@ -40,7 +40,12 @@ describe('the skew verdict reads revisions, not the backend’s own opinion', ()
     expect($codeSkewed.get()).toBe(true)
     expect($codeSkewServices.get()).toEqual(['dashboard'])
     // Full SHAs, clipped for copy — same shape the server's own code_skew used.
-    expect($codeSkew.get()).toEqual({ boot_rev: '6e4d10829c', disk_rev: '1729888f93', service: 'dashboard' })
+    expect($codeSkew.get()).toEqual({
+      boot_rev: '6e4d10829c',
+      disk_rev: '1729888f93',
+      respawns: false,
+      service: 'dashboard'
+    })
   })
 
   it('calls equal revisions clean', async () => {
@@ -91,7 +96,42 @@ describe('the skew verdict reads revisions, not the backend’s own opinion', ()
     })
 
     expect(await refreshCodeSkew()).toBe(true)
-    expect($codeSkew.get()).toEqual({ boot_rev: '6e4d10829c', disk_rev: '1729888f93', service: 'dashboard' })
+    expect($codeSkew.get()).toEqual({
+      boot_rev: '6e4d10829c',
+      disk_rev: '1729888f93',
+      respawns: false,
+      service: 'dashboard'
+    })
+  })
+
+  it('records that a stale dashboard expects a supervisor to restart it', async () => {
+    // The backend publishes the evidence; the row uses it to say "restarting itself"
+    // instead of sending the operator to the host for a process about to heal.
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT, respawn: 'marker:supervised-child' } })
+
+    await refreshCodeSkew()
+
+    expect($codeSkewRespawns.get()).toBe(true)
+    expect($codeSkew.get()?.respawns).toBe(true)
+  })
+
+  it('treats an unknown respawn field as no promise', async () => {
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT, respawn: 'unknown' } })
+
+    await refreshCodeSkew()
+
+    expect($codeSkewRespawns.get()).toBe(false)
+  })
+
+  it('drops the respawn evidence once the dashboard is clean again', async () => {
+    serve({ '/api/health': { commit: STALE, disk_commit: CURRENT, respawn: 'proven:5.0s' } })
+    await refreshCodeSkew()
+    expect($codeSkewRespawns.get()).toBe(true)
+
+    serve({ '/api/health': { commit: CURRENT, disk_commit: CURRENT, respawn: 'proven:5.0s' } })
+    await refreshCodeSkew()
+
+    expect($codeSkewRespawns.get()).toBeNull()
   })
 
   it('keeps probing the second service instead of stopping at the first 200', async () => {

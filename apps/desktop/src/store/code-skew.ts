@@ -10,6 +10,8 @@ export interface CodeSkewDetail {
   disk_rev?: string
   /** The service that reported the skew; a restart has to target THIS one. */
   service?: BackendService
+  /** Whether that service expects a supervisor to start it again after it exits. */
+  respawns?: boolean
 }
 
 /**
@@ -31,6 +33,16 @@ export const $codeSkew = atom<CodeSkewDetail | null>(null)
  */
 export const $codeSkewServices = atom<BackendService[]>([])
 
+/**
+ * Whether the stale DASHBOARD expects something to restart it. The dashboard's own health
+ * reports the evidence (`respawn`: a supervisor's marker, accumulated proof, or the client
+ * that owns it), so a surface can say "wait, it restarts itself" instead of sending the
+ * operator to run a command for a process that was about to heal on its own.
+ *
+ * `null` = no stale dashboard, or a build too old to publish the field.
+ */
+export const $codeSkewRespawns = atom<boolean | null>(null)
+
 /** One health endpoint per service, in the order we prefer to name a culprit. */
 const SERVICES: ReadonlyArray<{ path: string; service: BackendService }> = [
   { path: '/api/health', service: 'dashboard' },
@@ -48,6 +60,15 @@ interface HealthBody {
   code_skew?: unknown
   commit?: unknown
   disk_commit?: unknown
+  /** Evidence that something restarts this process after it exits; 'unknown' = none. */
+  respawn?: unknown
+}
+
+/** Only a positive, named evidence counts — an absent field is not a promise. */
+function expectsRespawn(body: unknown): boolean {
+  const evidence = (body as HealthBody | null)?.respawn
+
+  return typeof evidence === 'string' && evidence !== 'unknown' && evidence !== ''
 }
 
 type ServiceVerdict =
@@ -139,11 +160,19 @@ export async function refreshCodeSkew(): Promise<boolean> {
 
     if (verdict.state === 'skewed') {
       skewed.push(service)
-      detail ??= { ...verdict.detail, service }
+      detail ??= { ...verdict.detail, respawns: expectsRespawn(body), service }
+
+      if (service === 'dashboard') {
+        $codeSkewRespawns.set(expectsRespawn(body))
+      }
     }
   }
 
   if (skewed.length > 0) {
+    if (!skewed.includes('dashboard')) {
+      $codeSkewRespawns.set(null)
+    }
+
     $codeSkewServices.set(skewed)
     $codeSkew.set(detail)
     $codeSkewed.set(true)
@@ -152,6 +181,7 @@ export async function refreshCodeSkew(): Promise<boolean> {
   }
 
   $codeSkewServices.set([])
+  $codeSkewRespawns.set(null)
 
   // Nothing answered: leave the last verdict alone. A probe that could not run is
   // not evidence that the code is current.
@@ -175,4 +205,5 @@ export function clearCodeSkew(): void {
   $codeSkew.set(null)
   $codeSkewed.set(null)
   $codeSkewServices.set([])
+  $codeSkewRespawns.set(null)
 }

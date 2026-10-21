@@ -42,7 +42,7 @@ import { accountResetMs, formatReset, modelResetMs } from '@/lib/provider-limit'
 import { reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { foldIncludes, normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import { $codeSkewed, $codeSkewServices } from '@/store/code-skew'
+import { $codeSkewed, $codeSkewRespawns, $codeSkewServices } from '@/store/code-skew'
 import { $customModels, addCustomModel, customModelCandidate, withCustomModels } from '@/store/custom-models'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
@@ -274,6 +274,10 @@ export function ModelCatalogMenu({
   // services were named: fall back to the old behaviour rather than showing no action.
   const staleServices = useStore($codeSkewServices)
   const restartClearsIt = staleServices.length === 0 || staleServices.includes('gateway')
+  // A stale dashboard may be about to heal itself: the backend publishes the evidence that
+  // something would start it again after it exits. Saying "restart it on the host" to an
+  // operator whose dashboard is five seconds from restarting itself is needless work.
+  const dashboardSelfHeals = useStore($codeSkewRespawns) === true
   // The profile whose gateway would be restarted. `$activeGatewayProfile` is the
   // owner of the connection the skew verdict came from, so this scopes the
   // restart to the backend that actually reported the stale code.
@@ -987,7 +991,9 @@ export function ModelCatalogMenu({
             ? copy.restartingBackend
             : restartClearsIt
               ? copy.staleBackend
-              : copy.staleDashboard}
+              : dashboardSelfHeals
+                ? copy.staleDashboardSelfHealing
+                : copy.staleDashboard}
         </DropdownMenuItem>
       ) : null}
     </>

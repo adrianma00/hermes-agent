@@ -4,6 +4,7 @@ export const jaModelMenu = {
   editModels: 'モデルを編集…',
   staleBackend: '古いバックエンド — 再起動',
   staleDashboard: '古いダッシュボード — ホストで再起動',
+  staleDashboardSelfHealing: '古いダッシュボード — 自動で再起動します',
   restartingBackend: '再起動中…',
   followDefault: '設定のデフォルトを使用',
   refreshModels: 'モデルを更新',

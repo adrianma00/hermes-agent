@@ -4,6 +4,7 @@ export const frModelMenu = {
   editModels: 'Modifier les modèles…',
   staleBackend: 'Backend obsolète – redémarrer',
   staleDashboard: 'Tableau de bord obsolète – à redémarrer sur l’hôte',
+  staleDashboardSelfHealing: 'Tableau de bord obsolète – redémarrage automatique',
   restartingBackend: 'Redémarrage…',
   followDefault: 'Utiliser le modèle par défaut des Réglages',
   refreshModels: 'Actualiser les modèles',

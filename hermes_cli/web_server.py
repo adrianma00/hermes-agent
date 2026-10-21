@@ -1212,6 +1212,9 @@ def _on_server_started(
     # from proof accumulated across restarts, and says No when it cannot tell — a manual dashboard
     # in a terminal must not be killed on a guess.
     supervised, supervision_evidence = _code_skew_watchdog_decision(app, actual_port)
+    # Published on /api/health so a client can tell an operator "wait, it restarts itself"
+    # from "go restart it on the host" instead of offering one instruction for both.
+    app.state.respawn_evidence = supervision_evidence
     if supervised:
         # The host's updater never restarts this backend (SSH-isolated: only the remote Desktop
         # client holds its token and owner nonce, #91668/#101626; Desktop-owned local serve:

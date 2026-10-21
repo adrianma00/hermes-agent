@@ -4,6 +4,7 @@ export const ruModelMenu = {
   editModels: 'Изменить модели…',
   staleBackend: 'Устаревший бэкенд — перезапустить',
   staleDashboard: 'Устаревшая панель — перезапустите на хосте',
+  staleDashboardSelfHealing: 'Устаревшая панель — перезапустится сама',
   restartingBackend: 'Перезапуск…',
   followDefault: 'Использовать модель по умолчанию из настроек',
   refreshModels: 'Обновить модели',

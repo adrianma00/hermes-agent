@@ -4,6 +4,7 @@ export interface ModelMenuTranslations {
   editModels: string
   staleBackend: string
   staleDashboard: string
+  staleDashboardSelfHealing: string
   restartingBackend: string
   followDefault: string
   refreshModels: string
