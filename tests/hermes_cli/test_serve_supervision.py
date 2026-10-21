@@ -29,6 +29,25 @@ class TestSupervisionMarker:
     def test_none_without_a_supervisor(self):
         assert serve_supervision.supervision_marker() is None
 
+    def test_the_cross_os_declaration_is_read(self, monkeypatch):
+        # The installer writes this into the unit, plist or scheduled task it creates, so
+        # it is the ONE signal that does not need a per-OS probe. The Mac peer's plist
+        # sets exactly this.
+        monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
+        assert serve_supervision.supervision_marker() == "supervised-child"
+
+    def test_s6_declaration_is_read(self, monkeypatch):
+        monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
+        assert serve_supervision.supervision_marker() == "s6-supervised-child"
+
+    def test_the_declaration_outranks_systemd_stamps(self, monkeypatch):
+        # Both present on a current systemd unit; the deliberate declaration is the one to
+        # report, because INVOCATION_ID is inherited by every descendant of the unit.
+        monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", "1")
+        assert serve_supervision.supervision_marker() == "supervised-child"
+
     def test_systemd_needs_both_stamps(self, monkeypatch):
         # INVOCATION_ID alone is also set for transient units (`systemd-run`), which do
         # not restart anything; the pair is the service-shape signal.

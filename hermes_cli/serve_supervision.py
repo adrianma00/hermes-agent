@@ -11,12 +11,14 @@ revision, refusing model switches the whole time.
 
 Two signals, cheapest first, and neither guesses per-OS:
 
-``supervision_marker()`` reads what a supervisor stamped into the environment. It is
-definitive when present (systemd stamps ``INVOCATION_ID``/``SYSTEMD_EXEC_PID`` on every
-unit process) and absent for a shell-started one. launchd and the Windows service
-manager stamp nothing, so absence proves nothing — and is never read as proof. launchd is
-covered by its own probe instead (``launchd_supervision``): a loaded job whose live pid is
-this process is exactly the question the updater already asks to decide kickstart-vs-respawn.
+``supervision_marker()`` reads what a supervisor stamped into the environment. The
+installer writes ``HERMES_SUPERVISED_CHILD`` into the unit, plist or scheduled task it
+creates, so it is the one signal that covers all three OSes; systemd additionally stamps
+``INVOCATION_ID``/``SYSTEMD_EXEC_PID`` on unit processes, which covers units written
+before that marker existed. Neither is universal, though: a plist or task from before the
+convention says nothing, so absence is never read as proof. ``launchd_supervision()``
+covers those by asking whether a LOADED job's live pid is this process — the same
+question the updater already asks to decide kickstart-vs-respawn.
 
 ``respawn proof`` is the OS-agnostic answer for those. Every exit writes a timestamp and
 every boot compares itself to it: a graceful exit followed by a boot on the same port
@@ -56,10 +58,23 @@ _STATE_FILE = "serve-supervision.json"
 def supervision_marker() -> Optional[str]:
     """Name of the supervisor that stamped this process, or ``None``.
 
-    Only markers that MEAN "a service manager spawned this" are listed. The absence of
-    one is not evidence of absence (launchd and Windows set none), so callers must fall
-    through to the respawn proof rather than treating ``None`` as unsupervised.
+    Only markers that MEAN "a service manager spawned this" are listed, and the absence
+    of one is not evidence of absence — an older plist or task may predate the marker —
+    so callers fall through to the launchd probe and then the respawn proof rather than
+    treating ``None`` as unsupervised.
     """
+    # The canonical declaration, and the only one that covers all three OSes: the
+    # installer writes it into the unit/plist/task it creates (systemd Environment=,
+    # the launchd plist's EnvironmentVariables, the Windows task's env). `main.py`
+    # documents it as exactly that — "systemd unit / launchd plist / Windows task" —
+    # so this is the repo's own convention, not a new one invented here.
+    if os.environ.get("HERMES_SUPERVISED_CHILD"):
+        return "supervised-child"
+    if os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+        return "s6-supervised-child"
+    # systemd's own stamps, for a unit written before the marker existed. The pair is
+    # required: INVOCATION_ID alone is set for `systemd-run` transient units (which
+    # restart nothing) and is inherited by every descendant of a unit-spawned process.
     if os.environ.get("INVOCATION_ID") and os.environ.get("SYSTEMD_EXEC_PID"):
         return "systemd"
     if os.environ.get("SUPERVISOR_ENABLED"):
@@ -70,9 +85,10 @@ def supervision_marker() -> Optional[str]:
 def launchd_supervision() -> Optional[str]:
     """``launchd:<label>`` when a LOADED launchd job's live pid is this process.
 
-    macOS stamps nothing into the environment, so there is no marker to read. What it does
-    have is authoritative: a job is loaded or it is not, and ``launchctl print`` names the
-    pid it is running. The fleet already asks that question at update time to decide between
+    The FALLBACK for a plist written before ``HERMES_SUPERVISED_CHILD`` existed — a current
+    launcher sets that marker, so most macOS backends never reach this probe. It is
+    authoritative when it does run: a job is loaded or it is not, and ``launchctl print``
+    names the pid it is running. The fleet already asks that question at update time to decide between
     a kickstart and a respawn (``main_dashboard._loaded_launchd_backend_jobs``), so the boot
     path asks the same one rather than inventing a second notion of "supervised".
 
