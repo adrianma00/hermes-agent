@@ -225,6 +225,14 @@ class _KanbanDispatcher:
         "correctly idle", not "stuck". The review column is probed only when
         review dispatch is on (same gate as the dispatcher): a task waiting
         for a human reviewer is idle, not stuck.
+
+        Both probes take the BOARD being iterated. Without it the assignee is
+        resolved against the pinned/first board's namespace, so a card on a
+        shared board that belongs to another install (``yummi-board``'s bare
+        ``default`` read under this install's namespace) looks claimable and
+        this returns True on every tick — the dispatcher then reports
+        "ready queue non-empty ... 0 workers spawned" forever with no reason
+        line. Per-board readiness must be answered per board.
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
@@ -234,7 +242,8 @@ class _KanbanDispatcher:
                 conn = None
                 try:
                     conn = _kbc().connect(board=slug)
-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                    if (kbd.has_spawnable_ready(conn, board=slug)
+                            or (_review_probe and kbd.has_spawnable_review(conn, board=slug))):
                         return True
                 except Exception:
                     continue

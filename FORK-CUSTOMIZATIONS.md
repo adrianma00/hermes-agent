@@ -82,7 +82,8 @@ zero hits.
   `tests/gateway/test_session_kanban_namespaced_assignee.py`). The implementation itself lives in
   shared files.
 - **Edits to shared**: `cli-config.yaml.example`, `gateway/kanban_watchers.py`,
-  `hermes_cli/config_defaults.py`, `hermes_cli/kanban.py`, `hermes_cli/kanban_db.py`,
+  `gateway/kanban_watchers_dispatcher.py`, `hermes_cli/config_defaults.py`, `hermes_cli/kanban.py`,
+  `hermes_cli/kanban_db.py`,
   `hermes_cli/kanban_db_connect.py`, `hermes_cli/kanban_db_dispatch.py`, `tests/conftest.py`,
   `website/docs/user-guide/features/kanban.md`
 - **Edit site MOVED by the 2026-10-16 upstream merge**: the board-metadata cluster now lives in
@@ -110,6 +111,23 @@ zero hits.
   namespace gate normally refuses such a card first; admission re-checks so a path that never passed
   that gate (manual claim, stale lock, the other install's dispatcher writing into the shared DB)
   cannot run another install's card as this install's `default`.
+- **A board-aware probe must be given its BOARD, and losing that argument is silent**
+  (`gateway/kanban_watchers_dispatcher.py`, `_KanbanDispatcher.ready_nonempty()`): it must call
+  `has_spawnable_ready(conn, board=slug)` and `has_spawnable_review(conn, board=slug)`. Without the
+  board, the assignee is resolved against the pinned/first board's namespace, so a shared board's
+  bare `default` — which belongs to the OTHER install — reads as spawnable work here. The dispatcher
+  then logs `kanban dispatcher stuck: ready queue non-empty for N consecutive ticks but 0 workers
+  spawned` every 60 s, forever, with an empty reason line: a permanent false alarm that also pins
+  the bad-tick counter, so a genuine stall on that install would be indistinguishable from it.
+  **This site has already been lost once.** `4fa453f773b` added the `board=` arguments;
+  upstream's `6b63931b64b` ("fence the explicit-board override to unfenced callers") rewrote the
+  same loop to adopt `pin_first_board_resolution()` and resolved the conflict toward upstream's
+  signature — which has no `board` parameter at all — so the file still compiled and the fork line
+  vanished with nothing failing. It stayed invisible until 2026-10-21, when 14 consecutive
+  "dispatcher stuck" warnings on Em were traced to one `yummi-board` card.
+  `tests/gateway/test_kanban_ready_nonempty_board_scope.py` is the standing detector: it asserts a
+  foreign card on a shared board is NOT spawnable, and (control) that the identical card on a board
+  of our own namespace IS — so a return to the unscoped call turns it red.
 
 ## 4. Mobile pairing CLI
 
