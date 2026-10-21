@@ -18,8 +18,6 @@ import { ProviderStatusChip } from '@/components/provider-status-chip'
 import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { $gatewayRestarting, runGatewayRestart } from '@/store/system-actions'
 import {
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -44,7 +42,7 @@ import { accountResetMs, formatReset, modelResetMs } from '@/lib/provider-limit'
 import { reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { foldIncludes, normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import { $codeSkew, $codeSkewed } from '@/store/code-skew'
+import { $codeSkewed, $codeSkewServices } from '@/store/code-skew'
 import { $customModels, addCustomModel, customModelCandidate, withCustomModels } from '@/store/custom-models'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
@@ -66,8 +64,10 @@ import {
   seedKnownModels,
   setModelVisibilityOpen
 } from '@/store/model-visibility'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $defaultReasoningEffort } from '@/store/session'
+import { $gatewayRestarting, runGatewayRestart } from '@/store/system-actions'
 import type { LocalModelLoadProgress, LocalRuntimeJob } from '@/types/hermes'
 
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
@@ -267,6 +267,13 @@ export function ModelCatalogMenu({
   // Read here rather than fetched: the condition is already known app-wide, and
   // the picker never sends a switch RPC for a server-side guard to catch.
   const skewed = useStore($codeSkewed) === true
+  // WHICH service is stale decides whether this row's action can fix anything. The
+  // verdict already names it ($codeSkewServices, one health probe per service), so the
+  // row no longer has to guess — and must not offer a gateway restart for a dashboard
+  // that a gateway restart provably cannot clear. An empty list is a verdict from before
+  // services were named: fall back to the old behaviour rather than showing no action.
+  const staleServices = useStore($codeSkewServices)
+  const restartClearsIt = staleServices.length === 0 || staleServices.includes('gateway')
   // The profile whose gateway would be restarted. `$activeGatewayProfile` is the
   // owner of the connection the skew verdict came from, so this scopes the
   // restart to the backend that actually reported the stale code.
@@ -945,9 +952,15 @@ export function ModelCatalogMenu({
       {skewed ? (
         <DropdownMenuItem
           className={cn(dropdownMenuRow, 'text-destructive focus:text-destructive')}
-          disabled={restartingBackend}
+          // Nothing to run for a stale dashboard: it is a different process with its own
+          // code load, and this app's restart restarts the gateway.
+          disabled={restartingBackend || !restartClearsIt}
           onSelect={event => {
             event.preventDefault()
+
+            if (!restartClearsIt) {
+              return
+            }
 
             // Scoped restart, not a whole-backend recycle. `runGatewayRestart`
             // takes down only the gateway that owns this profile — the same
@@ -970,7 +983,11 @@ export function ModelCatalogMenu({
           }}
         >
           <Codicon name="warning" size="0.75rem" />
-          {restartingBackend ? copy.restartingBackend : copy.staleBackend}
+          {restartingBackend
+            ? copy.restartingBackend
+            : restartClearsIt
+              ? copy.staleBackend
+              : copy.staleDashboard}
         </DropdownMenuItem>
       ) : null}
     </>

@@ -353,6 +353,7 @@ export const arChrome = {
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
       staleBackend: 'الواجهة الخلفية قديمة — إعادة التشغيل',
+      staleDashboard: 'لوحة قديمة — أعد تشغيلها على المضيف',
       restartingBackend: 'جارٍ إعادة التشغيل…',
       followDefault: 'استخدام الافتراضي من الإعدادات',
       refreshModels: 'تحديث النماذج',

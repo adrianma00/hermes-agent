@@ -37,7 +37,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { registry } from '@/contrib/registry'
 import { queryClient } from '@/lib/query-client'
-import { $codeSkewed } from '@/store/code-skew'
+import { $codeSkewed, $codeSkewServices } from '@/store/code-skew'
 import { $favoriteModels, favoriteModelKey, toggleFavoriteModel } from '@/store/favorite-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { localModelsKey, localModelsOwner } from '@/store/local-runtime-jobs'
@@ -107,6 +107,7 @@ afterEach(() => {
   queryClient.setQueryData(localModelsKey(localModelsOwner(), 'jobs'), [])
   $defaultReasoningEffort.set('')
   $codeSkewed.set(null)
+  $codeSkewServices.set([])
   mocks.gatewayRestarting?.set(false)
   closeMenu.mockClear()
   vi.clearAllMocks()
@@ -778,6 +779,34 @@ describe('the stale-backend row', () => {
     const row = await screen.findByText(staleLabel)
 
     fireEvent.click(row)
+
+    await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalled())
+  })
+
+  it('names the dashboard and offers no restart this app cannot perform', async () => {
+    // A dashboard is a separate process with its own code load: `runGatewayRestart`
+    // restarts the gateway and provably cannot clear it. Offering the click anyway is
+    // how a skew survived a "restart" that looked like it worked.
+    $codeSkewed.set(true)
+    $codeSkewServices.set(['dashboard'])
+
+    renderMenu()
+
+    const row = await screen.findByText('Stale dashboard — restart it on the host')
+    fireEvent.click(row)
+
+    await waitFor(() => expect(mocks.runGatewayRestart).not.toHaveBeenCalled())
+    expect(screen.queryByText(staleLabel)).toBeNull()
+  })
+
+  it('still offers the restart when the gateway is the stale service', async () => {
+    mocks.runGatewayRestart.mockClear()
+    $codeSkewed.set(true)
+    $codeSkewServices.set(['gateway'])
+
+    renderMenu()
+
+    fireEvent.click(await screen.findByText(staleLabel))
 
     await waitFor(() => expect(mocks.runGatewayRestart).toHaveBeenCalled())
   })

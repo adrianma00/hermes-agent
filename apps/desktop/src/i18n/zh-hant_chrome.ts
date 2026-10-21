@@ -253,6 +253,7 @@ export const zhHantChrome = {
       noModels: '找不到模型',
       editModels: '編輯模型…',
       staleBackend: '後端程式碼陳舊 — 重新啟動',
+      staleDashboard: '面板程式碼陳舊 — 請在主機上重新啟動',
       restartingBackend: '重新啟動中…',
       followDefault: '使用設定中的預設模型',
       refreshModels: '重新整理模型',
