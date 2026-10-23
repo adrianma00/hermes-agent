@@ -464,7 +464,13 @@ _SPECS = [
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "
               "configured under auxiliary.triage_specifier."),
-    _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
+    _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer") + (
+        _arg("--force", action="store_true",
+             help="Rebuild a card whose graph is already settled (or whose "
+                  "block-loop park has not been touched): retires the previous "
+                  "graph, then decomposes again. Still refuses a card that is "
+                  "not in triage."),
+    ),
          help="Decompose a triage-column task into a graph of child tasks "
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "

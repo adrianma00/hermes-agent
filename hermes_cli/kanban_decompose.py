@@ -17,13 +17,18 @@ up with ``assignee=None``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import (
+    body_sha,
+    decompose_triage_task,
+    supersede_decomposed_graph,
+)
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -300,18 +305,120 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     )
 
 
+# Operator paths that re-arm a card the block-loop breaker parked. Any of these
+# after the latest ``block_loop_detected`` means a human has looked at it.
+_OPERATOR_EVENT_KINDS = (
+    "commented", "status", "unblocked", "promoted", "reassigned", "reclaimed",
+    "edited", "decompose_reset",
+)
+
+# Graph lineage states for a triage card that has been decomposed before.
+_LINEAGE_FRESH = "fresh"            # no committed graph (or one already retired)
+_LINEAGE_STALE = "stale"            # graph committed, but the card's text changed
+_LINEAGE_SETTLED = "settled"        # graph committed for this exact text
+
+
+def _latest_event_id(conn, task_id: str, kinds: tuple[str, ...]) -> int:
+    marks = ",".join("?" * len(kinds))
+    row = conn.execute(
+        f"SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({marks})",
+        (task_id, *kinds),
+    ).fetchone()
+    return int(row["m"] or 0)
+
+
+def _lineage_state(task) -> tuple[str, str]:
+    """Whether this card's committed graph still describes the card.
+
+    A ``decomposed`` event is the graph's lineage marker; a later
+    ``decompose_reset`` retires it. Between them, the recorded ``body_sha`` says
+    whether the card still asks for the same breakdown: unchanged means the
+    graph is settled (re-running it would pay the aux model for a reply the DB
+    must refuse), changed means an operator re-scoped the card and the old graph
+    is stale -- legitimate to rebuild, but only after retiring it.
+    """
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'decomposed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task.id,),
+        ).fetchone()
+        if row is None:
+            return _LINEAGE_FRESH, ""
+        reset_at = _latest_event_id(conn, task.id, ("decompose_reset",))
+        if int(row["id"]) < reset_at:
+            return _LINEAGE_FRESH, ""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    recorded = payload.get("body_sha") if isinstance(payload, dict) else None
+    current = body_sha(getattr(task, "title", ""), getattr(task, "body", ""))
+    if recorded is None:
+        # Events written before the digest existed: cannot prove the card was
+        # re-scoped, so refuse rather than pay to rediscover a refusal.
+        return _LINEAGE_SETTLED, (
+            "graph already committed for this card (no body digest recorded); "
+            "say --force to rebuild it")
+    if recorded == current:
+        return _LINEAGE_SETTLED, (
+            "graph already committed for this card; title/body unchanged since "
+            "decompose (say --force to rebuild it)")
+    return _LINEAGE_STALE, "card was re-scoped after its last decompose"
+
+
+def _parked_pending_human_reason(task_id: str) -> str:
+    """No-bill reason for a card the block-loop breaker parked, until touched.
+
+    The breaker parks a card in triage for a human. Auto-decompose must not pay
+    the aux model to rediscover that every tick -- but the bar is sticky-until-
+    touched, not permanent: commenting, unblocking, editing or re-decomposing
+    re-arms it.
+    """
+    with kbc.connect_closing() as conn:
+        parked_at = _latest_event_id(conn, task_id, ("block_loop_detected",))
+        if not parked_at:
+            return ""
+        touched_at = _latest_event_id(conn, task_id, _OPERATOR_EVENT_KINDS)
+    if touched_at > parked_at:
+        return ""
+    return "card is parked by the block-loop guard; a human must touch it before another attempt"
+
+
 def decompose_task(
     task_id: str,
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    force: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    as ``ok=False``.
+
+    Two guards run *before* the auxiliary model is called, so a card that cannot
+    produce a graph costs nothing: a card parked by the block-loop breaker waits
+    for a human to touch it, and a card whose graph is already settled for its
+    current text is not rebuilt. ``force`` is the operator override -- it retires
+    the settled graph and builds a fresh one rather than stacking a second
+    generation of parents onto the root."""
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    if not force:
+        reason = _parked_pending_human_reason(task_id)
+        if reason:
+            return DecomposeOutcome(task_id, False, reason)
+
+    state, why = _lineage_state(task)
+    if state == _LINEAGE_SETTLED and not force:
+        return DecomposeOutcome(task_id, False, why)
+    if state != _LINEAGE_FRESH:
+        with kbc.connect_closing() as conn:
+            supersede_decomposed_graph(
+                conn, task_id, reason=why, author=author or _profile_author())
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

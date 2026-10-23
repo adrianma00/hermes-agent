@@ -1,6 +1,8 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
 from typing import Any, Optional
@@ -115,16 +117,20 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, title, body, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
         # Dependency links alone do not imply lineage. The completion event is
-        # committed with the graph, and survives re-triage or unlinking.
+        # committed with the graph, and survives re-triage or unlinking. A
+        # later ``decompose_reset`` supersedes it: a fresh graph is allowed only
+        # after one has been retired explicitly, never stacked on top of it.
         if conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
-            (task_id,),
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' "
+            "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ? AND kind = 'decompose_reset'), 0) LIMIT 1",
+            (task_id, task_id),
         ).fetchone():
             return None
         child_ids = [
@@ -157,13 +163,87 @@ def decompose_triage_task(
                 now,
             )
         _append_event(
-            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
+            conn, task_id, "decomposed",
+            {"child_ids": child_ids, "root_assignee": root_assignee,
+             "body_sha": body_sha(root_row["title"], root_row["body"])},
         )
     # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
     # children in ``todo`` for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
     return child_ids
+
+
+def body_sha(title: Optional[str], body: Optional[str]) -> str:
+    """Stable digest of the text the decomposer was asked to break down.
+
+    Recorded on the ``decomposed`` event so a later attempt can tell "same card,
+    same graph" (settled -- no paid retry) from "an operator re-scoped it"
+    (stale graph -- retire it, then decompose the new text).
+    """
+    payload = (title or "") + "\x00" + (body or "")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def supersede_decomposed_graph(
+    conn: sqlite3.Connection, task_id: str, *, reason: str = "", author: Optional[str] = None,
+) -> list[str]:
+    """Retire a card's committed graph so a fresh one can be built.
+
+    Appends a ``decompose_reset`` event (the durable marker both lineage guards
+    consult), drops the root's links to the retired children and archives any
+    child still open, so a new graph never stacks a second generation of parents
+    onto a root that is already linked under the first. Returns the retired child
+    ids (empty when the card has no committed graph).
+
+    Link bookkeeping is inline rather than via ``unlink_tasks`` because that
+    helper opens its own write transaction; this runs inside the caller's.
+    """
+    from hermes_cli.kanban_db import _append_event, _insert_comment, recompute_ready, write_txn
+
+    now = int(time.time())
+    retired: list[str] = []
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'decomposed' "
+            "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ? AND kind = 'decompose_reset'), 0) "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, task_id),
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict):
+            retired = [str(c) for c in (payload.get("child_ids") or [])]
+        for cid in retired:
+            cur = conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (cid, task_id))
+            if cur.rowcount > 0:
+                _append_event(conn, task_id, "unlinked", {"parent": cid, "child": task_id})
+            child = conn.execute("SELECT status FROM tasks WHERE id = ?", (cid,)).fetchone()
+            if child is None or child["status"] in ("done", "archived"):
+                continue
+            conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (cid,))
+            _append_event(conn, cid, "archived",
+                          {"reason": "superseded by decompose_reset", "root": task_id})
+        _append_event(conn, task_id, "decompose_reset",
+                      {"retired_child_ids": retired, "supersedes_event_id": row["id"],
+                       "reason": reason})
+        if author and author.strip():
+            _insert_comment(
+                conn, task_id, author.strip(),
+                "Superseded the previous decompose graph ("
+                + (", ".join(retired) or "none") + ")"
+                + (f": {reason}" if reason else "")
+                + ". A fresh graph may now be built.",
+                now,
+            )
+    recompute_ready(conn)
+    return retired
 
 
 def _insert_decomposed_child(

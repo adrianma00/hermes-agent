@@ -1415,7 +1415,14 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     """Fan a triage task (or all) out into child tasks via the auxiliary LLM."""
     from hermes_cli import kanban_decompose as decomp
 
-    return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
+    force = bool(getattr(args, "force", False))
+
+    def _run_one(tid: str, **kwargs):
+        # The only operator override: rebuild a settled graph instead of
+        # silently returning the no-bill refusal.
+        return decomp.decompose_task(tid, force=force, **kwargs)
+
+    return _run_triage_sweep(args, "decompose", decomp, _run_one, "decomposed",
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
